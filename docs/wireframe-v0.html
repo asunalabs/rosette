@@ -1,0 +1,82 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Wireframe — private messenger</title>
+<style>
+  /* Intentionally rough: system fonts, thin gray lines, no color. A sketch, not a mockup. */
+  body { font-family: system-ui, sans-serif; background:#fafafa; color:#222; margin:24px; }
+  h1 { font-size:15px; font-weight:600; color:#666; }
+  .row { display:flex; gap:32px; align-items:flex-start; }
+  .phone { width:320px; border:2px solid #999; border-radius:18px; background:#fff; overflow:hidden; }
+  .label { text-align:center; font-size:12px; color:#888; margin-top:8px; }
+  .bar { padding:12px 14px; border-bottom:1px solid #ddd; display:flex; align-items:center; gap:8px; }
+  .bar b { font-size:15px; }
+  .shield { font-size:11px; border:1px solid #aaa; border-radius:10px; padding:1px 7px; color:#555; margin-left:auto; }
+  .search { margin:10px 14px; border:1px solid #ccc; border-radius:16px; padding:6px 12px; font-size:13px; color:#999; }
+  .chat { display:flex; gap:10px; padding:10px 14px; border-bottom:1px solid #eee; }
+  .avatar { width:38px; height:38px; border:1px solid #999; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:10px; color:#777; flex:none; }
+  .chat .who { font-size:14px; font-weight:600; }
+  .chat .msg { font-size:12px; color:#777; }
+  .meta { margin-left:auto; text-align:right; font-size:10px; color:#999; }
+  .pin { font-size:10px; color:#999; }
+  .fab { position:relative; }
+  .fab div { position:absolute; right:14px; bottom:12px; width:44px; height:44px; border:2px dashed #888; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:20px; color:#666; background:#fff; }
+  .fabspace { height:70px; }
+  /* chat view */
+  .bubble { max-width:70%; border:1px solid #bbb; border-radius:12px; padding:7px 10px; font-size:13px; margin:6px 14px; }
+  .them { border-bottom-left-radius:2px; }
+  .me { margin-left:auto; border-bottom-right-radius:2px; background:#f0f0f0; }
+  .ticks { font-size:9px; color:#999; text-align:right; }
+  .sys { text-align:center; font-size:10px; color:#999; margin:8px 0; }
+  .composer { display:flex; gap:8px; padding:10px 14px; border-top:1px solid #ddd; align-items:center; }
+  .composer .field { flex:1; border:1px solid #ccc; border-radius:16px; padding:7px 12px; font-size:13px; color:#999; }
+  .icon { width:30px; height:30px; border:1px dashed #999; border-radius:50%; flex:none; display:flex; align-items:center; justify-content:center; font-size:13px; color:#777; }
+  .note { max-width:700px; font-size:12px; color:#777; margin-top:20px; line-height:1.5; }
+</style>
+</head>
+<body>
+<h1>Wireframe v0 — conversation list + chat (rough sketch, layout only)</h1>
+<div class="row">
+
+  <!-- Screen 1: conversation list.
+       Decisions: no phone numbers anywhere; identicon-style avatars (drawn as circles here);
+       the privacy promise is ONE quiet chip in the header, not a wall of lock icons —
+       mainstream users are reassured by calm, not by cryptography talk. -->
+  <div>
+    <div class="phone">
+      <div class="bar"><b>Chats</b><span class="shield">🛡 private by design</span></div>
+      <div class="search">Search chats…</div>
+      <div class="chat"><div class="avatar">◆◇</div><div><div class="who">Lena 📌</div><div class="msg">see you at 8 then!</div></div><div class="meta">14:02<br>✓✓</div></div>
+      <div class="chat"><div class="avatar">▲▽</div><div><div class="who">bouldering group</div><div class="msg">Tomas: who brings the rope?</div></div><div class="meta">13:40<br><span class="pin">12 members</span></div></div>
+      <div class="chat"><div class="avatar">●○</div><div><div class="who">Papa</div><div class="msg">📷 photo</div></div><div class="meta">11:15</div></div>
+      <div class="chat"><div class="avatar">■□</div><div><div class="who">Marta (work)</div><div class="msg">draft is in the shared folder</div></div><div class="meta">Thu</div></div>
+      <div class="fab fabspace"><div>+</div></div>
+    </div>
+    <div class="label">1 — Chats · “+” opens QR / invite-link add flow (no phone number, ever)</div>
+  </div>
+
+  <!-- Screen 2: open chat.
+       Decisions: bubbles look 100% familiar (WhatsApp muscle memory);
+       the only privacy surface is the one-line system note when a chat starts;
+       delivery ticks kept — mainstream users panic without them. -->
+  <div>
+    <div class="phone">
+      <div class="bar"><div class="avatar" style="width:30px;height:30px">◆◇</div><b>Lena</b><span class="shield">🛡</span></div>
+      <div class="sys">Messages are end-to-end encrypted. Nobody outside this chat — not even us — can read them.</div>
+      <div class="bubble them">Did you see the new climbing gym opened near Hbf?</div>
+      <div class="bubble me">yes!! want to try it Friday?<div class="ticks">14:01 ✓✓</div></div>
+      <div class="bubble them">Deal. Loser buys dinner 😄</div>
+      <div class="bubble me">see you at 8 then!<div class="ticks">14:02 ✓✓</div></div>
+      <div class="composer"><div class="icon">📎</div><div class="field">Message…</div><div class="icon">🎤</div></div>
+    </div>
+    <div class="label">2 — Chat · familiar bubbles, one quiet trust line, zero crypto jargon</div>
+  </div>
+
+</div>
+<p class="note">Sketch intent: this should feel like a calm, mainstream messenger your mother could use —
+the privacy is in the architecture, not shouted in the UI. Edge cases to design later: empty state
+(first launch, zero chats → big friendly “add your first contact” QR panel), long names, failed
+delivery (relay unreachable), group at 200 members.</p>
+</body>
+</html>
