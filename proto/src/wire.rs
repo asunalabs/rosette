@@ -27,6 +27,38 @@ use crate::pow::PowSolution;
 /// pairing/creation. "No accounts" never means "no send authorization."
 pub type AuthTag = [u8; 32];
 
+/// Correlates a request with its reply (T3, eng-review OV6). Client-chosen,
+/// unique per in-flight request on a connection; the relay echoes it verbatim
+/// and attaches no meaning to the value.
+pub type RequestId = u64;
+
+/// Everything the client writes on the wire: a request plus the id its reply
+/// must echo. This is what lets a client pipeline — multiple frames can be
+/// in flight and each `Reply` names the request it answers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientFrame {
+    pub request_id: RequestId,
+    pub message: ClientMessage,
+}
+
+/// Everything the relay writes on the wire. `Reply` answers exactly one
+/// `ClientFrame`; `Push` is unsolicited (amendment A12) and carries no
+/// request id — the two are structurally distinct so a client can never
+/// mistake a push for the "next reply".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ServerFrame {
+    Reply {
+        request_id: RequestId,
+        message: ServerMessage,
+    },
+    /// Pushed to a subscribed connection as soon as a new envelope lands in
+    /// one of its queues — no polling.
+    Push {
+        queue_id: QueueId,
+        envelope: Envelope,
+    },
+}
+
 /// Distinguishes the two group-inbox send behaviors. Only a Commit advances
 /// the epoch and can conflict; an Application message never does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,16 +111,12 @@ pub enum ClientMessage {
     },
 }
 
+/// A reply to exactly one request. Pushes are NOT replies — they live in
+/// `ServerFrame::Push`, so this enum is only ever request-correlated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
     Ok,
     Error(RejectionCode),
-    /// Pushed to a subscribed connection as soon as a new envelope lands in
-    /// one of its queues — no polling.
-    Push {
-        queue_id: QueueId,
-        envelope: Envelope,
-    },
     PowChallenge(PowChallenge),
     QueueCreated {
         queue_id: QueueId,
@@ -145,6 +173,50 @@ mod tests {
         match decoded {
             ClientMessage::Subscribe { queue_ids } => assert_eq!(queue_ids.len(), 2),
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn client_frame_roundtrip_preserves_request_id() {
+        let frame = ClientFrame {
+            request_id: 7,
+            message: ClientMessage::RequestPowChallenge,
+        };
+        let bytes = crate::encode(&frame);
+        let decoded: ClientFrame = crate::decode(&bytes).unwrap();
+        assert_eq!(decoded.request_id, 7);
+        assert!(matches!(
+            decoded.message,
+            ClientMessage::RequestPowChallenge
+        ));
+    }
+
+    #[test]
+    fn server_frame_reply_roundtrip_preserves_request_id() {
+        let frame = ServerFrame::Reply {
+            request_id: u64::MAX,
+            message: ServerMessage::Ok,
+        };
+        let bytes = crate::encode(&frame);
+        match crate::decode::<ServerFrame>(&bytes).unwrap() {
+            ServerFrame::Reply {
+                request_id,
+                message: ServerMessage::Ok,
+            } => assert_eq!(request_id, u64::MAX),
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_frame_push_roundtrip() {
+        let frame = ServerFrame::Push {
+            queue_id: [4u8; 32],
+            envelope: Envelope::new([5u8; 16], DeliveryMode::RelayFanout, vec![0u8; 16]),
+        };
+        let bytes = crate::encode(&frame);
+        match crate::decode::<ServerFrame>(&bytes).unwrap() {
+            ServerFrame::Push { queue_id, .. } => assert_eq!(queue_id, [4u8; 32]),
+            other => panic!("expected Push, got {other:?}"),
         }
     }
 

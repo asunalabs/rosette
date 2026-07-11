@@ -24,4 +24,14 @@ proptest! {
     fn envelope_decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
         let _ = proto::decode::<proto::Envelope>(&bytes);
     }
+
+    #[test]
+    fn client_frame_decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+        let _ = proto::decode::<proto::ClientFrame>(&bytes);
+    }
+
+    #[test]
+    fn server_frame_decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+        let _ = proto::decode::<proto::ServerFrame>(&bytes);
+    }
 }

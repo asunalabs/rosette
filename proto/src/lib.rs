@@ -15,7 +15,9 @@ pub use envelope::{pad, padded_bucket_for, DeliveryMode, Envelope, MessageId};
 pub use error::RejectionCode;
 pub use link::{ContactLink, Endpoint, LinkError, QueueId, LINK_VERSION_V1};
 pub use pow::{PowChallenge, PowSolution};
-pub use wire::{AuthTag, ClientMessage, GroupSendKind, ServerMessage};
+pub use wire::{
+    AuthTag, ClientFrame, ClientMessage, GroupSendKind, RequestId, ServerFrame, ServerMessage,
+};
 
 /// Serialize any wire type with the shared bincode config. Centralized so a
 /// future format change (bincode major version, compression) touches one place.

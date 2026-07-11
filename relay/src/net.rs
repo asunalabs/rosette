@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use proto::framing::{read_frame, write_frame, ReadFrameError};
-use proto::{ClientMessage, ServerMessage};
+use proto::{ClientFrame, ServerFrame};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -66,7 +66,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (mut read_half, write_half) = tokio::io::split(socket);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerFrame>();
 
     let mut write_half = write_half;
     let writer_task = tokio::spawn(async move {
@@ -78,13 +78,13 @@ where
     });
 
     // Pushes land on this connection's own channel; forwarded straight into
-    // the shared writer queue so they interleave safely with Ok/Error replies.
+    // the shared writer queue so they interleave safely with replies.
     let (push_tx, mut push_rx) = mpsc::unbounded_channel();
     let forward_tx = out_tx.clone();
     let forward_task = tokio::spawn(async move {
         while let Some((queue_id, _message_id, envelope)) = push_rx.recv().await {
             if forward_tx
-                .send(ServerMessage::Push { queue_id, envelope })
+                .send(ServerFrame::Push { queue_id, envelope })
                 .is_err()
             {
                 break;
@@ -93,12 +93,17 @@ where
     });
 
     loop {
-        let msg: ClientMessage = match read_frame(&mut read_half).await {
-            Ok(msg) => msg,
+        let frame: ClientFrame = match read_frame(&mut read_half).await {
+            Ok(frame) => frame,
             Err(ReadFrameError::Closed) => break,
             Err(e) => return Err(e.into()),
         };
-        let reply = state.handle(msg, Some(push_tx.clone()));
+        // The request_id is echoed verbatim (T3, OV6) — the relay attaches no
+        // meaning to it, so a client is free to pipeline however it likes.
+        let reply = ServerFrame::Reply {
+            request_id: frame.request_id,
+            message: state.handle(frame.message, Some(push_tx.clone())),
+        };
         if out_tx.send(reply).is_err() {
             break;
         }

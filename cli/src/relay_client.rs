@@ -1,24 +1,36 @@
-//! Thin async client for the relay wire protocol. One outstanding
-//! request-reply at a time (fine for a demo/test harness — a real client
-//! would pipeline); Push messages arrive independently on `push_rx` at any
-//! time, matching the SUBSCRIBE model (amendment A12).
+//! Thin async client for the relay wire protocol. Fully pipelined (T3,
+//! eng-review OV6): every request carries a `request_id` and the matching
+//! `ServerFrame::Reply` is routed back to its caller through a pending-map,
+//! so any number of requests can be in flight concurrently. Push messages
+//! arrive independently on `push_rx` at any time, matching the SUBSCRIBE
+//! model (amendment A12).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail};
 use proto::framing::{read_frame, write_frame, ReadFrameError};
 use proto::{
-    ClientMessage, Envelope, GroupSendKind, PowSolution, QueueId, RejectionCode, ServerMessage,
+    ClientFrame, ClientMessage, Envelope, GroupSendKind, PowSolution, QueueId, RejectionCode,
+    RequestId, ServerFrame, ServerMessage,
 };
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsConnector;
 
 use crate::tls::{pinned_client_config, relay_server_name};
 
+/// Replies waiting to be claimed, keyed by request id. Shared between `call`
+/// (inserts) and the reader task (removes + fulfills). Dropped senders are
+/// how callers learn the connection died: the reader task drops the whole
+/// map on exit, failing every in-flight `call` at once.
+type PendingReplies = Arc<Mutex<HashMap<RequestId, oneshot::Sender<ServerMessage>>>>;
+
 pub struct RelayClient {
-    write_tx: mpsc::UnboundedSender<ClientMessage>,
-    reply_slot: Arc<Mutex<Option<oneshot::Sender<ServerMessage>>>>,
+    write_tx: mpsc::UnboundedSender<ClientFrame>,
+    pending: PendingReplies,
+    next_request_id: AtomicU64,
     pub push_rx: mpsc::UnboundedReceiver<(QueueId, Envelope)>,
 }
 
@@ -32,58 +44,69 @@ impl RelayClient {
         let tls = connector.connect(relay_server_name(), socket).await?;
         let (mut read_half, mut write_half) = tokio::io::split(tls);
 
-        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<ClientMessage>();
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<ClientFrame>();
         tokio::spawn(async move {
-            while let Some(msg) = write_rx.recv().await {
-                if write_frame(&mut write_half, &msg).await.is_err() {
+            while let Some(frame) = write_rx.recv().await {
+                if write_frame(&mut write_half, &frame).await.is_err() {
                     break;
                 }
             }
         });
 
-        let reply_slot: Arc<Mutex<Option<oneshot::Sender<ServerMessage>>>> =
-            Arc::new(Mutex::new(None));
+        let pending: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
         let (push_tx, push_rx) = mpsc::unbounded_channel();
-        let reader_slot = reply_slot.clone();
+        let reader_pending = pending.clone();
         tokio::spawn(async move {
             loop {
-                let msg: ServerMessage = match read_frame(&mut read_half).await {
-                    Ok(msg) => msg,
+                let frame: ServerFrame = match read_frame(&mut read_half).await {
+                    Ok(frame) => frame,
                     Err(ReadFrameError::Closed) => break,
                     Err(_) => break,
                 };
-                match msg {
-                    ServerMessage::Push { queue_id, envelope } => {
+                match frame {
+                    ServerFrame::Push { queue_id, envelope } => {
                         let _ = push_tx.send((queue_id, envelope));
                     }
-                    other => {
-                        if let Some(tx) = reader_slot.lock().await.take() {
-                            let _ = tx.send(other);
+                    ServerFrame::Reply {
+                        request_id,
+                        message,
+                    } => {
+                        // A missing entry means the caller gave up (dropped its
+                        // future) — the reply is discarded, not misrouted.
+                        if let Some(tx) = reader_pending.lock().unwrap().remove(&request_id) {
+                            let _ = tx.send(message);
                         }
                     }
                 }
             }
+            // Connection gone: dropping the map drops every waiting sender,
+            // which fails all in-flight `call`s with a closed-connection error.
+            reader_pending.lock().unwrap().clear();
         });
 
         Ok(RelayClient {
             write_tx,
-            reply_slot,
+            pending,
+            next_request_id: AtomicU64::new(0),
             push_rx,
         })
     }
 
     async fn call(&self, msg: ClientMessage) -> anyhow::Result<ServerMessage> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(request_id, tx);
+        if self
+            .write_tx
+            .send(ClientFrame {
+                request_id,
+                message: msg,
+            })
+            .is_err()
         {
-            let mut slot = self.reply_slot.lock().await;
-            if slot.is_some() {
-                bail!("relay client only supports one outstanding request at a time");
-            }
-            *slot = Some(tx);
+            self.pending.lock().unwrap().remove(&request_id);
+            return Err(anyhow!("relay connection closed"));
         }
-        self.write_tx
-            .send(msg)
-            .map_err(|_| anyhow!("relay connection closed"))?;
         rx.await
             .map_err(|_| anyhow!("relay connection closed before replying"))
     }

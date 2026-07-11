@@ -252,8 +252,11 @@ as of 2026-07-11: step 0 (T1 ci.yml) DONE; T5 relay bug fixes DONE; `ffi/`
 stub contract DONE (ahead of order, to unblock frontend); T2 TLS + relay-cert
 pinning DONE (relay presents a persistent self-signed cert, clients pin its
 SHA-256 fingerprint carried in the ContactLink Endpoint; convergence test runs
-over real TLS + a fingerprint-mismatch rejection test). Remaining step 1: T3
-request-ids, T4 redelivery/ack.
+over real TLS + a fingerprint-mismatch rejection test); T3 request-id
+correlation DONE (ClientFrame/ServerFrame wrappers in proto/, relay echoes the
+id, client fully pipelined via a pending-reply map — Push split out of
+ServerMessage so a push can never be mistaken for a reply). Remaining step 1:
+T4 redelivery/ack.
 
 0. **`ci.yml` (cargo-only) lands first** (OV10): `cargo test --workspace` on
    every push, so the convergence test guards every step below. Gradle jobs
@@ -345,7 +348,7 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   - Surfaced by: Outside voice OV2 — cleartext send_key in QueueCreated (proto/src/wire.rs:93-96)
   - Files: `proto/src/link.rs`, `relay/src/net.rs`, `cli/src/relay_client.rs`
   - Verify: e2e test over TLS; plaintext socket rejected
-- [ ] **T3 (P1, human: ~1d / CC: ~45min)** — proto+relay+cli — request-id correlation + client pipelining
+- [x] **T3 (P1, human: ~1d / CC: ~45min)** — proto+relay+cli — request-id correlation + client pipelining
   - Surfaced by: Outside voice OV6 — "next frame wins" reply matching (cli/src/relay_client.rs:44-53)
   - Files: `proto/src/wire.rs`, `relay/src/state.rs`, `cli/src/relay_client.rs`
   - Verify: test with two concurrent in-flight requests resolving correctly
