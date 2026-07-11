@@ -183,12 +183,31 @@ impl RelayState {
     /// per connection: a re-subscribe from the same connection (same channel)
     /// does NOT stack a second sender for a queue — that would double-deliver
     /// every push. Also prunes senders whose connection has since closed.
+    ///
+    /// T4 (eng-review OV3): after registering, the queue's unacked backlog is
+    /// drained to the subscribing connection. Delivery is at-least-once — a
+    /// message leaves `pending` only via `ack`, so a client that received a
+    /// push but crashed before acking sees it again on reconnect. Duplicate
+    /// suppression is the client's job (engine seen-set, OV5).
     pub fn subscribe(&self, queue_ids: &[QueueId], tx: PushSender) {
         let mut inner = self.inner.lock().unwrap();
         for qid in queue_ids {
             let subs = inner.subscribers.entry(*qid).or_default();
             subs.retain(|existing| !existing.is_closed() && !existing.same_channel(&tx));
             subs.push(tx.clone());
+        }
+        for qid in queue_ids {
+            if let Some(QueueEntry {
+                kind: QueueKind::Mailbox { pending },
+                ..
+            }) = inner.queues.get(qid)
+            {
+                for (message_id, envelope) in pending {
+                    if tx.send((*qid, *message_id, envelope.clone())).is_err() {
+                        return; // connection already gone; senders get pruned on the next send
+                    }
+                }
+            }
         }
     }
 
@@ -331,11 +350,13 @@ impl RelayState {
     }
 
     pub fn ack(&self, queue_id: QueueId, message_id: MessageId) {
-        // v0.1 scope cut (disclosed): mailbox `pending` is drained on ack for
-        // storage accounting, but the full fan-out journal with per-recipient
-        // delete-on-ack + TTL retention (amendment A3) is not yet built —
-        // tracked as T3 in tasks-eng-review-*.jsonl. This still gives the
-        // skeleton real backpressure (MAX_QUEUE_DEPTH) without journal state.
+        // Delete-on-ack (amendment A3, T4): the ack removes the message from
+        // the recipient's mailbox and frees its storage, ending its
+        // redelivery-on-resubscribe lifetime. Per-recipient semantics fall
+        // out of v0.1's store-one-copy-per-mailbox model (A11's store-once +
+        // refcount is a disclosed later cut). TTL-based expiry for messages
+        // never acked at all is still missing — that's relay persistence
+        // milestone territory (architecture.md step 5).
         let mut inner = self.inner.lock().unwrap();
         let mut freed = 0u64;
         if let Some(entry) = inner.queues.get_mut(&queue_id) {
@@ -639,6 +660,74 @@ mod tests {
             0,
             "dead sender must be pruned after a failed push"
         );
+    }
+
+    #[test]
+    fn subscribe_drains_unacked_backlog_and_ack_ends_redelivery() {
+        // T4 (eng-review OV3): enqueue while unsubscribed, resubscribe,
+        // receive the backlog, ack, storage freed — and a later subscriber
+        // no longer sees the acked messages.
+        let state = RelayState::new();
+        let (qid, key) = state.create_mailbox(solved_pow(&state)).unwrap();
+
+        // Two messages land while nobody is subscribed.
+        let first = env(1);
+        let second = env(2);
+        for e in [&first, &second] {
+            let tag = proto::compute_tag(&key, &qid, e);
+            state.send_to_mailbox(qid, tag, e.clone()).unwrap();
+        }
+
+        // Subscribing drains the backlog, oldest first.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.subscribe(&[qid], tx);
+        let (_, mid_1, env_1) = rx.try_recv().expect("backlog message 1 redelivered");
+        let (_, mid_2, env_2) = rx.try_recv().expect("backlog message 2 redelivered");
+        assert_eq!((mid_1, &env_1), (first.message_id, &first));
+        assert_eq!((mid_2, &env_2), (second.message_id, &second));
+        assert!(rx.try_recv().is_err(), "backlog has exactly two messages");
+
+        // Acking both frees their storage entirely.
+        state.ack(qid, mid_1);
+        state.ack(qid, mid_2);
+        assert_eq!(
+            state.inner.lock().unwrap().storage_bytes_used,
+            0,
+            "delete-on-ack must free the stored bytes"
+        );
+
+        // A fresh connection subscribing now gets nothing: acked messages
+        // are gone for good.
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        state.subscribe(&[qid], tx2);
+        assert!(
+            rx2.try_recv().is_err(),
+            "acked messages must not be redelivered"
+        );
+    }
+
+    #[test]
+    fn unacked_message_is_redelivered_on_resubscribe() {
+        // At-least-once (T4): a message that was pushed live but never acked
+        // (client crashed mid-processing) arrives again on the next
+        // subscribe. The duplicate is the contract — engine dedup (OV5)
+        // absorbs it client-side.
+        let state = RelayState::new();
+        let (qid, key) = state.create_mailbox(solved_pow(&state)).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.subscribe(&[qid], tx.clone());
+
+        let e = env(1);
+        let tag = proto::compute_tag(&key, &qid, &e);
+        state.send_to_mailbox(qid, tag, e.clone()).unwrap();
+        assert!(rx.try_recv().is_ok(), "live push delivered");
+
+        // No ack. Re-subscribing (same connection, per the documented
+        // full-set refresh flow) replays the unacked message.
+        state.subscribe(&[qid], tx);
+        let (_, mid, _) = rx.try_recv().expect("unacked message must be redelivered");
+        assert_eq!(mid, e.message_id);
     }
 
     #[test]

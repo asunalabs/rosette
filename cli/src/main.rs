@@ -116,13 +116,14 @@ async fn listen(name: &str, relay_addr: &str, relay_fingerprint: &str) -> anyhow
 
     let mut relay = relay;
     let (inbox_qid, inbox_key) = loop {
-        let (_qid, envelope) = relay
+        let (qid, envelope) = relay
             .push_rx
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("relay connection closed"))?;
         let payload: BootstrapPayload = bincode::deserialize(&envelope.padded_ciphertext)?;
         session.join_from_welcome(&payload.welcome_wire, &payload.tree_wire)?;
+        relay.ack(qid, envelope.message_id).await?;
         println!("Paired. Epoch {}.", session.epoch()?);
         break (payload.inbox_qid, payload.inbox_key);
     };
@@ -203,14 +204,16 @@ async fn chat_repl(
                     .await??;
             }
             push = relay.push_rx.recv() => {
-                let Some((_qid, envelope)) = push else { break };
-                if authored.remove(&envelope.message_id) {
-                    continue;
+                let Some((qid, envelope)) = push else { break };
+                if !authored.remove(&envelope.message_id) {
+                    match session.process_incoming(&envelope.padded_ciphertext)? {
+                        Incoming::Application(bytes) => println!("< {}", String::from_utf8_lossy(&bytes)),
+                        Incoming::CommitApplied => println!("(group state updated, epoch {})", session.epoch()?),
+                    }
                 }
-                match session.process_incoming(&envelope.padded_ciphertext)? {
-                    Incoming::Application(bytes) => println!("< {}", String::from_utf8_lossy(&bytes)),
-                    Incoming::CommitApplied => println!("(group state updated, epoch {})", session.epoch()?),
-                }
+                // Ack after processing (T4): own echoes are acked too — they
+                // occupy mailbox storage like any other delivery.
+                relay.ack(qid, envelope.message_id).await?;
             }
         }
     }

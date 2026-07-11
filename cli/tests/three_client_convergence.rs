@@ -48,7 +48,8 @@ struct Member {
     mailbox_qid: QueueId,
     /// Unused in this test (nothing sends to a member's mailbox directly —
     /// only the relay's own fan-out does), but a real client always holds
-    /// this to ack, so it's kept here rather than dropped.
+    /// its mailbox send credential to hand out at pairing, so it's kept
+    /// here rather than dropped.
     #[allow(dead_code)]
     mailbox_key: [u8; 32],
     /// Message ids this member authored itself — skipped when they arrive
@@ -74,21 +75,29 @@ impl Member {
     /// Drains this member's mailbox until it sees a non-self-authored
     /// message, decrypting/merging it through the MLS session. Real network
     /// delivery, so pushes can arrive interleaved with unrelated traffic.
+    /// Every delivery is acked AFTER processing (T4: the ack is what ends
+    /// the relay's redelivery obligation, so it must not precede the work).
     async fn recv_next_foreign(&mut self) -> Incoming {
         loop {
-            let (_qid, envelope) = self
+            let (qid, envelope) = self
                 .relay
                 .push_rx
                 .recv()
                 .await
                 .expect("relay connection alive");
-            if self.authored.remove(&envelope.message_id) {
-                continue; // this is my own fan-out echo — already applied locally
+            let incoming = if self.authored.remove(&envelope.message_id) {
+                None // my own fan-out echo — already applied locally
+            } else {
+                Some(
+                    self.session
+                        .process_incoming(&envelope.padded_ciphertext)
+                        .unwrap(),
+                )
+            };
+            self.relay.ack(qid, envelope.message_id).await.unwrap();
+            if let Some(incoming) = incoming {
+                return incoming;
             }
-            return self
-                .session
-                .process_incoming(&envelope.padded_ciphertext)
-                .unwrap();
         }
     }
 }

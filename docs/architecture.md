@@ -255,8 +255,12 @@ SHA-256 fingerprint carried in the ContactLink Endpoint; convergence test runs
 over real TLS + a fingerprint-mismatch rejection test); T3 request-id
 correlation DONE (ClientFrame/ServerFrame wrappers in proto/, relay echoes the
 id, client fully pipelined via a pending-reply map — Push split out of
-ServerMessage so a push can never be mistaken for a reply). Remaining step 1:
-T4 redelivery/ack.
+ServerMessage so a push can never be mistaken for a reply); T4
+redelivery/ack DONE (subscribe drains the unacked backlog to the subscribing
+connection, delete-on-ack frees storage and ends redelivery, all clients ack
+after processing — at-least-once delivery, duplicates absorbed client-side
+per OV5). **Step 1 wire/relay hardening is COMPLETE; next is step 2, the
+engine/ extraction (T6).**
 
 0. **`ci.yml` (cargo-only) lands first** (OV10): `cargo test --workspace` on
    every push, so the convergence test guards every step below. Gradle jobs
@@ -352,7 +356,7 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   - Surfaced by: Outside voice OV6 — "next frame wins" reply matching (cli/src/relay_client.rs:44-53)
   - Files: `proto/src/wire.rs`, `relay/src/state.rs`, `cli/src/relay_client.rs`
   - Verify: test with two concurrent in-flight requests resolving correctly
-- [ ] **T4 (P1, human: ~2d / CC: ~1h)** — relay — redelivery-on-resubscribe + delete-on-ack
+- [x] **T4 (P1, human: ~2d / CC: ~1h)** — relay — redelivery-on-resubscribe + delete-on-ack
   - Surfaced by: Outside voice OV3 — subscribe never drains pending (relay/src/state.rs:167-190); nothing acks
   - Files: `relay/src/state.rs`
   - Verify: unit test — enqueue while unsubscribed, resubscribe, receive backlog, ack, storage freed
