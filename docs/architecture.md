@@ -264,8 +264,14 @@ per OV5). Step 1 wire/relay hardening COMPLETE. T6 engine extraction DONE
 auto-retry per OV4, seen-set dedup per OV5, reconnect + resubscribe +
 backlog replay), cli/ is a thin REPL over it, convergence/pinning/pipelining
 tests moved to engine/tests plus new commit-retry, dedup, and
-proxy-severed-connection reconnect tests. **Next: T7, the real UniFFI
-surface over engine/.**
+proxy-severed-connection reconnect tests. T7 DONE (2026-07-12): ffi/ stub
+replaced by the real engine behind the unchanged frozen signatures (engine
+actor thread owns a current-thread tokio runtime; callbacks delivered only
+via the dedicated chat-ffi-dispatch thread per OV8; loopback-relay
+callback-delivery test proves the full stack — see ffi-contract.md
+"Real-engine behavior notes" for the two additive EngineError variants and
+the CHAT_RELAY_ADDR/CHAT_RELAY_FINGERPRINT bootstrap knob). **Backend next:
+T9 relay persistence (step 5). T8 (app scaffold) is the frontend track.**
 
 0. **`ci.yml` (cargo-only) lands first** (OV10): `cargo test --workspace` on
    every push, so the convergence test guards every step below. Gradle jobs
@@ -373,7 +379,7 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   - Surfaced by: D4 + Outside voice OV4/OV5 — retry is manual test choreography today (cli/tests/three_client_convergence.rs:146-166); process_incoming errors on replay
   - Files: `engine/` (new), `cli/`, `Cargo.toml`
   - Verify: `cargo test -p engine` — convergence + retry-loop + reconnect + dedup tests green
-- [ ] **T7 (P2, human: ~3d / CC: ~1-2h)** — ffi — UniFFI crate, dispatch-thread event delivery, callback test
+- [x] **T7 (P2, human: ~3d / CC: ~1-2h)** — ffi — UniFFI crate, dispatch-thread event delivery, callback test
   - Surfaced by: Architecture review + OV8 threading contract
   - Files: `ffi/` (new)
   - Verify: Rust-side callback-delivery test green

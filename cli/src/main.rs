@@ -99,6 +99,8 @@ async fn chat_repl(mut engine: ChatEngine) -> anyhow::Result<()> {
                 match event? {
                     Event::Message(bytes) => println!("< {}", String::from_utf8_lossy(&bytes)),
                     Event::EpochAdvanced(epoch) => println!("(group state updated, epoch {epoch})"),
+                    Event::ConnectionChanged(false) => println!("(connection lost — reconnecting…)"),
+                    Event::ConnectionChanged(true) => println!("(reconnected)"),
                 }
             }
         }

@@ -161,6 +161,18 @@ impl ChatSession {
         Ok(())
     }
 
+    /// The display names of every current group member, from their
+    /// BasicCredential identity bytes. Local decoration only (see
+    /// `Identity::generate`) — trust rests on TOFU + safety numbers, never
+    /// on these strings.
+    pub fn member_names(&self) -> Result<Vec<String>, SessionError> {
+        let group = self.group.as_ref().ok_or(SessionError::NoGroup)?;
+        Ok(group
+            .members()
+            .map(|m| String::from_utf8_lossy(m.credential.serialized_content()).into_owned())
+            .collect())
+    }
+
     pub fn epoch(&self) -> Result<u64, SessionError> {
         Ok(self
             .group

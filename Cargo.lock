@@ -294,7 +294,13 @@ dependencies = [
 name = "chat-ffi"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "base64",
+ "engine",
+ "proto",
+ "relay",
  "thiserror 1.0.69",
+ "tokio",
  "uniffi",
 ]
 

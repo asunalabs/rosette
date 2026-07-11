@@ -1,9 +1,14 @@
 # FFI Contract — the backend/frontend seam
 
 This is the ONE interface the backend and frontend share. It lets both teams
-work independently: the frontend builds the whole app against these signatures
-today (they're backed by an in-memory stub), and the backend swaps the stub for
-the real engine later **without changing any signature**.
+work independently: the frontend builds the whole app against these signatures,
+and the backend evolves what's underneath **without changing any signature**.
+
+> **2026-07-12 (T7): the stub is gone.** The same signatures are now backed by
+> the real `engine/` crate — MLS encryption, TLS relay connection, reconnect,
+> dedup, epoch-conflict retry. Nothing the frontend already built changes.
+> Additive updates a frontend dev should know about are marked **ADDITIVE**
+> below.
 
 Source of truth: `ffi/src/lib.rs`. This doc summarizes it; the code is canonical.
 
@@ -45,11 +50,34 @@ Data types: `Conversation { id, display_name, last_message?, unread, verified }`
 Events (pushed via `EngineEventListener.on_event`):
 `MessageReceived`, `ConversationUpdated`, `ConnectionStateChanged { online }`,
 `SecurityCodeChanged`. These map 1:1 to the wireframe-v1 states (reconnect
-banner, failed-send bubble, quiet security-code line).
+banner, failed-send bubble, quiet security-code line). Callbacks always run
+on the dedicated `chat-ffi-dispatch` thread (review OV8), never a tokio
+worker; events fired before `set_listener` are buffered and flushed in order.
 
 The interface is deliberately transport-free — no relay, epoch, MLS, or socket
 terms cross it. That is why it stays stable while the backend adds TLS,
 request-ids, reconnect, and real MLS underneath.
+
+### Real-engine behavior notes (T7, all within the frozen signatures)
+
+- **ADDITIVE — `EngineError` gained two variants:** `RelayUnreachable { reason }`
+  (network problem, distinct from a bad code) and `NotSupported { reason }`
+  (v0.1 limits: one conversation per engine — a second `pair_with_link`
+  returns this). On the Kotlin side these are new exception subclasses;
+  existing `when`/`catch` code keeps compiling.
+- **Home relay config:** `create_contact_link` mints a mailbox on the relay
+  named by the `CHAT_RELAY_ADDR` + `CHAT_RELAY_FINGERPRINT` (64-char hex) env
+  vars (relay address is not user-editable in v1; a baked-in production
+  default replaces this when one exists). `pair_with_link` needs no config —
+  the scanned link carries its relay + fingerprint.
+- **`create_contact_link` failure mode:** the frozen signature is infallible,
+  so when the relay is unreachable/unconfigured it returns an EMPTY string
+  and emits `ConnectionStateChanged { online: false }`. Treat empty as "show
+  the calm offline banner, retry later".
+- `pair_with_link` and `send` block for a network round-trip — call them from
+  a coroutine off the main thread.
+- `display_name` in `Conversation` is the peer's MLS-credential name
+  (decoration only, never an identifier); `"New contact"` if absent.
 
 ## Frontend: consuming it via Gobley
 
@@ -69,14 +97,14 @@ drops to a tracked spike. If Gobley itself fails to generate bindings, that is
 the gate doing its job — fall back to vanilla UniFFI + a hand-written cinterop
 shim for iOS (Android/desktop are fine on vanilla UniFFI's JNA output).
 
-## What "stub" means for the frontend right now
+## ~~What "stub" means for the frontend right now~~ (retired at T7)
 
-`send` stores the message and echoes a canned `echo: <text>` reply through the
-listener, `pair_with_link` fabricates a peer, `create_contact_link` returns a
-placeholder token. No network, no crypto. This is enough to build and exercise
-every wireframe screen (list, chat, pairing, verification, states) against real
-generated bindings. When the backend lands the real engine (T6), the same
-bindings start talking to actual relays — no frontend code change.
+The in-memory stub (canned `echo:` replies, fabricated peers, placeholder
+links) was replaced by the real engine on 2026-07-12 — the same bindings now
+talk to actual relays with real MLS encryption, exactly as promised: no
+frontend code change. For local development, point `CHAT_RELAY_ADDR` /
+`CHAT_RELAY_FINGERPRINT` at a locally running `relay` binary (it prints its
+fingerprint on startup).
 
 ## Changing the contract
 

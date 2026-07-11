@@ -2,27 +2,39 @@
 //! (design doc D4: thick Rust core, high-level UniFFI surface). This crate is
 //! the ONE boundary the two teams share:
 //!
-//!   - Backend owns this file and freezes the exported signatures. The
-//!     internals below are an in-memory STUB so the app runs today; backend
-//!     swaps them for the real `engine/` (crate extraction, T6) without
-//!     changing a single exported signature. Everything the UI calls stays
-//!     put while TLS, request-ids, and reconnect land underneath.
+//!   - Backend owns this file and freezes the exported signatures. As of T7
+//!     the in-memory stub is gone: every call below drives the real
+//!     `engine/` crate (MLS, TLS relay connection, reconnect, dedup,
+//!     epoch-conflict retry). The exported signatures did not change;
+//!     `EngineError` gained two ADDITIVE variants (`RelayUnreachable`,
+//!     `NotSupported`) — new exception subclasses on the Kotlin side,
+//!     non-breaking for existing code.
 //!   - Frontend owns `app/engine-kt` (Gobley) which generates Kotlin bindings
 //!     from these exports, and `app/composeApp` which calls them.
 //!
 //! Deliberately transport-free: nothing here mentions relays, epochs, MLS, or
-//! sockets. That is why the contract survives the backend hardening work — the
-//! UI only ever sees conversations, messages, and events.
+//! sockets — except one bootstrap knob: the home relay for `create_contact_link`
+//! comes from the `CHAT_RELAY_ADDR` + `CHAT_RELAY_FINGERPRINT` (hex) env vars
+//! (relay address is not user-editable in v1; a baked-in production default
+//! lands when one exists). `pair_with_link` needs no config — the link carries
+//! its relay.
 //!
-//! STUB BEHAVIOR (so the frontend can build every wireframe screen against
-//! real bindings): pairing creates a fake conversation; `send` stores the
-//! message and echoes a canned reply back through the listener. No network,
-//! no crypto. Swap-out point is marked `// STUB` throughout.
+//! THREADING (review OV8): the engine lives on its own dedicated thread with
+//! its own tokio runtime, created lazily on first use. Listener callbacks are
+//! NEVER invoked from tokio worker threads — events drain through a channel
+//! consumed by the dedicated `chat-ffi-dispatch` thread, so a slow/blocking
+//! Kotlin handler can stall at most event delivery, never the engine.
+//!
+//! v0.1 scope: ONE conversation per engine (the pairing produces it). The
+//! multi-conversation surface is already shaped for more.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use engine::ChatEngine as CoreEngine;
+use tokio::sync::{mpsc, oneshot};
 
 uniffi::setup_scaffolding!();
 
@@ -40,7 +52,7 @@ pub struct Conversation {
 }
 
 /// One message in a conversation.
-#[derive(uniffi::Record, Clone)]
+#[derive(uniffi::Record, Clone, Debug)]
 pub struct ChatMessage {
     pub id: String,
     pub body: String,
@@ -51,7 +63,7 @@ pub struct ChatMessage {
     pub delivery: DeliveryState,
 }
 
-#[derive(uniffi::Enum, Clone, PartialEq, Eq)]
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
 pub enum DeliveryState {
     /// Composed, not yet accepted by the relay ("Not sent yet · tap to retry").
     Pending,
@@ -89,11 +101,21 @@ pub enum EngineError {
     UnknownConversation,
     #[error("send failed: {reason}")]
     SendFailed { reason: String },
+    /// ADDITIVE (T7): the relay could not be reached. Distinct from
+    /// `InvalidContactLink` so the UI can say "check your connection" instead
+    /// of "bad code".
+    #[error("relay unreachable: {reason}")]
+    RelayUnreachable { reason: String },
+    /// ADDITIVE (T7): the operation is outside v0.1's scope (e.g. pairing a
+    /// second conversation).
+    #[error("not supported: {reason}")]
+    NotSupported { reason: String },
 }
 
-/// The UI implements this to receive pushes. `on_event` may be called from a
-/// dedicated dispatch thread (design doc FFI threading contract) — it must not
-/// block for long.
+/// The UI implements this to receive pushes. `on_event` is always called from
+/// the dedicated `chat-ffi-dispatch` thread (review OV8) — never from a tokio
+/// worker — so it may block briefly without stalling the engine, but should
+/// still hand off to the UI loop quickly.
 #[uniffi::export(callback_interface)]
 pub trait EngineEventListener: Send + Sync {
     fn on_event(&self, event: EngineEvent);
@@ -106,21 +128,82 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-// STUB state. The real engine replaces this whole block with a handle to the
-// extracted `engine/` crate; the exported API above does not change.
+/// v0.1: one conversation per engine, so its id is fixed.
+const CONVERSATION_ID: &str = "conv-1";
+
+#[derive(Clone)]
+struct RelayConfig {
+    addr: String,
+    fingerprint: [u8; 32],
+}
+
+fn relay_config_from_env() -> Option<RelayConfig> {
+    let addr = std::env::var("CHAT_RELAY_ADDR").ok()?;
+    let hex = std::env::var("CHAT_RELAY_FINGERPRINT").ok()?;
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut fingerprint = [0u8; 32];
+    for (i, byte) in fingerprint.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(RelayConfig {
+        addr,
+        fingerprint: fingerprint,
+    })
+}
+
 #[derive(Default)]
-struct StubState {
+struct Store {
     conversations: Vec<Conversation>,
     messages: HashMap<String, Vec<ChatMessage>>,
+}
+
+enum DispatchMsg {
+    Event(EngineEvent),
+    ListenerChanged,
+}
+
+/// State shared between the FFI object, the engine actor thread, and the
+/// dispatch thread.
+struct Shared {
+    store: Mutex<Store>,
+    dispatch_tx: std::sync::mpsc::Sender<DispatchMsg>,
+    seq: AtomicU64,
+}
+
+impl Shared {
+    fn dispatch(&self, event: EngineEvent) {
+        let _ = self.dispatch_tx.send(DispatchMsg::Event(event));
+    }
+
+    fn next_msg_id(&self) -> String {
+        format!("msg-{}", self.seq.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Requests crossing from FFI callers into the engine actor thread.
+enum Command {
+    CreateLink {
+        reply: oneshot::Sender<anyhow::Result<String>>,
+    },
+    Send {
+        body: String,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
 }
 
 /// The one object the UI holds. Created once at app start.
 #[derive(uniffi::Object)]
 pub struct ChatEngine {
     display_name: String,
-    state: Mutex<StubState>,
-    listener: Mutex<Option<Box<dyn EngineEventListener>>>,
-    seq: AtomicU64,
+    relay_cfg: Option<RelayConfig>,
+    shared: Arc<Shared>,
+    listener: Arc<Mutex<Option<Box<dyn EngineEventListener>>>>,
+    /// Command channel to the engine actor thread; None until the first
+    /// operation that needs a live engine spawns it.
+    backend: Mutex<Option<mpsc::Sender<Command>>>,
 }
 
 #[uniffi::export]
@@ -129,63 +212,196 @@ impl ChatEngine {
     /// stable network identifier (design doc: no accounts, no phone numbers).
     #[uniffi::constructor]
     pub fn new(display_name: String) -> Arc<Self> {
+        let (dispatch_tx, dispatch_rx) = std::sync::mpsc::channel::<DispatchMsg>();
+        let listener: Arc<Mutex<Option<Box<dyn EngineEventListener>>>> = Arc::new(Mutex::new(None));
+
+        // OV8: the ONLY place listener callbacks ever run. Events arriving
+        // before set_listener are buffered, then flushed in order.
+        let dispatch_listener = listener.clone();
+        std::thread::Builder::new()
+            .name("chat-ffi-dispatch".to_string())
+            .spawn(move || {
+                let mut buffer: Vec<EngineEvent> = Vec::new();
+                while let Ok(msg) = dispatch_rx.recv() {
+                    match msg {
+                        DispatchMsg::Event(event) => buffer.push(event),
+                        DispatchMsg::ListenerChanged => {}
+                    }
+                    let guard = dispatch_listener.lock().unwrap();
+                    if let Some(l) = guard.as_ref() {
+                        for event in buffer.drain(..) {
+                            l.on_event(event);
+                        }
+                    }
+                }
+            })
+            .expect("spawning the dispatch thread never fails");
+
         Arc::new(ChatEngine {
             display_name,
-            state: Mutex::new(StubState::default()),
-            listener: Mutex::new(None),
-            seq: AtomicU64::new(1),
+            relay_cfg: relay_config_from_env(),
+            shared: Arc::new(Shared {
+                store: Mutex::new(Store::default()),
+                dispatch_tx,
+                seq: AtomicU64::new(1),
+            }),
+            listener,
+            backend: Mutex::new(None),
         })
     }
 
     /// Register (or replace) the event listener. Call once after construction.
+    /// Events that arrived earlier are delivered immediately, in order.
     pub fn set_listener(&self, listener: Box<dyn EngineEventListener>) {
         *self.listener.lock().unwrap() = Some(listener);
+        let _ = self.shared.dispatch_tx.send(DispatchMsg::ListenerChanged);
     }
 
     /// The base64 contact-link string this device's QR code encodes
-    /// (wireframe-v1 frame B). STUB: a placeholder token, not a real link.
+    /// (wireframe-v1 frame B): a fresh MLS KeyPackage plus this device's
+    /// bootstrap mailbox on its home relay. Returns an EMPTY string when the
+    /// relay is unreachable or unconfigured (the signature is frozen and
+    /// infallible) — a `ConnectionStateChanged { online: false }` event
+    /// accompanies that case so the UI can show the calm banner.
     pub fn create_contact_link(&self) -> String {
-        // STUB: real impl builds a proto::ContactLink (KeyPackage + relay
-        // endpoint) and base64-encodes it.
-        format!("chat-contact-stub:{}", self.display_name)
+        // Engine already running (e.g. link regeneration): ask it directly.
+        let existing = self.backend.lock().unwrap().clone();
+        if let Some(cmd_tx) = existing {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if cmd_tx
+                .blocking_send(Command::CreateLink { reply: reply_tx })
+                .is_ok()
+            {
+                if let Ok(Ok(link)) = reply_rx.blocking_recv() {
+                    return link;
+                }
+            }
+            self.shared
+                .dispatch(EngineEvent::ConnectionStateChanged { online: false });
+            return String::new();
+        }
+
+        let Some(cfg) = self.relay_cfg.clone() else {
+            self.shared
+                .dispatch(EngineEvent::ConnectionStateChanged { online: false });
+            return String::new();
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<anyhow::Result<String>>();
+        let name = self.display_name.clone();
+        let shared = self.shared.clone();
+        std::thread::Builder::new()
+            .name("chat-ffi-engine".to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("building the engine runtime never fails");
+                rt.block_on(async move {
+                    let mut core =
+                        match CoreEngine::connect(&name, &cfg.addr, cfg.fingerprint).await {
+                            Ok(core) => core,
+                            Err(e) => {
+                                let _ = init_tx.send(Err(e));
+                                return;
+                            }
+                        };
+                    let link = match core.contact_link() {
+                        Ok(link) => link,
+                        Err(e) => {
+                            let _ = init_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    let _ = init_tx.send(Ok(link));
+                    actor_loop(core, cmd_rx, shared, None).await;
+                });
+            })
+            .expect("spawning the engine thread never fails");
+
+        match init_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(link)) => {
+                *self.backend.lock().unwrap() = Some(cmd_tx);
+                link
+            }
+            _ => {
+                self.shared
+                    .dispatch(EngineEvent::ConnectionStateChanged { online: false });
+                String::new()
+            }
+        }
     }
 
-    /// Consume a scanned/pasted contact link and start a conversation. Returns
-    /// the new conversation id. STUB: fabricates a peer named from the link.
+    /// Consume a scanned/pasted contact link and start a conversation.
+    /// Connects to the relay named IN the link, founds the 2-member MLS
+    /// group, and delivers the Welcome. Returns the new conversation id.
     pub fn pair_with_link(&self, link: String) -> Result<String, EngineError> {
         if link.trim().is_empty() {
             return Err(EngineError::InvalidContactLink);
         }
-        let id = self.next_id("conv");
-        let peer = link
-            .strip_prefix("chat-contact-stub:")
-            .unwrap_or("New contact")
-            .to_string();
-        {
-            let mut s = self.state.lock().unwrap();
-            s.conversations.push(Conversation {
-                id: id.clone(),
-                display_name: peer,
-                last_message: None,
-                unread: 0,
-                verified: false,
+        if self.backend.lock().unwrap().is_some() {
+            return Err(EngineError::NotSupported {
+                reason: "v0.1 supports a single conversation per engine".to_string(),
             });
-            s.messages.insert(id.clone(), Vec::new());
         }
-        self.emit(EngineEvent::ConversationUpdated {
-            conversation: id.clone(),
-        });
-        Ok(id)
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<anyhow::Result<String>>();
+        let name = self.display_name.clone();
+        let shared = self.shared.clone();
+        std::thread::Builder::new()
+            .name("chat-ffi-engine".to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("building the engine runtime never fails");
+                rt.block_on(async move {
+                    let core = match CoreEngine::pair_with_link(&name, &link).await {
+                        Ok(core) => core,
+                        Err(e) => {
+                            let _ = init_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    let conversation = create_conversation(&shared, core.peer_name());
+                    let _ = init_tx.send(Ok(conversation.clone()));
+                    actor_loop(core, cmd_rx, shared, Some(conversation)).await;
+                });
+            })
+            .expect("spawning the engine thread never fails");
+
+        match init_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(conversation)) => {
+                *self.backend.lock().unwrap() = Some(cmd_tx);
+                Ok(conversation)
+            }
+            Ok(Err(e)) => {
+                if e.downcast_ref::<proto::LinkError>().is_some()
+                    || e.downcast_ref::<base64::DecodeError>().is_some()
+                {
+                    Err(EngineError::InvalidContactLink)
+                } else {
+                    Err(EngineError::RelayUnreachable {
+                        reason: e.to_string(),
+                    })
+                }
+            }
+            Err(_) => Err(EngineError::RelayUnreachable {
+                reason: "timed out reaching the relay".to_string(),
+            }),
+        }
     }
 
     /// All conversations, newest activity first (UI sorts as it likes).
     pub fn conversations(&self) -> Vec<Conversation> {
-        self.state.lock().unwrap().conversations.clone()
+        self.shared.store.lock().unwrap().conversations.clone()
     }
 
     /// Messages in a conversation, oldest first.
     pub fn messages(&self, conversation: String) -> Vec<ChatMessage> {
-        self.state
+        self.shared
+            .store
             .lock()
             .unwrap()
             .messages
@@ -194,53 +410,46 @@ impl ChatEngine {
             .unwrap_or_default()
     }
 
-    /// Send a text message. STUB: stores it as Sent, then echoes a canned
-    /// reply back through the listener so the UI has round-trip behavior.
+    /// Send a text message: MLS-encrypted, relayed, end to end. Blocks until
+    /// the relay accepts (or the engine gives up); failed sends are recorded
+    /// with `DeliveryState::Failed` for the retry bubble.
     pub fn send(&self, conversation: String, body: String) -> Result<(), EngineError> {
-        let mine = ChatMessage {
-            id: self.next_id("msg"),
-            body: body.clone(),
-            mine: true,
-            timestamp_ms: now_ms(),
-            delivery: DeliveryState::Sent,
-        };
+        if !self
+            .shared
+            .store
+            .lock()
+            .unwrap()
+            .messages
+            .contains_key(&conversation)
         {
-            let mut s = self.state.lock().unwrap();
-            let msgs = s
-                .messages
-                .get_mut(&conversation)
-                .ok_or(EngineError::UnknownConversation)?;
-            msgs.push(mine);
-            if let Some(c) = s.conversations.iter_mut().find(|c| c.id == conversation) {
-                c.last_message = Some(body.clone());
-            }
+            return Err(EngineError::UnknownConversation);
         }
-        // STUB: canned inbound echo. Real impl delivers peer messages off the
-        // relay fan-out.
-        let reply = ChatMessage {
-            id: self.next_id("msg"),
-            body: format!("echo: {body}"),
-            mine: false,
-            timestamp_ms: now_ms(),
-            delivery: DeliveryState::Received,
-        };
-        {
-            let mut s = self.state.lock().unwrap();
-            if let Some(msgs) = s.messages.get_mut(&conversation) {
-                msgs.push(reply.clone());
-            }
-        }
-        self.emit(EngineEvent::MessageReceived {
-            conversation,
-            message: reply,
-        });
-        Ok(())
+        let cmd_tx = self
+            .backend
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(EngineError::UnknownConversation)?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .blocking_send(Command::Send {
+                body,
+                reply: reply_tx,
+            })
+            .map_err(|_| EngineError::SendFailed {
+                reason: "engine stopped".to_string(),
+            })?;
+        reply_rx
+            .blocking_recv()
+            .map_err(|_| EngineError::SendFailed {
+                reason: "engine stopped".to_string(),
+            })?
     }
 
     /// Mark a conversation verified after the user confirms the safety-number
     /// words. Idempotent.
     pub fn mark_verified(&self, conversation: String) -> Result<(), EngineError> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.shared.store.lock().unwrap();
         let c = s
             .conversations
             .iter_mut()
@@ -248,19 +457,168 @@ impl ChatEngine {
             .ok_or(EngineError::UnknownConversation)?;
         c.verified = true;
         drop(s);
-        self.emit(EngineEvent::ConversationUpdated { conversation });
+        self.shared
+            .dispatch(EngineEvent::ConversationUpdated { conversation });
         Ok(())
     }
 }
 
-impl ChatEngine {
-    fn next_id(&self, prefix: &str) -> String {
-        format!("{prefix}-{}", self.seq.fetch_add(1, Ordering::Relaxed))
+/// Register the (single, v0.1) conversation in the store once pairing
+/// completes, on either side.
+fn create_conversation(shared: &Shared, peer_name: Option<String>) -> String {
+    let id = CONVERSATION_ID.to_string();
+    {
+        let mut store = shared.store.lock().unwrap();
+        store.conversations.push(Conversation {
+            id: id.clone(),
+            display_name: peer_name.unwrap_or_else(|| "New contact".to_string()),
+            last_message: None,
+            unread: 0,
+            verified: false,
+        });
+        store.messages.insert(id.clone(), Vec::new());
     }
+    shared.dispatch(EngineEvent::ConversationUpdated {
+        conversation: id.clone(),
+    });
+    id
+}
 
-    fn emit(&self, event: EngineEvent) {
-        if let Some(l) = self.listener.lock().unwrap().as_ref() {
-            l.on_event(event);
+/// The engine actor: sole owner of the `CoreEngine`, running on the dedicated
+/// engine thread. Interleaves FFI commands with engine events; exits when the
+/// FFI object (and thus the command channel) is dropped.
+async fn actor_loop(
+    mut core: CoreEngine,
+    mut cmd_rx: mpsc::Receiver<Command>,
+    shared: Arc<Shared>,
+    mut conversation: Option<String>,
+) {
+    loop {
+        // The listen side becomes paired mid-loop (await_pairing below).
+        if conversation.is_none() && core.is_paired() {
+            conversation = Some(create_conversation(&shared, core.peer_name()));
+        }
+        match conversation.clone() {
+            Some(conv) => {
+                tokio::select! {
+                    cmd = cmd_rx.recv() => {
+                        let Some(cmd) = cmd else { return };
+                        handle_command(cmd, &mut core, &shared, &conv).await;
+                    }
+                    event = core.next_event() => match event {
+                        Ok(event) => forward_event(event, &shared, &conv),
+                        Err(_) => {
+                            // Reconnect exhausted its patience: the engine is
+                            // wedged. Tell the UI and stop.
+                            shared.dispatch(EngineEvent::ConnectionStateChanged { online: false });
+                            return;
+                        }
+                    }
+                }
+            }
+            None => {
+                tokio::select! {
+                    cmd = cmd_rx.recv() => {
+                        let Some(cmd) = cmd else { return };
+                        handle_command(cmd, &mut core, &shared, CONVERSATION_ID).await;
+                    }
+                    paired = core.await_pairing() => {
+                        if paired.is_err() {
+                            shared.dispatch(EngineEvent::ConnectionStateChanged { online: false });
+                            return;
+                        }
+                        // Conversation creation happens at the top of the loop.
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_command(cmd: Command, core: &mut CoreEngine, shared: &Shared, conversation: &str) {
+    match cmd {
+        Command::CreateLink { reply } => {
+            let _ = reply.send(core.contact_link());
+        }
+        Command::Send { body, reply } => {
+            if !core.is_paired() {
+                let _ = reply.send(Err(EngineError::SendFailed {
+                    reason: "not paired yet".to_string(),
+                }));
+                return;
+            }
+            let result = core.send_message(body.as_bytes()).await;
+            let delivery = if result.is_ok() {
+                DeliveryState::Sent
+            } else {
+                DeliveryState::Failed
+            };
+            {
+                let mut store = shared.store.lock().unwrap();
+                let msg = ChatMessage {
+                    id: shared.next_msg_id(),
+                    body: body.clone(),
+                    mine: true,
+                    timestamp_ms: now_ms(),
+                    delivery,
+                };
+                if let Some(msgs) = store.messages.get_mut(conversation) {
+                    msgs.push(msg);
+                }
+                if let Some(c) = store
+                    .conversations
+                    .iter_mut()
+                    .find(|c| c.id == conversation)
+                {
+                    c.last_message = Some(body);
+                }
+            }
+            shared.dispatch(EngineEvent::ConversationUpdated {
+                conversation: conversation.to_string(),
+            });
+            let _ = reply.send(result.map_err(|e| EngineError::SendFailed {
+                reason: e.to_string(),
+            }));
+        }
+    }
+}
+
+fn forward_event(event: engine::Event, shared: &Shared, conversation: &str) {
+    match event {
+        engine::Event::Message(bytes) => {
+            let message = ChatMessage {
+                id: shared.next_msg_id(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+                mine: false,
+                timestamp_ms: now_ms(),
+                delivery: DeliveryState::Received,
+            };
+            {
+                let mut store = shared.store.lock().unwrap();
+                if let Some(msgs) = store.messages.get_mut(conversation) {
+                    msgs.push(message.clone());
+                }
+                if let Some(c) = store
+                    .conversations
+                    .iter_mut()
+                    .find(|c| c.id == conversation)
+                {
+                    c.last_message = Some(message.body.clone());
+                    c.unread += 1;
+                }
+            }
+            shared.dispatch(EngineEvent::MessageReceived {
+                conversation: conversation.to_string(),
+                message,
+            });
+        }
+        engine::Event::EpochAdvanced(_) => {
+            shared.dispatch(EngineEvent::SecurityCodeChanged {
+                conversation: conversation.to_string(),
+            });
+        }
+        engine::Event::ConnectionChanged(online) => {
+            shared.dispatch(EngineEvent::ConnectionStateChanged { online });
         }
     }
 }
@@ -268,56 +626,35 @@ impl ChatEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
-    #[derive(Default)]
-    struct CountingListener {
-        count: Arc<AtomicUsize>,
-    }
-    impl EngineEventListener for CountingListener {
-        fn on_event(&self, _event: EngineEvent) {
-            self.count.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    // Network-free contract checks; the full stack (real relay, real MLS,
+    // dispatch-thread delivery) is proven in tests/callback_delivery.rs.
 
     #[test]
-    fn pair_send_roundtrip_fires_events_and_records_messages() {
-        let engine = ChatEngine::new("alice".to_string());
-        let count = Arc::new(AtomicUsize::new(0));
-        engine.set_listener(Box::new(CountingListener {
-            count: count.clone(),
-        }));
-
-        let conv = engine
-            .pair_with_link(engine.create_contact_link())
-            .expect("pairing with a well-formed link succeeds");
-        assert_eq!(engine.conversations().len(), 1);
-
-        engine.send(conv.clone(), "hi".to_string()).unwrap();
-        // Stub records the sent message plus its echo reply.
-        let msgs = engine.messages(conv.clone());
-        assert_eq!(msgs.len(), 2);
-        assert!(msgs[0].mine && msgs[0].delivery == DeliveryState::Sent);
-        assert!(!msgs[1].mine && msgs[1].delivery == DeliveryState::Received);
-
-        engine.mark_verified(conv.clone()).unwrap();
-        assert!(engine.conversations()[0].verified);
-
-        // Events fired: pair (ConversationUpdated) + send (MessageReceived) +
-        // verify (ConversationUpdated) = 3.
-        assert_eq!(count.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
-    fn empty_link_and_unknown_conversation_are_errors() {
+    fn empty_and_malformed_links_are_invalid() {
         let engine = ChatEngine::new("bob".to_string());
         assert!(matches!(
             engine.pair_with_link("  ".to_string()),
             Err(EngineError::InvalidContactLink)
         ));
         assert!(matches!(
+            engine.pair_with_link("not b64 at all!!!".to_string()),
+            Err(EngineError::InvalidContactLink)
+        ));
+    }
+
+    #[test]
+    fn unknown_conversation_is_an_error() {
+        let engine = ChatEngine::new("bob".to_string());
+        assert!(matches!(
             engine.send("nope".to_string(), "x".to_string()),
             Err(EngineError::UnknownConversation)
         ));
+        assert!(matches!(
+            engine.mark_verified("nope".to_string()),
+            Err(EngineError::UnknownConversation)
+        ));
+        assert!(engine.conversations().is_empty());
+        assert!(engine.messages("nope".to_string()).is_empty());
     }
 }

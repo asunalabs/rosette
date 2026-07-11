@@ -28,9 +28,16 @@ pub enum Event {
     /// A commit was applied; the group now stands at this epoch. UI-wise
     /// this maps to the quiet "security code changed" system line.
     EpochAdvanced(u64),
+    /// The relay connection dropped (false) or came back (true). Drives the
+    /// calm reconnect banner. v0.1 limitation (disclosed): both events
+    /// surface only once the reconnect loop finishes, because `next_event`
+    /// blocks inside it — live "offline" signaling needs the engine to pump
+    /// on its own task, which arrives with the FFI dispatch layer's caller.
+    ConnectionChanged(bool),
 }
 
 pub struct ChatEngine {
+    display_name: String,
     session: ChatSession,
     relay: RelayClient,
     relay_addr: String,
@@ -80,6 +87,7 @@ impl ChatEngine {
         let (mailbox_qid, mailbox_key) = relay.create_mailbox().await?;
         relay.subscribe(vec![mailbox_qid]).await?;
         Ok(ChatEngine {
+            display_name: display_name.to_string(),
             session: ChatSession::new(display_name),
             relay,
             relay_addr: relay_addr.to_string(),
@@ -146,6 +154,11 @@ impl ChatEngine {
 
     /// The "listen" side's second half: wait for the scanner's bootstrap
     /// payload, join the group, adopt the group inbox credentials.
+    /// Cancellation-safe past the join: all pairing state is set
+    /// synchronously after the push arrives, before the ack await — a
+    /// dropped future at worst skips the ack, which redelivery + the
+    /// seen-set absorb. Callers racing this in a select! should re-check
+    /// `is_paired()`.
     pub async fn await_pairing(&mut self) -> anyhow::Result<()> {
         loop {
             let Some((qid, envelope)) = self.relay.push_rx.recv().await else {
@@ -156,10 +169,23 @@ impl ChatEngine {
             self.session
                 .join_from_welcome(&payload.welcome_wire, &payload.tree_wire)?;
             self.seen.insert(envelope.message_id);
-            self.try_ack(qid, envelope.message_id).await?;
             self.inbox = Some((payload.inbox_qid, payload.inbox_key));
+            self.try_ack(qid, envelope.message_id).await?;
             return Ok(());
         }
+    }
+
+    /// True once this engine has a conversation to send into (either side
+    /// of the pairing handshake has completed).
+    pub fn is_paired(&self) -> bool {
+        self.inbox.is_some()
+    }
+
+    /// The peer's display name, read from their MLS credential. Decoration
+    /// only — never an identifier. None until paired.
+    pub fn peer_name(&self) -> Option<String> {
+        let names = self.session.member_names().ok()?;
+        names.into_iter().find(|n| *n != self.display_name)
     }
 
     pub fn epoch(&self) -> anyhow::Result<u64> {
@@ -270,7 +296,14 @@ impl ChatEngine {
     /// two can't lose it.
     async fn pump_one(&mut self) -> anyhow::Result<()> {
         match self.relay.push_rx.recv().await {
-            None => self.reconnect().await,
+            None => {
+                self.pending_events
+                    .push_back(Event::ConnectionChanged(false));
+                self.reconnect().await?;
+                self.pending_events
+                    .push_back(Event::ConnectionChanged(true));
+                Ok(())
+            }
             Some((qid, envelope)) => {
                 let id = envelope.message_id;
                 if self.seen.insert(id) {

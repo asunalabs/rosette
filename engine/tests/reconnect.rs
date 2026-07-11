@@ -103,7 +103,19 @@ async fn engine_reconnects_resubscribes_and_replays_backlog_without_loss_or_dup(
 
     // Alice's next_event notices the dead connection, reconnects (accept
     // #2), re-subscribes, and the replayed backlog surfaces "two" — not
-    // "one" (acked, gone), not an error, not a duplicate.
+    // "one" (acked, gone), not an error, not a duplicate. The engine also
+    // reports the connection cycle, in order, before the replay.
+    assert_eq!(
+        timeout(Duration::from_secs(30), alice.next_event())
+            .await
+            .expect("offline event")
+            .unwrap(),
+        Event::ConnectionChanged(false)
+    );
+    assert_eq!(
+        alice.next_event().await.unwrap(),
+        Event::ConnectionChanged(true)
+    );
     expect_message(&mut alice, b"two").await;
 
     // The fresh connection is fully functional in both directions, and
