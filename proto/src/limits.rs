@@ -22,6 +22,13 @@ pub const RATE_LIMIT_PER_QUEUE_PER_MINUTE: u32 = 60;
 /// queue (amendment A18). Crude by design — raise if abuse is observed.
 pub const QUEUE_CREATION_POW_DIFFICULTY: u8 = 16;
 
+/// Max unsolved PoW challenges the relay tracks at once. A stranger can request
+/// challenges without ever solving them; without this cap the outstanding set
+/// grows until OOM. At the cap the relay FIFO-evicts the oldest unsolved
+/// challenge (a solver racing eviction just re-requests — cheap for them, and
+/// the cap is generous relative to legitimate concurrent pairings).
+pub const MAX_OUTSTANDING_POW_CHALLENGES: usize = 10_000;
+
 /// Undelivered fan-out journal entries older than this are dropped (amendment
 /// A3's retention rule — delete-on-ack, TTL on undelivered).
 pub const FAN_OUT_JOURNAL_TTL_SECS: u64 = 14 * 24 * 60 * 60;

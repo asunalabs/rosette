@@ -60,6 +60,10 @@ struct Inner {
     queues: HashMap<QueueId, QueueEntry>,
     subscribers: HashMap<QueueId, Vec<PushSender>>,
     outstanding_challenges: HashMap<[u8; 32], u8>,
+    /// Insertion order of `outstanding_challenges` keys, for FIFO eviction at
+    /// the cap. May hold keys already consumed/removed from the map; eviction
+    /// tolerates that (the remove is a no-op). Bounded by the same cap.
+    challenge_order: VecDeque<[u8; 32]>,
     storage_bytes_used: u64,
 }
 
@@ -83,9 +87,20 @@ impl RelayState {
     pub fn issue_pow_challenge(&self) -> PowChallenge {
         let challenge = PowChallenge::generate(limits::QUEUE_CREATION_POW_DIFFICULTY);
         let mut inner = self.inner.lock().unwrap();
+        // Bounded: FIFO-evict the oldest unsolved challenge(s) so a client that
+        // requests challenges without ever solving them can't OOM the relay.
+        while inner.challenge_order.len() >= limits::MAX_OUTSTANDING_POW_CHALLENGES {
+            match inner.challenge_order.pop_front() {
+                Some(oldest) => {
+                    inner.outstanding_challenges.remove(&oldest);
+                }
+                None => break,
+            }
+        }
         inner
             .outstanding_challenges
             .insert(challenge.challenge, challenge.difficulty);
+        inner.challenge_order.push_back(challenge.challenge);
         challenge
     }
 
@@ -164,13 +179,16 @@ impl RelayState {
         Ok((queue_id, send_key))
     }
 
-    /// Registers `tx` to receive every future push for `queue_ids`. Replaces
-    /// this sender's prior subscription entirely (a fresh Subscribe call
-    /// always states the full current set — see wire.rs docs).
+    /// Registers `tx` to receive every future push for `queue_ids`. Idempotent
+    /// per connection: a re-subscribe from the same connection (same channel)
+    /// does NOT stack a second sender for a queue — that would double-deliver
+    /// every push. Also prunes senders whose connection has since closed.
     pub fn subscribe(&self, queue_ids: &[QueueId], tx: PushSender) {
         let mut inner = self.inner.lock().unwrap();
         for qid in queue_ids {
-            inner.subscribers.entry(*qid).or_default().push(tx.clone());
+            let subs = inner.subscribers.entry(*qid).or_default();
+            subs.retain(|existing| !existing.is_closed() && !existing.same_channel(&tx));
+            subs.push(tx.clone());
         }
     }
 
@@ -190,10 +208,11 @@ impl RelayState {
         if stored {
             inner.storage_bytes_used += envelope.padded_ciphertext.len() as u64;
         }
-        if let Some(subs) = inner.subscribers.get(&queue_id) {
-            for tx in subs {
-                let _ = tx.send((queue_id, message_id, envelope.clone()));
-            }
+        // Prune dead subscribers as we notify: a send that fails means the
+        // receiving connection is gone, so drop its sender instead of leaking
+        // it forever (every reconnect would otherwise add a permanent entry).
+        if let Some(subs) = inner.subscribers.get_mut(&queue_id) {
+            subs.retain(|tx| tx.send((queue_id, message_id, envelope.clone())).is_ok());
         }
     }
 
@@ -563,5 +582,81 @@ mod tests {
         state
             .send_to_mailbox(qid, tag2, over)
             .expect("storage freed by ack");
+    }
+
+    #[test]
+    fn resubscribe_same_connection_does_not_double_deliver() {
+        // Bug fix (eng-review OV9): subscribe used to append, so a connection
+        // that re-sent its Subscribe (the documented "full current set" flow)
+        // got registered twice and received every push twice.
+        let state = RelayState::new();
+        let (member, _) = state.create_mailbox(solved_pow(&state)).unwrap();
+        let (inbox, key) = state
+            .create_group_inbox(solved_pow(&state), 1, vec![member])
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.subscribe(&[member], tx.clone());
+        state.subscribe(&[member], tx); // re-subscribe, same channel
+
+        let e = env(1);
+        let tag = proto::compute_tag(&key, &inbox, &e);
+        state
+            .send_to_group_inbox(inbox, GroupSendKind::Application, tag, e)
+            .unwrap();
+
+        assert!(rx.try_recv().is_ok(), "one delivery expected");
+        assert!(
+            rx.try_recv().is_err(),
+            "must not double-deliver to a re-subscribed connection"
+        );
+    }
+
+    #[test]
+    fn dead_subscriber_is_pruned_on_send() {
+        // Bug fix (eng-review OV9): a dropped connection's sender used to stay
+        // registered forever. After the receiver is dropped, the next send must
+        // remove it so the subscriber list doesn't grow without bound.
+        let state = RelayState::new();
+        let (member, _) = state.create_mailbox(solved_pow(&state)).unwrap();
+        let (inbox, key) = state
+            .create_group_inbox(solved_pow(&state), 1, vec![member])
+            .unwrap();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        state.subscribe(&[member], tx);
+        drop(rx); // connection gone
+
+        let e = env(1);
+        let tag = proto::compute_tag(&key, &inbox, &e);
+        state
+            .send_to_group_inbox(inbox, GroupSendKind::Application, tag, e)
+            .unwrap();
+
+        let inner = state.inner.lock().unwrap();
+        assert_eq!(
+            inner.subscribers.get(&member).map(|v| v.len()).unwrap_or(0),
+            0,
+            "dead sender must be pruned after a failed push"
+        );
+    }
+
+    #[test]
+    fn outstanding_pow_challenges_are_bounded() {
+        // Bug fix (eng-review OV9): requesting challenges without solving them
+        // used to grow the map without limit (OOM). It must stay capped.
+        let state = RelayState::new();
+        for _ in 0..(limits::MAX_OUTSTANDING_POW_CHALLENGES + 500) {
+            state.issue_pow_challenge();
+        }
+        let inner = state.inner.lock().unwrap();
+        assert!(
+            inner.outstanding_challenges.len() <= limits::MAX_OUTSTANDING_POW_CHALLENGES,
+            "outstanding challenge map must stay within its cap"
+        );
+        assert!(
+            inner.challenge_order.len() <= limits::MAX_OUTSTANDING_POW_CHALLENGES,
+            "challenge order deque must stay within its cap"
+        );
     }
 }
