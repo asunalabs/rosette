@@ -34,9 +34,13 @@ pub fn key_package_to_bytes(key_package: &KeyPackage) -> Result<Vec<u8>, Pairing
         .map_err(|e| PairingError::Decode(e.to_string()))
 }
 
-pub fn key_package_from_bytes(bytes: &[u8], provider: &Provider) -> Result<KeyPackage, PairingError> {
+pub fn key_package_from_bytes(
+    bytes: &[u8],
+    provider: &Provider,
+) -> Result<KeyPackage, PairingError> {
     let mut cursor = bytes;
-    let msg_in = MlsMessageIn::tls_deserialize(&mut cursor).map_err(|e| PairingError::Decode(e.to_string()))?;
+    let msg_in = MlsMessageIn::tls_deserialize(&mut cursor)
+        .map_err(|e| PairingError::Decode(e.to_string()))?;
     let kp_in = match msg_in.extract() {
         MlsMessageBodyIn::KeyPackage(kp) => kp,
         _ => return Err(PairingError::NotAKeyPackage),
@@ -66,7 +70,10 @@ pub fn build_contact_link(
 }
 
 /// The scanner's side: pull a usable KeyPackage back out of a scanned link.
-pub fn key_package_from_link(link: &ContactLink, provider: &Provider) -> Result<KeyPackage, PairingError> {
+pub fn key_package_from_link(
+    link: &ContactLink,
+    provider: &Provider,
+) -> Result<KeyPackage, PairingError> {
     key_package_from_bytes(&link.key_package, provider)
 }
 
@@ -81,12 +88,22 @@ mod tests {
         let bundle = alice.generate_key_package().unwrap();
 
         let bob_provider = Provider::default();
-        let link = build_contact_link(bundle.key_package(), "relay.local:7443", [1u8; 32], [2u8; 32]).unwrap();
+        let link = build_contact_link(
+            bundle.key_package(),
+            "relay.local:7443",
+            [1u8; 32],
+            [2u8; 32],
+        )
+        .unwrap();
 
         let recovered = key_package_from_link(&link, &bob_provider).unwrap();
         assert_eq!(
             recovered.leaf_node().credential().serialized_content(),
-            bundle.key_package().leaf_node().credential().serialized_content()
+            bundle
+                .key_package()
+                .leaf_node()
+                .credential()
+                .serialized_content()
         );
     }
 }

@@ -10,8 +10,8 @@
 
 use base64::Engine;
 use chatcore::{message_id_for, ChatSession, Incoming};
-use cli::RelayClient;
 use clap::{Parser, Subcommand};
+use cli::RelayClient;
 use proto::{ContactLink, DeliveryMode, Endpoint, Envelope, GroupSendKind, QueueId};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -55,7 +55,11 @@ struct BootstrapPayload {
 
 fn wrap(wire_bytes: Vec<u8>) -> Envelope {
     let padded = proto::pad(&wire_bytes).expect("demo messages fit the largest padding bucket");
-    Envelope::new(message_id_for(&wire_bytes), DeliveryMode::RelayFanout, padded)
+    Envelope::new(
+        message_id_for(&wire_bytes),
+        DeliveryMode::RelayFanout,
+        padded,
+    )
 }
 
 #[tokio::main]
@@ -75,14 +79,23 @@ async fn listen(name: &str, relay_addr: &str) -> anyhow::Result<()> {
     relay.subscribe(vec![mailbox_qid]).await?;
 
     let key_package = session.generate_key_package()?;
-    let link = chatcore::pairing::build_contact_link(key_package.key_package(), relay_addr, mailbox_qid, mailbox_key)?;
+    let link = chatcore::pairing::build_contact_link(
+        key_package.key_package(),
+        relay_addr,
+        mailbox_qid,
+        mailbox_key,
+    )?;
     let link_b64 = base64::engine::general_purpose::STANDARD.encode(link.to_bytes());
     println!("Share this link: {link_b64}");
     println!("Waiting to be paired...");
 
     let mut relay = relay;
     let (inbox_qid, inbox_key) = loop {
-        let (_qid, envelope) = relay.push_rx.recv().await.ok_or_else(|| anyhow::anyhow!("relay connection closed"))?;
+        let (_qid, envelope) = relay
+            .push_rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("relay connection closed"))?;
         let payload: BootstrapPayload = bincode::deserialize(&envelope.padded_ciphertext)?;
         session.join_from_welcome(&payload.welcome_wire, &payload.tree_wire)?;
         println!("Paired. Epoch {}.", session.epoch()?);
@@ -95,7 +108,11 @@ async fn listen(name: &str, relay_addr: &str) -> anyhow::Result<()> {
 async fn connect(link_b64: &str, name: &str, relay_addr: &str) -> anyhow::Result<()> {
     let link_bytes = base64::engine::general_purpose::STANDARD.decode(link_b64.trim())?;
     let link = ContactLink::from_bytes(&link_bytes)?;
-    let Endpoint { queue_id: peer_mailbox, send_key: peer_send_key, .. } = link.primary_endpoint().clone();
+    let Endpoint {
+        queue_id: peer_mailbox,
+        send_key: peer_send_key,
+        ..
+    } = link.primary_endpoint().clone();
 
     let mut session = ChatSession::new(name);
     let relay = RelayClient::connect(relay_addr).await?;
@@ -107,7 +124,9 @@ async fn connect(link_b64: &str, name: &str, relay_addr: &str) -> anyhow::Result
     let welcome_wire = session.add_members(&[peer_kp])?;
     let tree_wire = session.export_ratchet_tree()?;
 
-    let (inbox_qid, inbox_key) = relay.create_group_inbox(1, vec![own_mailbox, peer_mailbox]).await?;
+    let (inbox_qid, inbox_key) = relay
+        .create_group_inbox(1, vec![own_mailbox, peer_mailbox])
+        .await?;
     let payload = BootstrapPayload {
         welcome_wire,
         tree_wire,
@@ -115,13 +134,20 @@ async fn connect(link_b64: &str, name: &str, relay_addr: &str) -> anyhow::Result
         inbox_key,
     };
     let envelope = wrap(bincode::serialize(&payload)?);
-    relay.send_to_mailbox(peer_mailbox, &peer_send_key, envelope).await?;
+    relay
+        .send_to_mailbox(peer_mailbox, &peer_send_key, envelope)
+        .await?;
     println!("Paired. Epoch {}.", session.epoch()?);
 
     chat_repl(session, relay, inbox_qid, inbox_key).await
 }
 
-async fn chat_repl(mut session: ChatSession, mut relay: RelayClient, inbox_qid: QueueId, inbox_key: [u8; 32]) -> anyhow::Result<()> {
+async fn chat_repl(
+    mut session: ChatSession,
+    mut relay: RelayClient,
+    inbox_qid: QueueId,
+    inbox_key: [u8; 32],
+) -> anyhow::Result<()> {
     let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();

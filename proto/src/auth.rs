@@ -22,7 +22,12 @@ pub fn compute_tag(send_key: &[u8; 32], queue_id: &QueueId, envelope: &Envelope)
     tag
 }
 
-pub fn verify_tag(send_key: &[u8; 32], queue_id: &QueueId, envelope: &Envelope, tag: &AuthTag) -> bool {
+pub fn verify_tag(
+    send_key: &[u8; 32],
+    queue_id: &QueueId,
+    envelope: &Envelope,
+    tag: &AuthTag,
+) -> bool {
     compute_tag(send_key, queue_id, envelope) == *tag
 }
 

@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail};
 use proto::framing::{read_frame, write_frame, ReadFrameError};
-use proto::{ClientMessage, Envelope, GroupSendKind, PowSolution, QueueId, RejectionCode, ServerMessage};
+use proto::{
+    ClientMessage, Envelope, GroupSendKind, PowSolution, QueueId, RejectionCode, ServerMessage,
+};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
@@ -31,7 +33,8 @@ impl RelayClient {
             }
         });
 
-        let reply_slot: Arc<Mutex<Option<oneshot::Sender<ServerMessage>>>> = Arc::new(Mutex::new(None));
+        let reply_slot: Arc<Mutex<Option<oneshot::Sender<ServerMessage>>>> =
+            Arc::new(Mutex::new(None));
         let (push_tx, push_rx) = mpsc::unbounded_channel();
         let reader_slot = reply_slot.clone();
         tokio::spawn(async move {
@@ -70,8 +73,11 @@ impl RelayClient {
             }
             *slot = Some(tx);
         }
-        self.write_tx.send(msg).map_err(|_| anyhow!("relay connection closed"))?;
-        rx.await.map_err(|_| anyhow!("relay connection closed before replying"))
+        self.write_tx
+            .send(msg)
+            .map_err(|_| anyhow!("relay connection closed"))?;
+        rx.await
+            .map_err(|_| anyhow!("relay connection closed before replying"))
     }
 
     async fn create_queue_with_pow(
@@ -91,7 +97,8 @@ impl RelayClient {
     }
 
     pub async fn create_mailbox(&self) -> anyhow::Result<(QueueId, [u8; 32])> {
-        self.create_queue_with_pow(|solution| ClientMessage::CreateMailbox { solution }).await
+        self.create_queue_with_pow(|solution| ClientMessage::CreateMailbox { solution })
+            .await
     }
 
     pub async fn create_group_inbox(
@@ -107,10 +114,19 @@ impl RelayClient {
         .await
     }
 
-    pub async fn send_to_mailbox(&self, queue_id: QueueId, send_key: &[u8; 32], envelope: Envelope) -> anyhow::Result<()> {
+    pub async fn send_to_mailbox(
+        &self,
+        queue_id: QueueId,
+        send_key: &[u8; 32],
+        envelope: Envelope,
+    ) -> anyhow::Result<()> {
         let auth_tag = proto::compute_tag(send_key, &queue_id, &envelope);
         match self
-            .call(ClientMessage::SendToMailbox { queue_id, auth_tag, envelope })
+            .call(ClientMessage::SendToMailbox {
+                queue_id,
+                auth_tag,
+                envelope,
+            })
             .await?
         {
             ServerMessage::Ok => Ok(()),
@@ -131,7 +147,12 @@ impl RelayClient {
     ) -> anyhow::Result<Result<(), RejectionCode>> {
         let auth_tag = proto::compute_tag(send_key, &queue_id, &envelope);
         match self
-            .call(ClientMessage::SendToGroupInbox { queue_id, kind, auth_tag, envelope })
+            .call(ClientMessage::SendToGroupInbox {
+                queue_id,
+                kind,
+                auth_tag,
+                envelope,
+            })
             .await?
         {
             ServerMessage::Ok => Ok(Ok(())),
@@ -148,7 +169,13 @@ impl RelayClient {
     }
 
     pub async fn ack(&self, queue_id: QueueId, message_id: [u8; 16]) -> anyhow::Result<()> {
-        match self.call(ClientMessage::Ack { queue_id, message_id }).await? {
+        match self
+            .call(ClientMessage::Ack {
+                queue_id,
+                message_id,
+            })
+            .await?
+        {
             ServerMessage::Ok => Ok(()),
             other => bail!("expected Ok, got {other:?}"),
         }

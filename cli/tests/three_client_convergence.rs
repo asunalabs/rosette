@@ -26,7 +26,11 @@ async fn start_relay() -> String {
 
 fn wrap(wire_bytes: Vec<u8>) -> Envelope {
     let padded = proto::pad(&wire_bytes).expect("skeleton test messages fit the largest bucket");
-    Envelope::new(message_id_for(&wire_bytes), DeliveryMode::RelayFanout, padded)
+    Envelope::new(
+        message_id_for(&wire_bytes),
+        DeliveryMode::RelayFanout,
+        padded,
+    )
 }
 
 /// A member's view of the relay: its own mailbox (for fan-out delivery) and
@@ -65,11 +69,19 @@ impl Member {
     /// delivery, so pushes can arrive interleaved with unrelated traffic.
     async fn recv_next_foreign(&mut self) -> Incoming {
         loop {
-            let (_qid, envelope) = self.relay.push_rx.recv().await.expect("relay connection alive");
+            let (_qid, envelope) = self
+                .relay
+                .push_rx
+                .recv()
+                .await
+                .expect("relay connection alive");
             if self.authored.remove(&envelope.message_id) {
                 continue; // this is my own fan-out echo — already applied locally
             }
-            return self.session.process_incoming(&envelope.padded_ciphertext).unwrap();
+            return self
+                .session
+                .process_incoming(&envelope.padded_ciphertext)
+                .unwrap();
         }
     }
 }
@@ -94,8 +106,13 @@ async fn three_clients_converge_after_a_concurrent_commit_conflict() {
         .add_members(&[bob_kp.key_package().clone(), carol_kp.key_package().clone()])
         .unwrap();
     let tree_wire = alice.session.export_ratchet_tree().unwrap();
-    bob.session.join_from_welcome(&welcome_wire, &tree_wire).unwrap();
-    carol.session.join_from_welcome(&welcome_wire, &tree_wire).unwrap();
+    bob.session
+        .join_from_welcome(&welcome_wire, &tree_wire)
+        .unwrap();
+    carol
+        .session
+        .join_from_welcome(&welcome_wire, &tree_wire)
+        .unwrap();
     assert_eq!(alice.session.epoch().unwrap(), 1);
     assert_eq!(bob.session.epoch().unwrap(), 1);
     assert_eq!(carol.session.epoch().unwrap(), 1);
@@ -105,7 +122,10 @@ async fn three_clients_converge_after_a_concurrent_commit_conflict() {
     // actual first message, not an out-of-band test shortcut. ---
     let (inbox_qid, inbox_key) = alice
         .relay
-        .create_group_inbox(1, vec![alice.mailbox_qid, bob.mailbox_qid, carol.mailbox_qid])
+        .create_group_inbox(
+            1,
+            vec![alice.mailbox_qid, bob.mailbox_qid, carol.mailbox_qid],
+        )
         .await
         .unwrap();
     let creds_plaintext = bincode::serialize(&(inbox_qid, inbox_key)).unwrap();
@@ -114,7 +134,12 @@ async fn three_clients_converge_after_a_concurrent_commit_conflict() {
     alice.authored.insert(creds_envelope.message_id);
     alice
         .relay
-        .send_to_group_inbox(inbox_qid, &inbox_key, GroupSendKind::Application, creds_envelope)
+        .send_to_group_inbox(
+            inbox_qid,
+            &inbox_key,
+            GroupSendKind::Application,
+            creds_envelope,
+        )
         .await
         .unwrap()
         .expect("creds broadcast must succeed");
@@ -134,11 +159,18 @@ async fn three_clients_converge_after_a_concurrent_commit_conflict() {
     let carol_envelope = wrap(carol_commit_wire.clone());
 
     let (bob_result, carol_result) = tokio::join!(
-        bob.relay
-            .send_to_group_inbox(inbox_qid, &inbox_key, GroupSendKind::Commit { epoch: 1 }, bob_envelope.clone()),
-        carol
-            .relay
-            .send_to_group_inbox(inbox_qid, &inbox_key, GroupSendKind::Commit { epoch: 1 }, carol_envelope.clone())
+        bob.relay.send_to_group_inbox(
+            inbox_qid,
+            &inbox_key,
+            GroupSendKind::Commit { epoch: 1 },
+            bob_envelope.clone()
+        ),
+        carol.relay.send_to_group_inbox(
+            inbox_qid,
+            &inbox_key,
+            GroupSendKind::Commit { epoch: 1 },
+            carol_envelope.clone()
+        )
     );
     let bob_result = bob_result.unwrap();
     let carol_result = carol_result.unwrap();
@@ -190,11 +222,19 @@ async fn three_clients_converge_after_a_concurrent_commit_conflict() {
 
     // --- Real convergence, not just matching epoch numbers: every member
     // can now send and every other member can decrypt. ---
-    let members: [(&str, &mut Member); 3] = [("alice", &mut alice), ("bob", &mut bob), ("carol", &mut carol)];
+    let members: [(&str, &mut Member); 3] = [
+        ("alice", &mut alice),
+        ("bob", &mut bob),
+        ("carol", &mut carol),
+    ];
     let senders = members;
     for i in 0..senders.len() {
         let plaintext = format!("hello from {}", senders[i].0).into_bytes();
-        let wire = senders[i].1.session.encrypt_application(&plaintext).unwrap();
+        let wire = senders[i]
+            .1
+            .session
+            .encrypt_application(&plaintext)
+            .unwrap();
         let envelope = wrap(wire);
         senders[i].1.authored.insert(envelope.message_id);
         let (qid, key) = (inbox_qid, inbox_key);

@@ -54,7 +54,11 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    pub fn new(message_id: MessageId, delivery_mode: DeliveryMode, padded_ciphertext: Vec<u8>) -> Self {
+    pub fn new(
+        message_id: MessageId,
+        delivery_mode: DeliveryMode,
+        padded_ciphertext: Vec<u8>,
+    ) -> Self {
         Envelope {
             message_id,
             delivery_mode,

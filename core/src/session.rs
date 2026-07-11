@@ -131,7 +131,11 @@ impl ChatSession {
     }
 
     /// Joins a group from a received Welcome + out-of-band ratchet tree.
-    pub fn join_from_welcome(&mut self, welcome_wire: &[u8], ratchet_tree_wire: &[u8]) -> Result<(), SessionError> {
+    pub fn join_from_welcome(
+        &mut self,
+        welcome_wire: &[u8],
+        ratchet_tree_wire: &[u8],
+    ) -> Result<(), SessionError> {
         let mut cursor = welcome_wire;
         let msg_in = MlsMessageIn::tls_deserialize(&mut cursor)
             .map_err(|e| SessionError::Decode(e.to_string()))?;
@@ -158,7 +162,12 @@ impl ChatSession {
     }
 
     pub fn epoch(&self) -> Result<u64, SessionError> {
-        Ok(self.group.as_ref().ok_or(SessionError::NoGroup)?.epoch().as_u64())
+        Ok(self
+            .group
+            .as_ref()
+            .ok_or(SessionError::NoGroup)?
+            .epoch()
+            .as_u64())
     }
 
     /// Builds a self-update commit (a plain, membership-preserving epoch
@@ -169,7 +178,11 @@ impl ChatSession {
     pub fn self_update(&mut self) -> Result<Vec<u8>, SessionError> {
         let group = self.group.as_mut().ok_or(SessionError::NoGroup)?;
         let bundle = group
-            .self_update(&self.provider, &self.identity.signer, LeafNodeParameters::default())
+            .self_update(
+                &self.provider,
+                &self.identity.signer,
+                LeafNodeParameters::default(),
+            )
             .map_err(|e| SessionError::Mls(e.to_string()))?;
         bundle
             .commit()
@@ -222,7 +235,9 @@ impl ChatSession {
             .process_message(&self.provider, protocol_message)
             .map_err(|e| SessionError::Mls(e.to_string()))?;
         match processed.into_content() {
-            ProcessedMessageContent::ApplicationMessage(app) => Ok(Incoming::Application(app.into_bytes())),
+            ProcessedMessageContent::ApplicationMessage(app) => {
+                Ok(Incoming::Application(app.into_bytes()))
+            }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 group
                     .merge_staged_commit(&self.provider, *staged)

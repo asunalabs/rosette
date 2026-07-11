@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use crate::envelope::{Envelope, MessageId};
 use crate::error::RejectionCode;
 use crate::link::QueueId;
-use crate::pow::PowSolution;
 pub use crate::pow::PowChallenge;
+use crate::pow::PowSolution;
 
 /// MAC over (queue_id, envelope) using the per-queue send key established at
 /// pairing/creation. "No accounts" never means "no send authorization."

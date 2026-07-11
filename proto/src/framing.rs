@@ -34,7 +34,9 @@ where
 {
     let len = match reader.read_u32_le().await {
         Ok(len) => len,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(ReadFrameError::Closed),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(ReadFrameError::Closed)
+        }
         Err(e) => return Err(e.into()),
     };
     if len as usize > crate::limits::MAX_MESSAGE_SIZE * 2 {

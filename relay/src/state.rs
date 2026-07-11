@@ -8,8 +8,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use proto::{
-    limits, AuthTag, ClientMessage, Envelope, GroupSendKind, MessageId, PowChallenge,
-    PowSolution, QueueId, RejectionCode, ServerMessage,
+    limits, AuthTag, ClientMessage, Envelope, GroupSendKind, MessageId, PowChallenge, PowSolution,
+    QueueId, RejectionCode, ServerMessage,
 };
 use rand::RngCore;
 use tokio::sync::mpsc;
@@ -115,7 +115,10 @@ impl RelayState {
         }
     }
 
-    pub fn create_mailbox(&self, solution: PowSolution) -> Result<(QueueId, [u8; 32]), RejectionCode> {
+    pub fn create_mailbox(
+        &self,
+        solution: PowSolution,
+    ) -> Result<(QueueId, [u8; 32]), RejectionCode> {
         let mut inner = self.inner.lock().unwrap();
         self.consume_pow(&mut inner, &solution)?;
         let queue_id = Self::fresh_queue_id(&inner);
@@ -171,7 +174,12 @@ impl RelayState {
         }
     }
 
-    fn push_and_notify(inner: &mut Inner, queue_id: QueueId, message_id: MessageId, envelope: Envelope) {
+    fn push_and_notify(
+        inner: &mut Inner,
+        queue_id: QueueId,
+        message_id: MessageId,
+        envelope: Envelope,
+    ) {
         let mut stored = false;
         if let Some(entry) = inner.queues.get_mut(&queue_id) {
             if let QueueKind::Mailbox { pending } = &mut entry.kind {
@@ -271,20 +279,29 @@ impl RelayState {
                 QueueKind::GroupInbox { epoch, fan_out_to } => (*epoch, fan_out_to.clone()),
                 QueueKind::Mailbox { .. } => return Err(RejectionCode::GroupInboxNotFound),
             };
-            if let GroupSendKind::Commit { epoch: target_epoch } = kind {
+            if let GroupSendKind::Commit {
+                epoch: target_epoch,
+            } = kind
+            {
                 if target_epoch != current_epoch {
                     return Err(RejectionCode::EpochConflict);
                 }
             }
             roster
         };
-        if Self::would_exceed_storage_bound(&inner, envelope.padded_ciphertext.len(), fan_out_to.len()) {
+        if Self::would_exceed_storage_bound(
+            &inner,
+            envelope.padded_ciphertext.len(),
+            fan_out_to.len(),
+        ) {
             return Err(RejectionCode::StorageBoundExceeded);
         }
         {
             let entry = inner.queues.get_mut(&queue_id).expect("checked above");
             entry.check_and_bump_rate_limit()?;
-            if let (GroupSendKind::Commit { .. }, QueueKind::GroupInbox { epoch, .. }) = (kind, &mut entry.kind) {
+            if let (GroupSendKind::Commit { .. }, QueueKind::GroupInbox { epoch, .. }) =
+                (kind, &mut entry.kind)
+            {
                 *epoch += 1;
             }
         }
@@ -323,7 +340,9 @@ impl RelayState {
     /// unit tests without opening a socket.
     pub fn handle(&self, msg: ClientMessage, push_tx: Option<PushSender>) -> ServerMessage {
         match msg {
-            ClientMessage::RequestPowChallenge => ServerMessage::PowChallenge(self.issue_pow_challenge()),
+            ClientMessage::RequestPowChallenge => {
+                ServerMessage::PowChallenge(self.issue_pow_challenge())
+            }
             ClientMessage::CreateMailbox { solution } => match self.create_mailbox(solution) {
                 Ok((queue_id, send_key)) => ServerMessage::QueueCreated { queue_id, send_key },
                 Err(e) => ServerMessage::Error(e),
@@ -359,7 +378,10 @@ impl RelayState {
                 }
                 ServerMessage::Ok
             }
-            ClientMessage::Ack { queue_id, message_id } => {
+            ClientMessage::Ack {
+                queue_id,
+                message_id,
+            } => {
                 self.ack(queue_id, message_id);
                 ServerMessage::Ok
             }
@@ -405,7 +427,9 @@ mod tests {
     fn mailbox_send_rejects_unknown_queue() {
         let state = RelayState::new();
         assert_eq!(
-            state.send_to_mailbox([9u8; 32], [0u8; 32], env(1)).unwrap_err(),
+            state
+                .send_to_mailbox([9u8; 32], [0u8; 32], env(1))
+                .unwrap_err(),
             RejectionCode::QueueNotFound
         );
     }
@@ -438,12 +462,18 @@ mod tests {
         let commit_b = env(0xB);
         let tag_b = proto::compute_tag(&key, &inbox, &commit_b);
 
-        let result_a = state.send_to_group_inbox(inbox, GroupSendKind::Commit { epoch: 1 }, tag_a, commit_a);
-        let result_b = state.send_to_group_inbox(inbox, GroupSendKind::Commit { epoch: 1 }, tag_b, commit_b);
+        let result_a =
+            state.send_to_group_inbox(inbox, GroupSendKind::Commit { epoch: 1 }, tag_a, commit_a);
+        let result_b =
+            state.send_to_group_inbox(inbox, GroupSendKind::Commit { epoch: 1 }, tag_b, commit_b);
 
         // Exactly one wins.
         assert_ne!(result_a.is_ok(), result_b.is_ok());
-        let loser = if result_a.is_err() { result_a } else { result_b };
+        let loser = if result_a.is_err() {
+            result_a
+        } else {
+            result_b
+        };
         assert_eq!(loser.unwrap_err(), RejectionCode::EpochConflict);
 
         // The loser can retry against the new epoch and succeeds.
@@ -490,10 +520,14 @@ mod tests {
             .send_to_group_inbox(inbox, GroupSendKind::Application, tag, e.clone())
             .unwrap();
 
-        let (qid_a, _, pushed_a) = rx_a.try_recv().expect("member A must receive the fan-out push");
+        let (qid_a, _, pushed_a) = rx_a
+            .try_recv()
+            .expect("member A must receive the fan-out push");
         assert_eq!(qid_a, member_a);
         assert_eq!(pushed_a, e);
-        let (qid_b, _, pushed_b) = rx_b.try_recv().expect("member B must receive the fan-out push");
+        let (qid_b, _, pushed_b) = rx_b
+            .try_recv()
+            .expect("member B must receive the fan-out push");
         assert_eq!(qid_b, member_b);
         assert_eq!(pushed_b, e);
     }
@@ -507,9 +541,15 @@ mod tests {
             // Leave room for exactly one more max-size message.
             inner.storage_bytes_used = limits::MAX_STORAGE_BYTES - limits::MAX_MESSAGE_SIZE as u64;
         }
-        let big = Envelope::new([1u8; 16], DeliveryMode::RelayFanout, vec![0u8; limits::MAX_MESSAGE_SIZE]);
+        let big = Envelope::new(
+            [1u8; 16],
+            DeliveryMode::RelayFanout,
+            vec![0u8; limits::MAX_MESSAGE_SIZE],
+        );
         let tag = proto::compute_tag(&key, &qid, &big);
-        state.send_to_mailbox(qid, tag, big.clone()).expect("fits exactly at the bound");
+        state
+            .send_to_mailbox(qid, tag, big.clone())
+            .expect("fits exactly at the bound");
 
         let over = Envelope::new([2u8; 16], DeliveryMode::RelayFanout, vec![0u8; 1]);
         let tag2 = proto::compute_tag(&key, &qid, &over);
@@ -520,6 +560,8 @@ mod tests {
 
         // Ack the first message; its bytes are freed, so the second now fits.
         state.ack(qid, big.message_id);
-        state.send_to_mailbox(qid, tag2, over).expect("storage freed by ack");
+        state
+            .send_to_mailbox(qid, tag2, over)
+            .expect("storage freed by ack");
     }
 }
