@@ -155,6 +155,75 @@ would be a fourth toolchain for an audience the wedge doesn't target).
 `./gradlew build` + the FFI smoke test (below). Release pipelines land with
 their first artifact, not before.
 
+## UI / design plan (from /plan-design-review, 2026-07-11)
+
+Design source of truth: `docs/wireframe-v0.html` (chat list + chat) plus
+`docs/wireframe-v1.html` (the screens v0 deferred — pairing, verification,
+failure states, desktop two-pane). These are LAYOUT specs only; the visual
+token layer is a prerequisite, see "Design system gate" below.
+
+### Screen inventory + navigation (Pass 1)
+
+```text
+first launch ──▶ EmptyState (= your QR, the pairing screen; NO onboarding carousel)
+                       │
+ChatList ◀────────────┘
+  │  ▲
+  │  └──────────────── Chat  (⇄ back)
+  │                      ▲
+  └──(+)──▶ AddContact ──┤   tabs: [My code] [Scan]
+              │          │
+              └──▶ Verification sheet (offered ONCE after pairing, skippable)
+```
+
+Five screens. **Settings deliberately absent from v1** — nothing to set yet
+(subtraction default). Relay address is not user-editable in v1.
+
+### Interaction states (Pass 2) — what the user SEES, mapped to engine events
+
+| State family | User sees | Engine event |
+|--------------|-----------|--------------|
+| Connection loss | One calm top banner ("Connecting… messages will send when you're back online"). NEVER modal, never blocks composing — sends queue. | reconnect loop (step 2 engine) |
+| Failed send | Red-edged bubble stays in place with "Not sent yet · tap to retry". Message never disappears. | send rejection / timeout |
+| Key/epoch change | One quiet system line: "X changed their security code. Review". No blocking interstitial (calm > fear). | `Incoming::CommitApplied` with changed keys |
+| Loading | Skeleton rows in the list; nothing in an open chat (local-first = instant once persisted). | pre-first-sync |
+| Empty (first launch) | The QR pairing screen itself — the empty state IS the onboarding. | no conversations yet |
+
+### User journey (Pass 3)
+
+install → no signup form (the visceral privacy proof: every competitor asks
+for a phone number here, this app shows your QR) → scan/share → connected →
+verification offered once, positively framed ("compare these five words to be
+sure nobody's in the middle"), skippable, never nagging → first message.
+Unverified chats get NO scary warnings; verification adds a quiet ✓ by the name.
+
+### Visual identity (Pass 4)
+
+Looking familiar is intentional — the wedge is mandate-resistance, not visual
+novelty. But the app needs ONE deliberate signature so it isn't anonymous.
+Natural candidate: the identicon system (on every avatar, every screen; no
+competitor owns it) plus the verified-✓ treatment. Design deferred to
+DESIGN.md, tracked as a TODO — not a v1 blocker.
+
+### Design system gate (Pass 5)
+
+There is no DESIGN.md yet; wireframe CSS is `system-ui` + gray boxes by
+admission, not a system. **composeApp UI work (step 6) is gated on running
+/design-consultation first** to produce DESIGN.md: typeface, color tokens,
+spacing scale, identicon algorithm, motion. Engine/FFI steps (0–4) do not
+depend on this and proceed now. Building screens before tokens means
+per-screen ad-hoc styling that never reconciles.
+
+### Responsive + accessibility (Pass 6)
+
+- **One breakpoint at 700dp:** below = single pane (list OR chat); at/above =
+  two-pane (list + chat), per wireframe-v1 frame E. Same composables, no
+  desktop-only chrome.
+- **A11y baseline, specified from day one (Compose `semantics {}`, not
+  retrofitted):** screen-reader labels (TalkBack / desktop SR) on every
+  control, 48dp minimum touch targets, 4.5:1 contrast on body text, full
+  keyboard navigation on desktop.
+
 ## Migration steps (ordered, each independently shippable)
 
 Reordered after the outside-voice review: wire/relay hardening moved AHEAD of
@@ -280,6 +349,12 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   - Files: `relay/src/state.rs`, `relay/Dockerfile`
   - Verify: kill -9 relay mid-conversation, restart, conversation resumes
 
+### Design tasks (from /plan-design-review)
+- [ ] **DT1 (P2, human: ~1d / CC: ~1h)** — app — pairing flow screens (EmptyState=QR, AddContact My-code/Scan, Verification sheet) per wireframe-v1
+- [ ] **DT2 (P2, human: ~1d / CC: ~1h)** — app — interaction states (reconnect banner, failed-send bubble, key-change system line, skeleton loading)
+- [ ] **DT3 (P2, human: ~4h / CC: ~30min)** — app — 700dp breakpoint + a11y baseline (semantics, 48dp, 4.5:1, keyboard)
+- [ ] **DT4 (P3, human: ~1d)** — design — run /design-consultation for DESIGN.md tokens + identicon signature (gates step 6)
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
@@ -287,11 +362,11 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
 | Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (PLAN) | 7 issues, 0 critical gaps open — all folded into plan (D3-D5, 1A, OV1-OV10) |
-| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+| Design Review | `/plan-design-review` | UI/UX gaps | 1 | CLEAR | score 3/10 → 8/10, 6 decisions added (nav map, states, journey, breakpoint, a11y, design-system gate) |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
 **CROSS-MODEL:** Outside voice (Claude subagent; codex usage-limited) found 10 issues the primary review missed or understated; 6 adopted verbatim (OV1,2,3,6,9,10), 2 adopted with modification (OV4/5 folded into step 2; OV7 resolved as split-gate compromise preserving iOS-day-one), 1 was a doc addition (OV8). One genuine tension (OV7 iOS-day-one) resolved by user decision: keep iOS, split the gate.
 
-**VERDICT:** ENG CLEARED — ready to implement (step 0: ci.yml, then step 1: wire hardening).
+**VERDICT:** ENG + DESIGN CLEARED — ready to implement (step 0: ci.yml, then step 1: wire hardening; UI steps gated on /design-consultation per DT4).
 
 NO UNRESOLVED DECISIONS

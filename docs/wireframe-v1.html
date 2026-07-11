@@ -1,0 +1,135 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Wireframe v1 — missing screens (design review pass)</title>
+<style>
+  /* Same deliberate roughness as wireframe-v0: layout decisions only. */
+  body { font-family: system-ui, sans-serif; background:#fafafa; color:#222; margin:24px; }
+  h1 { font-size:15px; font-weight:600; color:#666; }
+  h2 { font-size:13px; font-weight:600; color:#888; margin:28px 0 8px; }
+  .row { display:flex; gap:28px; align-items:flex-start; flex-wrap:wrap; }
+  .phone { width:320px; border:2px solid #999; border-radius:18px; background:#fff; overflow:hidden; }
+  .desktop { width:680px; border:2px solid #999; border-radius:10px; background:#fff; overflow:hidden; display:flex; }
+  .label { text-align:center; font-size:12px; color:#888; margin-top:8px; max-width:320px; }
+  .label.wide { max-width:680px; }
+  .bar { padding:12px 14px; border-bottom:1px solid #ddd; display:flex; align-items:center; gap:8px; }
+  .bar b { font-size:15px; }
+  .shield { font-size:11px; border:1px solid #aaa; border-radius:10px; padding:1px 7px; color:#555; margin-left:auto; }
+  .avatar { width:38px; height:38px; border:1px solid #999; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:10px; color:#777; flex:none; }
+  .qrbox { width:180px; height:180px; border:2px dashed #888; margin:22px auto 10px; display:flex; align-items:center; justify-content:center; color:#999; font-size:12px; }
+  .bigbtn { margin:10px 14px; border:1px solid #888; border-radius:20px; padding:10px; text-align:center; font-size:14px; }
+  .ghostbtn { margin:6px 14px 16px; border:1px dashed #aaa; border-radius:20px; padding:8px; text-align:center; font-size:13px; color:#777; }
+  .tabs { display:flex; border-bottom:1px solid #ddd; }
+  .tab { flex:1; text-align:center; padding:10px; font-size:13px; color:#999; }
+  .tab.on { color:#222; border-bottom:2px solid #555; font-weight:600; }
+  .sys { text-align:center; font-size:10px; color:#999; margin:8px 12px; }
+  .bubble { max-width:70%; border:1px solid #bbb; border-radius:12px; padding:7px 10px; font-size:13px; margin:6px 14px; }
+  .me { margin-left:auto; border-bottom-right-radius:2px; background:#f0f0f0; }
+  .failed { border-color:#c66; }
+  .failnote { font-size:10px; color:#c66; margin:2px 16px 8px; text-align:right; }
+  .banner { background:#f4f4f4; border-bottom:1px solid #ddd; font-size:11px; color:#777; text-align:center; padding:5px; }
+  .words { display:flex; flex-wrap:wrap; gap:6px; justify-content:center; margin:14px; }
+  .word { border:1px solid #aaa; border-radius:8px; padding:5px 10px; font-size:13px; }
+  .note { font-size:12px; color:#777; margin:10px 16px; text-align:center; line-height:1.45; }
+  .pane-list { width:250px; border-right:1px solid #ddd; }
+  .pane-chat { flex:1; display:flex; flex-direction:column; }
+  .chat { display:flex; gap:10px; padding:10px 14px; border-bottom:1px solid #eee; }
+  .chat .who { font-size:14px; font-weight:600; }
+  .chat .msg { font-size:12px; color:#777; }
+  .chat.sel { background:#f4f4f4; }
+  .composer { display:flex; gap:8px; padding:10px 14px; border-top:1px solid #ddd; align-items:center; margin-top:auto; }
+  .composer .field { flex:1; border:1px solid #ccc; border-radius:16px; padding:7px 12px; font-size:13px; color:#999; }
+  .footnote { max-width:760px; font-size:12px; color:#777; margin-top:22px; line-height:1.5; }
+</style>
+</head>
+<body>
+<h1>Wireframe v1 — the screens v0 deferred (pairing, verification, states, desktop)</h1>
+
+<h2>A — First launch (empty state is the onboarding)</h2>
+<div class="row">
+  <div>
+    <div class="phone">
+      <div class="bar"><b>Chats</b><span class="shield">🛡 private by design</span></div>
+      <div class="qrbox">[ your QR code ]</div>
+      <div class="note">No phone number needed. Show this code to a friend —
+        or scan theirs — and you're connected.</div>
+      <div class="bigbtn">Scan a friend's code</div>
+      <div class="ghostbtn">Share as link instead</div>
+    </div>
+    <div class="label">A — Empty state IS the pairing screen. No dead “no chats yet” text; the first
+      action is the product's core loop. Warmth via copy, not decoration.</div>
+  </div>
+
+  <div>
+    <div class="phone">
+      <div class="bar"><b>Add contact</b><span class="shield">🛡</span></div>
+      <div class="tabs"><div class="tab on">My code</div><div class="tab">Scan</div></div>
+      <div class="qrbox">[ QR: contact link ]</div>
+      <div class="note">This code is single-use. It expires after one connection
+        or 24 hours — whichever comes first.</div>
+      <div class="ghostbtn">Copy invite link</div>
+    </div>
+    <div class="label">B — “+” from the chat list. Two tabs, zero settings. The single-use note is the
+      only protocol fact shown (it matters to the user's mental model).</div>
+  </div>
+
+  <div>
+    <div class="phone">
+      <div class="bar"><div class="avatar">◆◇</div><b>Lena</b><span class="shield">🛡</span></div>
+      <div class="sys">You're connected. To be sure nobody is in the middle,
+        compare these five words with Lena in person or on a call:</div>
+      <div class="words"><span class="word">meadow</span><span class="word">tiger</span><span class="word">454</span><span class="word">copper</span><span class="word">violin</span></div>
+      <div class="bigbtn">They match — mark verified ✓</div>
+      <div class="ghostbtn">Skip for now</div>
+      <div class="note">Skippable, never nagging. Unverified chats show no scary
+        warnings — verification adds a quiet ✓ next to the name.</div>
+    </div>
+    <div class="label">C — Safety-number verification, right after pairing. Words not hex digits;
+      positive framing (“be sure”), not fear framing.</div>
+  </div>
+</div>
+
+<h2>B — Failure states (relay unreachable, failed send, group state change)</h2>
+<div class="row">
+  <div>
+    <div class="phone">
+      <div class="bar"><div class="avatar">◆◇</div><b>Lena</b><span class="shield">🛡</span></div>
+      <div class="banner">Connecting… messages will send when you're back online</div>
+      <div class="bubble me">see you at 8 then!</div>
+      <div class="bubble me failed">also — bring the rope?</div>
+      <div class="failnote">Not sent yet · tap to retry</div>
+      <div class="sys">Lena changed her security code. <u>Review</u></div>
+      <div class="composer"><div class="field">Message…</div></div>
+    </div>
+    <div class="label">D — One calm banner for connection state (never a modal). Failed bubble keeps
+      its place in history; retry is on the bubble. Epoch/key change = one quiet
+      system line with an action, mirroring Signal's convention.</div>
+  </div>
+
+  <div class="">
+    <div class="desktop">
+      <div class="pane-list">
+        <div class="bar"><b>Chats</b><span class="shield">🛡</span></div>
+        <div class="chat sel"><div class="avatar">◆◇</div><div><div class="who">Lena ✓</div><div class="msg">see you at 8 then!</div></div></div>
+        <div class="chat"><div class="avatar">▲▽</div><div><div class="who">bouldering group</div><div class="msg">who brings the rope?</div></div></div>
+      </div>
+      <div class="pane-chat">
+        <div class="bar"><div class="avatar" style="width:28px;height:28px">◆◇</div><b>Lena ✓</b><span class="shield">🛡</span></div>
+        <div class="bubble">Did you see the new gym opened near Hbf?</div>
+        <div class="bubble me">yes!! want to try it Friday?</div>
+        <div class="composer"><div class="field">Message…</div></div>
+      </div>
+    </div>
+    <div class="label wide">E — Desktop (JVM target): two-pane at ≥700dp, phone layout below. Same
+      components, no desktop-only chrome. ✓ after name = verified state surfacing.</div>
+  </div>
+</div>
+
+<p class="footnote">Sketch intent, same rules as v0: layout decisions only. Final visual layer
+(typeface, color tokens, spacing scale, identicon algorithm) belongs to DESIGN.md —
+run /design-consultation before implementing composeApp screens. States drawn here map 1:1
+to engine events from docs/architecture.md: banner = reconnect loop, failed bubble =
+send rejection/timeout, system line = CommitApplied with changed keys.</p>
+</body>
+</html>
