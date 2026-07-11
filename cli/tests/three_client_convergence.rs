@@ -14,14 +14,21 @@ use std::sync::Arc;
 use chatcore::{message_id_for, ChatSession, Incoming};
 use cli::RelayClient;
 use proto::{DeliveryMode, Envelope, GroupSendKind, QueueId, RejectionCode};
-use relay::RelayState;
+use relay::{RelayIdentity, RelayState};
 
-async fn start_relay() -> String {
+/// Starts a real TLS relay on an OS-assigned port and returns its address plus
+/// the cert fingerprint clients must pin (T2). In-memory identity — file
+/// persistence is only for the long-lived binary.
+async fn start_relay() -> (String, [u8; 32]) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let state = Arc::new(RelayState::new());
-    tokio::spawn(relay::net::serve_on(listener, state));
-    addr
+    let identity = RelayIdentity::generate();
+    let fingerprint = identity.fingerprint;
+    tokio::spawn(async move {
+        relay::net::serve_on(listener, state, &identity).await.ok();
+    });
+    (addr, fingerprint)
 }
 
 fn wrap(wire_bytes: Vec<u8>) -> Envelope {
@@ -51,8 +58,8 @@ struct Member {
 }
 
 impl Member {
-    async fn connect(name: &str, relay_addr: &str) -> Self {
-        let relay = RelayClient::connect(relay_addr).await.unwrap();
+    async fn connect(name: &str, relay_addr: &str, fingerprint: [u8; 32]) -> Self {
+        let relay = RelayClient::connect(relay_addr, fingerprint).await.unwrap();
         let (mailbox_qid, mailbox_key) = relay.create_mailbox().await.unwrap();
         relay.subscribe(vec![mailbox_qid]).await.unwrap();
         Member {
@@ -88,11 +95,11 @@ impl Member {
 
 #[tokio::test]
 async fn three_clients_converge_after_a_concurrent_commit_conflict() {
-    let relay_addr = start_relay().await;
+    let (relay_addr, fp) = start_relay().await;
 
-    let mut alice = Member::connect("alice", &relay_addr).await;
-    let mut bob = Member::connect("bob", &relay_addr).await;
-    let mut carol = Member::connect("carol", &relay_addr).await;
+    let mut alice = Member::connect("alice", &relay_addr, fp).await;
+    let mut bob = Member::connect("bob", &relay_addr, fp).await;
+    let mut carol = Member::connect("carol", &relay_addr, fp).await;
 
     // --- Founding: Alice creates the group and adds Bob + Carol in one
     // commit (design doc amendment A1's test design: the founding Add never

@@ -11,7 +11,9 @@
 //! plan-eng-review tasks JSONL (T3 in tasks-eng-review-*.jsonl).
 //! ```
 
+pub mod identity;
 pub mod net;
 mod state;
 
+pub use identity::RelayIdentity;
 pub use state::{RelayState, RELAY_QUEUE_CAPACITY_HINT};

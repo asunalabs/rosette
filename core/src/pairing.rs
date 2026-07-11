@@ -51,10 +51,12 @@ pub fn key_package_from_bytes(
 }
 
 /// Build the link a QR code encodes: this identity's KeyPackage plus the
-/// bootstrap mailbox the relay just minted.
+/// bootstrap mailbox the relay just minted. `relay_fingerprint` is the relay's
+/// TLS cert fingerprint the scanner will pin (T2).
 pub fn build_contact_link(
     key_package: &KeyPackage,
     relay_addr: &str,
+    relay_fingerprint: [u8; 32],
     queue_id: QueueId,
     send_key: [u8; 32],
 ) -> Result<ContactLink, PairingError> {
@@ -63,6 +65,7 @@ pub fn build_contact_link(
         kp_bytes,
         vec![Endpoint {
             relay_addr: relay_addr.to_string(),
+            relay_fingerprint,
             queue_id,
             send_key,
         }],
@@ -91,6 +94,7 @@ mod tests {
         let link = build_contact_link(
             bundle.key_package(),
             "relay.local:7443",
+            [9u8; 32],
             [1u8; 32],
             [2u8; 32],
         )

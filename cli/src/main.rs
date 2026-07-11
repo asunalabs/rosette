@@ -27,19 +27,38 @@ struct Cli {
 enum Command {
     /// Print a contact link, then wait to be paired and chat.
     Listen {
+        /// The relay's TLS fingerprint (printed by the relay on startup). Baked
+        /// into the contact link so the peer pins the same relay.
+        #[arg(long)]
+        relay_fingerprint: String,
         #[arg(long, default_value = "alice")]
         name: String,
         #[arg(long, default_value = "127.0.0.1:7443")]
         relay: String,
     },
-    /// Scan a contact link printed by `listen`, pair, and chat.
+    /// Scan a contact link printed by `listen`, pair, and chat. The relay
+    /// address and fingerprint both come from the link.
     Connect {
         link: String,
         #[arg(long, default_value = "bob")]
         name: String,
-        #[arg(long, default_value = "127.0.0.1:7443")]
-        relay: String,
     },
+}
+
+/// Parse a 64-char hex fingerprint into raw bytes.
+fn parse_fingerprint(hex: &str) -> anyhow::Result<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        anyhow::bail!(
+            "relay fingerprint must be 64 hex characters, got {}",
+            hex.len()
+        );
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)?;
+    }
+    Ok(out)
 }
 
 /// What travels through the bootstrap mailbox: the Welcome (self-encrypted
@@ -67,14 +86,19 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     match cli.command {
-        Command::Listen { name, relay } => listen(&name, &relay).await,
-        Command::Connect { link, name, relay } => connect(&link, &name, &relay).await,
+        Command::Listen {
+            relay_fingerprint,
+            name,
+            relay,
+        } => listen(&name, &relay, &relay_fingerprint).await,
+        Command::Connect { link, name } => connect(&link, &name).await,
     }
 }
 
-async fn listen(name: &str, relay_addr: &str) -> anyhow::Result<()> {
+async fn listen(name: &str, relay_addr: &str, relay_fingerprint: &str) -> anyhow::Result<()> {
+    let fingerprint = parse_fingerprint(relay_fingerprint)?;
     let mut session = ChatSession::new(name);
-    let relay = RelayClient::connect(relay_addr).await?;
+    let relay = RelayClient::connect(relay_addr, fingerprint).await?;
     let (mailbox_qid, mailbox_key) = relay.create_mailbox().await?;
     relay.subscribe(vec![mailbox_qid]).await?;
 
@@ -82,6 +106,7 @@ async fn listen(name: &str, relay_addr: &str) -> anyhow::Result<()> {
     let link = chatcore::pairing::build_contact_link(
         key_package.key_package(),
         relay_addr,
+        fingerprint,
         mailbox_qid,
         mailbox_key,
     )?;
@@ -105,17 +130,18 @@ async fn listen(name: &str, relay_addr: &str) -> anyhow::Result<()> {
     chat_repl(session, relay, inbox_qid, inbox_key).await
 }
 
-async fn connect(link_b64: &str, name: &str, relay_addr: &str) -> anyhow::Result<()> {
+async fn connect(link_b64: &str, name: &str) -> anyhow::Result<()> {
     let link_bytes = base64::engine::general_purpose::STANDARD.decode(link_b64.trim())?;
     let link = ContactLink::from_bytes(&link_bytes)?;
     let Endpoint {
+        relay_addr,
+        relay_fingerprint,
         queue_id: peer_mailbox,
         send_key: peer_send_key,
-        ..
     } = link.primary_endpoint().clone();
 
     let mut session = ChatSession::new(name);
-    let relay = RelayClient::connect(relay_addr).await?;
+    let relay = RelayClient::connect(&relay_addr, relay_fingerprint).await?;
     let (own_mailbox, _own_key) = relay.create_mailbox().await?;
     relay.subscribe(vec![own_mailbox]).await?;
 

@@ -1,6 +1,7 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use relay::RelayState;
+use relay::{RelayIdentity, RelayState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -8,6 +9,16 @@ async fn main() -> anyhow::Result<()> {
     let addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:7443".to_string());
+    // Persistent so the pinned fingerprint in already-shared contact links
+    // survives restarts (see identity.rs). Override with arg 2.
+    let identity_path = std::env::args()
+        .nth(2)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("relay_identity.der"));
+
+    let identity = RelayIdentity::load_or_create(&identity_path)?;
+    println!("relay TLS fingerprint: {}", identity.fingerprint_hex());
+
     let state = Arc::new(RelayState::new());
-    relay::net::serve(&addr, state).await
+    relay::net::serve(&addr, state, &identity).await
 }

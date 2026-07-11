@@ -249,7 +249,11 @@ Reordered after the outside-voice review: wire/relay hardening moved AHEAD of
 the engine extraction (OV2/OV3/OV6/OV9 all touch code the extraction moves and
 the FFI then freezes — fixing them first is the cheapest point forever). Status
 as of 2026-07-11: step 0 (T1 ci.yml) DONE; T5 relay bug fixes DONE; `ffi/`
-stub contract DONE (ahead of order, to unblock frontend).
+stub contract DONE (ahead of order, to unblock frontend); T2 TLS + relay-cert
+pinning DONE (relay presents a persistent self-signed cert, clients pin its
+SHA-256 fingerprint carried in the ContactLink Endpoint; convergence test runs
+over real TLS + a fingerprint-mismatch rejection test). Remaining step 1: T3
+request-ids, T4 redelivery/ack.
 
 0. **`ci.yml` (cargo-only) lands first** (OV10): `cargo test --workspace` on
    every push, so the convergence test guards every step below. Gradle jobs

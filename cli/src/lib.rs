@@ -4,5 +4,6 @@
 //! hardest test — concurrent-commit convergence (amendment A1).
 
 pub mod relay_client;
+pub mod tls;
 
 pub use relay_client::RelayClient;

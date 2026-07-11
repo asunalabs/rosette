@@ -12,6 +12,9 @@ use proto::{
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio_rustls::TlsConnector;
+
+use crate::tls::{pinned_client_config, relay_server_name};
 
 pub struct RelayClient {
     write_tx: mpsc::UnboundedSender<ClientMessage>,
@@ -20,9 +23,14 @@ pub struct RelayClient {
 }
 
 impl RelayClient {
-    pub async fn connect(addr: &str) -> anyhow::Result<Self> {
+    /// Connect to a relay over TLS, pinning `relay_fingerprint` (the SHA-256 of
+    /// the relay's cert, carried in the contact link). The handshake fails if
+    /// the relay presents any other certificate.
+    pub async fn connect(addr: &str, relay_fingerprint: [u8; 32]) -> anyhow::Result<Self> {
         let socket = TcpStream::connect(addr).await?;
-        let (mut read_half, mut write_half) = socket.into_split();
+        let connector = TlsConnector::from(pinned_client_config(relay_fingerprint));
+        let tls = connector.connect(relay_server_name(), socket).await?;
+        let (mut read_half, mut write_half) = tokio::io::split(tls);
 
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<ClientMessage>();
         tokio::spawn(async move {

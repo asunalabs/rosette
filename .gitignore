@@ -1,2 +1,4 @@
 /target
 .gstack/
+# Relay TLS identity (generated at runtime; each operator has their own)
+relay_identity.der

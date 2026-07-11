@@ -20,6 +20,11 @@ pub struct Endpoint {
     /// "host:port" — deliberately a bare string, not a parsed URL, so unknown
     /// future relay addressing schemes don't require a link format bump.
     pub relay_addr: String,
+    /// SHA-256 of the relay's self-signed TLS certificate (T2 / OV2). The
+    /// scanner pins this: it connects over TLS and rejects the relay unless the
+    /// presented leaf cert hashes to exactly this value. No CA, no trust store —
+    /// the link IS the trust anchor for the relay's transport identity.
+    pub relay_fingerprint: [u8; 32],
     pub queue_id: QueueId,
     /// Per-queue send key, established at the queue's creation and handed to
     /// the scanner via this link. "No accounts" never means "no send
@@ -102,6 +107,7 @@ mod tests {
     fn sample_endpoint() -> Endpoint {
         Endpoint {
             relay_addr: "relay.example:8443".to_string(),
+            relay_fingerprint: [6u8; 32],
             queue_id: [7u8; 32],
             send_key: [8u8; 32],
         }
