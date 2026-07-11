@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use chatcore::{message_id_for, ChatSession, Incoming};
-use cli::RelayClient;
+use engine::RelayClient;
 use proto::{DeliveryMode, Envelope, GroupSendKind, QueueId, RejectionCode};
 use relay::{RelayIdentity, RelayState};
 

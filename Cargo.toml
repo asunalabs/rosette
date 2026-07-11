@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["proto", "core", "relay", "cli", "ffi"]
+members = ["proto", "core", "engine", "relay", "cli", "ffi"]
 
 [workspace.package]
 edition = "2021"
@@ -16,3 +16,4 @@ tracing-subscriber = "0.3"
 anyhow = "1"
 proto = { path = "proto" }
 chatcore = { path = "core" }
+engine = { path = "engine" }

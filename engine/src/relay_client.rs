@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use proto::framing::{read_frame, write_frame, ReadFrameError};
 use proto::{
     ClientFrame, ClientMessage, Envelope, GroupSendKind, PowSolution, QueueId, RejectionCode,
@@ -26,6 +26,13 @@ use crate::tls::{pinned_client_config, relay_server_name};
 /// how callers learn the connection died: the reader task drops the whole
 /// map on exit, failing every in-flight `call` at once.
 type PendingReplies = Arc<Mutex<HashMap<RequestId, oneshot::Sender<ServerMessage>>>>;
+
+/// The connection died under a request. Typed (not a bare string error) so
+/// `ChatEngine` can downcast, reconnect, and retry — while every other error
+/// (a relay rejection, an unexpected reply type) stays fatal to the call.
+#[derive(Debug, thiserror::Error)]
+#[error("relay connection closed")]
+pub struct ConnectionClosed;
 
 pub struct RelayClient {
     write_tx: mpsc::UnboundedSender<ClientFrame>,
@@ -105,10 +112,9 @@ impl RelayClient {
             .is_err()
         {
             self.pending.lock().unwrap().remove(&request_id);
-            return Err(anyhow!("relay connection closed"));
+            return Err(anyhow::Error::new(ConnectionClosed));
         }
-        rx.await
-            .map_err(|_| anyhow!("relay connection closed before replying"))
+        rx.await.map_err(|_| anyhow::Error::new(ConnectionClosed))
     }
 
     async fn create_queue_with_pow(

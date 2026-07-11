@@ -370,18 +370,9 @@ name = "cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
- "bincode",
- "chatcore",
  "clap",
- "proto",
- "relay",
- "rustls",
- "serde",
- "sha2",
+ "engine",
  "tokio",
- "tokio-rustls",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -594,6 +585,25 @@ dependencies = [
  "sec1",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bincode",
+ "chatcore",
+ "proto",
+ "relay",
+ "rustls",
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]

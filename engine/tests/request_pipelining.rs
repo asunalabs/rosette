@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use cli::RelayClient;
+use engine::RelayClient;
 use relay::{RelayIdentity, RelayState};
 
 async fn start_relay() -> (String, [u8; 32]) {

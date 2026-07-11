@@ -259,8 +259,13 @@ ServerMessage so a push can never be mistaken for a reply); T4
 redelivery/ack DONE (subscribe drains the unacked backlog to the subscribing
 connection, delete-on-ack frees storage and ends redelivery, all clients ack
 after processing — at-least-once delivery, duplicates absorbed client-side
-per OV5). **Step 1 wire/relay hardening is COMPLETE; next is step 2, the
-engine/ extraction (T6).**
+per OV5). Step 1 wire/relay hardening COMPLETE. T6 engine extraction DONE
+(2026-07-12): `engine/` crate owns ChatEngine (pairing, send, epoch-conflict
+auto-retry per OV4, seen-set dedup per OV5, reconnect + resubscribe +
+backlog replay), cli/ is a thin REPL over it, convergence/pinning/pipelining
+tests moved to engine/tests plus new commit-retry, dedup, and
+proxy-severed-connection reconnect tests. **Next: T7, the real UniFFI
+surface over engine/.**
 
 0. **`ci.yml` (cargo-only) lands first** (OV10): `cargo test --workspace` on
    every push, so the convergence test guards every step below. Gradle jobs
@@ -364,7 +369,7 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   - Surfaced by: Outside voice OV9 — state.rs:170 appends senders forever; state.rs:83-90 unbounded map
   - Files: `relay/src/state.rs`
   - Verify: unit tests for each (dead-sender pruned, challenge cap, no double-delivery)
-- [ ] **T6 (P1, human: ~1w / CC: ~2-3h)** — engine — extract crate; auto-retry conflict loop + foreign-dup seen-set, each with own test; convergence test kept as low-level net
+- [x] **T6 (P1, human: ~1w / CC: ~2-3h)** — engine — extract crate; auto-retry conflict loop + foreign-dup seen-set, each with own test; convergence test kept as low-level net
   - Surfaced by: D4 + Outside voice OV4/OV5 — retry is manual test choreography today (cli/tests/three_client_convergence.rs:146-166); process_incoming errors on replay
   - Files: `engine/` (new), `cli/`, `Cargo.toml`
   - Verify: `cargo test -p engine` — convergence + retry-loop + reconnect + dedup tests green
