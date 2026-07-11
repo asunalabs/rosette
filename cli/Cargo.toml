@@ -1,0 +1,28 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chat-cli"
+path = "src/main.rs"
+
+[dependencies]
+proto.workspace = true
+chatcore.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+bincode.workspace = true
+serde.workspace = true
+base64 = "0.22"
+
+[dev-dependencies]
+relay = { path = "../relay" }
