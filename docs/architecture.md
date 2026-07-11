@@ -224,11 +224,32 @@ per-screen ad-hoc styling that never reconciles.
   control, 48dp minimum touch targets, 4.5:1 contrast on body text, full
   keyboard navigation on desktop.
 
+## Parallel work split (2 people: backend + frontend)
+
+To let both people work without blocking each other, the FFI contract was
+pulled to the FRONT as a stub (`ffi/` crate, landed 2026-07-11) — see
+`docs/ffi-contract.md`. This re-sequences the solo-ordering below: the frontend
+builds the whole app against the frozen `ChatEngine` interface (in-memory stub)
+while the backend fills in the real engine behind the same signatures.
+
+- **Backend owns:** `proto/ core/ engine/ relay/ cli/ ffi/`. Freezes the `ffi/`
+  interface; changes to it are announced + coordinated.
+- **Frontend owns:** `app/` (composeApp + engine-kt Gobley + iosApp).
+- Disjoint directories → direct pushes to master rarely conflict. CI (T1) runs
+  on every push and PR.
+
+The migration steps below are the BACKEND track. The frontend track is:
+scaffold `app/` → prove the Gobley 3-target gate (step 4 here) → build wireframe
+screens against the stub bindings → real behavior arrives when backend swaps the
+stub for `engine/` (T6), no frontend change.
+
 ## Migration steps (ordered, each independently shippable)
 
 Reordered after the outside-voice review: wire/relay hardening moved AHEAD of
 the engine extraction (OV2/OV3/OV6/OV9 all touch code the extraction moves and
-the FFI then freezes — fixing them first is the cheapest point forever).
+the FFI then freezes — fixing them first is the cheapest point forever). Status
+as of 2026-07-11: step 0 (T1 ci.yml) DONE; T5 relay bug fixes DONE; `ffi/`
+stub contract DONE (ahead of order, to unblock frontend).
 
 0. **`ci.yml` (cargo-only) lands first** (OV10): `cargo test --workspace` on
    every push, so the convergence test guards every step below. Gradle jobs
