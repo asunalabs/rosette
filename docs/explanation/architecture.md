@@ -232,11 +232,37 @@ pulled to the FRONT as a stub (`ffi/` crate, landed 2026-07-11) — see
 builds the whole app against the frozen `ChatEngine` interface (in-memory stub)
 while the backend fills in the real engine behind the same signatures.
 
-- **Backend owns:** `proto/ core/ engine/ relay/ cli/ ffi/`. Freezes the `ffi/`
-  interface; changes to it are announced + coordinated.
+- **Backend owns:** `proto/ core/ engine/ relay/ cli/ ffi/ directory/`. Freezes
+  the `ffi/` interface; changes to it are announced + coordinated.
 - **Frontend owns:** `app/` (composeApp + engine-kt Gobley + iosApp).
 - Disjoint directories → direct pushes to master rarely conflict. CI (T1) runs
   on every push and PR.
+
+## `directory/` (added 2026-07-12, identity/directory pivot)
+
+Not in the diagram above — it's a fifth crate outside the client↔relay
+message path, not a variant of it:
+
+```
+directory/  Identity/directory service. Phone verification (Argon2id
+            hash, keyed with a server-side pepper) + username search
+            (k-anonymity hash-prefix bucketing, HIBP-style — not the
+            bloom-filter/PSI options considered and rejected, see
+            docs/plans/spike-t17-anti-enumeration.md). HTTP/JSON API
+            (axum), PostgreSQL — a real client-server DB, not relay's
+            embedded-SQLite-per-operator file, because directory is a
+            single centrally-run service, not something every relay
+            operator self-hosts. Depends on proto/ only; never imports
+            core/ or engine/ in production (dependency graph checked via
+            `cargo tree -p directory -e normal`) — a compromised or
+            crashed directory process cannot touch message delivery.
+```
+
+Not yet wired to anything else: the client doesn't call it, and there's no
+bridge from a directory search hit to `core::pairing`'s MLS pairing flow
+(both are link/QR-exchange based today — see T25 in
+`docs/plans/tasks-identity-directory-pivot.md`). Full status, what's done
+vs. open, lives in that task list, not here.
 
 The migration steps below are the BACKEND track. The frontend track is:
 scaffold `app/` → prove the Gobley 3-target gate (step 4 here) → build wireframe

@@ -1,0 +1,36 @@
+[package]
+name = "directory"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "directory"
+path = "src/main.rs"
+
+[dependencies]
+proto.workspace = true
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+argon2 = "0.5"
+rand = "0.8"
+async-trait = "0.1"
+# Real client-server DB (Signal/Telegram-style), not embedded SQLite —
+# directory is a centrally-run service, unlike relay's per-operator file.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "migrate", "macros"] }
+axum = "0.7"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+# T21 crash-isolation test only — never a normal/production dependency of
+# this crate (T1's "directory never imports core/engine" is about the
+# `[dependencies]` graph, not test-only tooling that proves the isolation).
+engine.workspace = true
+relay = { path = "../relay" }
+tempfile = "3"

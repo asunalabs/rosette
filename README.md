@@ -7,10 +7,14 @@ content, or membership.
 Status: working protocol skeleton. Relay, encrypted 1:1 chat over the CLI,
 and the Kotlin Multiplatform app shell all run today, paired by exchanging a
 QR/contact link — no phone, no email, no account, real app screens are in
-progress. A Signal-model identity/directory pivot is underway (not yet
-implemented): phone required at signup (hashed, verification-only, hidden by
-default), username as the public/searchable discovery surface, no email. See
-[docs/plans/tasks-identity-directory-pivot.md](docs/plans/tasks-identity-directory-pivot.md).
+progress. A Signal-model identity/directory pivot is implemented as a
+standalone service (`directory/`): phone required at signup (Argon2id-hashed,
+verification-only, hidden by default), k-anonymity-bucketed phone/username
+search opt-in (off by default), backed by PostgreSQL. Not yet wired to the
+client or to `core`/`engine`'s pairing flow — see
+[docs/plans/tasks-identity-directory-pivot.md](docs/plans/tasks-identity-directory-pivot.md)
+for what's done versus open (T25 in particular: no bridge exists yet from a
+directory search hit to an actual MLS pairing session).
 
 ## Try it
 
@@ -37,14 +41,15 @@ cargo run -p cli -- connect "<link>"                      # 3: bob → chat
 ## Repo layout
 
 ```
-proto/    wire protocol (single source of truth for the client-relay boundary)
-core/     MLS core (the only crate that touches OpenMLS)
-engine/   client engine: connection, reconnect, dedup, epoch-conflict retry
-ffi/      UniFFI surface consumed by the app (frozen contract)
-relay/    store-and-forward daemon (content-blind, epoch-aware)
-cli/      dogfood REPL — thin shell over engine/
-app/      Kotlin Multiplatform app (Compose UI + Gobley bindings)
-docs/     everything linked above (tutorials/, how-to/, reference/, explanation/, plans/, design/)
+proto/     wire protocol (single source of truth for the client-relay boundary)
+core/      MLS core (the only crate that touches OpenMLS)
+engine/    client engine: connection, reconnect, dedup, epoch-conflict retry
+ffi/       UniFFI surface consumed by the app (frozen contract)
+relay/     store-and-forward daemon (content-blind, epoch-aware), embedded SQLite
+directory/ identity/directory service (phone verify, username search) — separate process, PostgreSQL, never imports core/engine
+cli/       dogfood REPL — thin shell over engine/
+app/       Kotlin Multiplatform app (Compose UI + Gobley bindings)
+docs/      everything linked above (tutorials/, how-to/, reference/, explanation/, plans/, design/)
 ```
 
 ## Development
@@ -52,6 +57,23 @@ docs/     everything linked above (tutorials/, how-to/, reference/, explanation/
 ```bash
 cargo test --workspace        # the whole Rust stack, incl. 3-client convergence
 cd app && ./gradlew :engine-kt:desktopTest   # FFI smoke test across the seam
+```
+
+`directory/`'s tests need a real Postgres reachable via `DATABASE_URL` (each
+test gets its own ephemeral DB via `sqlx::test`):
+
+```bash
+docker run -d --name chat-directory-postgres -e POSTGRES_PASSWORD=devpassword \
+  -e POSTGRES_USER=directory -e POSTGRES_DB=directory -p 5432:5432 postgres:16-alpine
+export DATABASE_URL="postgres://directory:devpassword@localhost:5432/directory"
+cargo test --workspace
+```
+
+Running the directory service itself also needs `DIRECTORY_PEPPER` (or
+`DIRECTORY_ALLOW_DEV_PEPPER=1` for local dev only):
+
+```bash
+DIRECTORY_ALLOW_DEV_PEPPER=1 cargo run -p directory   # listens on 127.0.0.1:7444
 ```
 
 CI runs both on every push (`.github/workflows/ci.yml`). Backend and frontend

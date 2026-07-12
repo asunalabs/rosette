@@ -11,6 +11,25 @@ jobs:
   test:
     name: cargo test --workspace
     runs-on: ubuntu-latest
+    # directory/'s tests need a real Postgres (each test gets its own
+    # ephemeral DB via sqlx::test) — relay stays on embedded SQLite and
+    # needs nothing here.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: directory
+          POSTGRES_PASSWORD: ci-password
+          POSTGRES_DB: directory
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://directory:ci-password@localhost:5432/directory
     steps:
       - uses: actions/checkout@v4
 

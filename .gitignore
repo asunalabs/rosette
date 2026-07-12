@@ -1,5 +1,6 @@
 /target
 .gstack/
+.claude/
 # Relay TLS identity (generated at runtime; each operator has their own)
 relay_identity.der
 # Relay persistent state (T9; lives next to the identity)
