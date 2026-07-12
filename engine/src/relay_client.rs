@@ -24,8 +24,18 @@ use crate::tls::{pinned_client_config, relay_server_name};
 /// Replies waiting to be claimed, keyed by request id. Shared between `call`
 /// (inserts) and the reader task (removes + fulfills). Dropped senders are
 /// how callers learn the connection died: the reader task drops the whole
-/// map on exit, failing every in-flight `call` at once.
-type PendingReplies = Arc<Mutex<HashMap<RequestId, oneshot::Sender<ServerMessage>>>>;
+/// map on exit, failing every in-flight `call` at once. `closed` makes that
+/// final: a `call` that starts AFTER the reader exited would otherwise
+/// insert a sender nobody will ever fulfill or drop and await it forever
+/// (found by the T9 relay-restart test — the first send on a dead
+/// connection hung instead of failing over to reconnect).
+#[derive(Default)]
+struct Pending {
+    closed: bool,
+    map: HashMap<RequestId, oneshot::Sender<ServerMessage>>,
+}
+
+type PendingReplies = Arc<Mutex<Pending>>;
 
 /// The connection died under a request. Typed (not a bare string error) so
 /// `ChatEngine` can downcast, reconnect, and retry — while every other error
@@ -60,7 +70,7 @@ impl RelayClient {
             }
         });
 
-        let pending: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingReplies = Arc::new(Mutex::new(Pending::default()));
         let (push_tx, push_rx) = mpsc::unbounded_channel();
         let reader_pending = pending.clone();
         tokio::spawn(async move {
@@ -80,15 +90,18 @@ impl RelayClient {
                     } => {
                         // A missing entry means the caller gave up (dropped its
                         // future) — the reply is discarded, not misrouted.
-                        if let Some(tx) = reader_pending.lock().unwrap().remove(&request_id) {
+                        if let Some(tx) = reader_pending.lock().unwrap().map.remove(&request_id) {
                             let _ = tx.send(message);
                         }
                     }
                 }
             }
             // Connection gone: dropping the map drops every waiting sender,
-            // which fails all in-flight `call`s with a closed-connection error.
-            reader_pending.lock().unwrap().clear();
+            // which fails all in-flight `call`s with a closed-connection
+            // error; `closed` fails every FUTURE `call` up front.
+            let mut pending = reader_pending.lock().unwrap();
+            pending.closed = true;
+            pending.map.clear();
         });
 
         Ok(RelayClient {
@@ -102,7 +115,13 @@ impl RelayClient {
     async fn call(&self, msg: ClientMessage) -> anyhow::Result<ServerMessage> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(request_id, tx);
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.closed {
+                return Err(anyhow::Error::new(ConnectionClosed));
+            }
+            pending.map.insert(request_id, tx);
+        }
         if self
             .write_tx
             .send(ClientFrame {
@@ -111,7 +130,7 @@ impl RelayClient {
             })
             .is_err()
         {
-            self.pending.lock().unwrap().remove(&request_id);
+            self.pending.lock().unwrap().map.remove(&request_id);
             return Err(anyhow::Error::new(ConnectionClosed));
         }
         rx.await.map_err(|_| anyhow::Error::new(ConnectionClosed))
