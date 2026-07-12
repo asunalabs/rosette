@@ -277,8 +277,16 @@ its fan-out survive a crash together), unlocking relay/Dockerfile +
 release-relay.yml; full-stack proof in engine/tests/relay_restart.rs (relay
 runtime hard-dropped mid-conversation, restarted from disk, conversation
 resumes through the engines' reconnect loops). **The backend track (steps
-0–5) is COMPLETE. T8 (app scaffold) is the frontend track; step 6 UI work
-remains gated on DT4 (/design-consultation → DESIGN.md).**
+0–5) is COMPLETE.** T8 Android+desktop DONE (2026-07-12): Gobley 0.3.7
+scaffold under app/ (engine-kt bindings module + composeApp walking shell);
+the go/no-go gate passed on both unblocking targets — desktop EXECUTES the
+FFI smoke tests against the real engine, Android cross-compiles and links
+libchat_ffi.so into the APK (arm64-v8a + x86_64); ffi/ moved to uniffi
+=0.29.4 in lockstep with the bindgen (signatures unchanged). iOS remains
+the timeboxed spike per the split gate — needs Mac hardware, not startable
+from this machine. **Step 6 UI work remains gated on DT4
+(/design-consultation → DESIGN.md); composeApp stays a walking shell until
+then.**
 
 0. **`ci.yml` (cargo-only) lands first** (OV10): `cargo test --workspace` on
    every push, so the convergence test guards every step below. Gradle jobs
@@ -390,7 +398,7 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   - Surfaced by: Architecture review + OV8 threading contract
   - Files: `ffi/` (new)
   - Verify: Rust-side callback-delivery test green
-- [ ] **T8 (P2, human: ~1w / CC: ~3-4h)** — app — Gobley scaffold, 3 targets, split gate (Android+desktop unblock; iOS 5-day timebox)
+- [x] **T8 (P2, human: ~1w / CC: ~3-4h)** — app — Gobley scaffold, 3 targets, split gate (Android+desktop DONE 2026-07-12; iOS 5-day timebox still open — needs Mac hardware)
   - Surfaced by: D5 + review 1A + OV7 resolution
   - Files: `app/` (new)
   - Verify: FFI smoke test per target in ci.yml

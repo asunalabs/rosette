@@ -1,0 +1,5 @@
+# The gradle wrapper scripts must keep their native line endings regardless
+# of the checkout platform: gradlew runs under sh (LF), gradlew.bat under
+# cmd.exe (CRLF).
+app/gradlew text eol=lf
+app/gradlew.bat text eol=crlf

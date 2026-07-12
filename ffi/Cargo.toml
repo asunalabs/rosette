@@ -11,7 +11,10 @@ name = "chat_ffi"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
-uniffi = "0.28"
+# Gobley 0.3.7 generates the Kotlin bindings and targets uniffi-rs 0.29.4
+# exactly (external bindgens pin one uniffi version) — keep these in lockstep
+# with app/gradle/libs.versions.toml.
+uniffi = "=0.29.4"
 thiserror.workspace = true
 engine.workspace = true
 proto.workspace = true

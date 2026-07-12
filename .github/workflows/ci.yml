@@ -35,3 +35,43 @@ jobs:
       # Add back: rustup component add clippy + cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  # T8 go/no-go gate (ffi-contract.md): Gobley must generate bindings, build
+  # the ffi crate, and link per target. Desktop EXECUTES the smoke test;
+  # Android proves codegen + NDK cross-compile + link by assembling the APK
+  # (running it needs an emulator — deliberately out of CI scope for now).
+  # iOS is the timeboxed follow-up per the T8 split gate; no macOS job yet.
+  app-ffi-smoke:
+    name: app FFI smoke (desktop test + android link)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-app-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Desktop FFI smoke test (executes bindings)
+        run: ./gradlew :engine-kt:desktopTest
+
+      - name: Android FFI smoke (codegen + cross-compile + link)
+        run: ./gradlew :composeApp:assembleDebug
