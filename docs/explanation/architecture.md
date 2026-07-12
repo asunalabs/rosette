@@ -98,8 +98,8 @@ chat/
 │   ├── composeApp/               # Compose MP UI: commonMain/androidMain/desktopMain/iosMain
 │   └── iosApp/                   # Xcode shell project (thin; owns signing/entitlements)
 ├── docs/
-│   ├── architecture.md           # this document
-│   └── wireframe-v0.{html,png}   # (exists) approved UI direction
+│   ├── explanation/architecture.md   # this document
+│   └── design/wireframe-v0.{html,png} # (exists) approved UI direction
 ├── .github/workflows/
 │   ├── ci.yml                    # NEW  cargo test + gradle build/test on every push
 │   └── release-*.yml             # NEW  per-artifact release pipelines (see Distribution)
@@ -157,8 +157,8 @@ their first artifact, not before.
 
 ## UI / design plan (from /plan-design-review, 2026-07-11)
 
-Design source of truth: `docs/wireframe-v0.html` (chat list + chat) plus
-`docs/wireframe-v1.html` (the screens v0 deferred — pairing, verification,
+Design source of truth: `docs/design/wireframe-v0.html` (chat list + chat) plus
+`docs/design/wireframe-v1.html` (the screens v0 deferred — pairing, verification,
 failure states, desktop two-pane). These are LAYOUT specs only; the visual
 token layer is a prerequisite, see "Design system gate" below.
 
@@ -228,7 +228,7 @@ per-screen ad-hoc styling that never reconciles.
 
 To let both people work without blocking each other, the FFI contract was
 pulled to the FRONT as a stub (`ffi/` crate, landed 2026-07-11) — see
-`docs/ffi-contract.md`. This re-sequences the solo-ordering below: the frontend
+`docs/reference/ffi-contract.md`. This re-sequences the solo-ordering below: the frontend
 builds the whole app against the frozen `ChatEngine` interface (in-memory stub)
 while the backend fills in the real engine behind the same signatures.
 

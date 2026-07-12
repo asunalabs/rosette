@@ -92,7 +92,7 @@ quit. Incoming output:
 ## App / FFI environment variables
 
 Read by the `ffi/` crate when the Kotlin app calls `create_contact_link`
-(source: `docs/ffi-contract.md`, `ffi/src/lib.rs`):
+(source: `docs/reference/ffi-contract.md`, `ffi/src/lib.rs`):
 
 | Variable | Format | Effect |
 |----------|--------|--------|
