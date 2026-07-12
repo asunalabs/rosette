@@ -2,8 +2,19 @@
 //! resource limits. Kept separate from net.rs so the DS conflict-resolution
 //! logic (the property amendment A1 exists to prove) is unit-testable
 //! without a TCP stack.
+//!
+//! Persistence (T9, eng-review OV1): `RelayState::open` backs every durable
+//! mutation (queue creation, stored envelopes, acks, epoch advances) with
+//! write-through SQLite, so a killed relay restarts with its queues, unacked
+//! backlogs, and DS epochs intact — contact links and mid-flight
+//! conversations survive. Ephemeral state (subscribers, PoW challenges,
+//! rate-limit windows) is per-connection/abuse bookkeeping and deliberately
+//! resets. `RelayState::new` stays memory-only for tests. A persistence
+//! failure panics: a relay that cannot durably store what it acknowledges
+//! must crash loudly, not degrade silently.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -12,6 +23,7 @@ use proto::{
     QueueId, RejectionCode, ServerMessage,
 };
 use rand::RngCore;
+use rusqlite::{params, Connection};
 use tokio::sync::mpsc;
 
 /// Just a sizing hint for pre-allocating subscriber channels — not a hard cap.
@@ -65,6 +77,8 @@ struct Inner {
     /// tolerates that (the remove is a no-op). Bounded by the same cap.
     challenge_order: VecDeque<[u8; 32]>,
     storage_bytes_used: u64,
+    /// Write-through persistence (T9). None = memory-only (tests).
+    db: Option<Connection>,
 }
 
 pub struct RelayState {
@@ -79,9 +93,131 @@ impl Default for RelayState {
     }
 }
 
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS queues (
+    queue_id BLOB PRIMARY KEY,
+    send_key BLOB NOT NULL,
+    -- NULL for a mailbox; the current DS epoch for a group inbox.
+    epoch    INTEGER
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS roster (
+    inbox_id     BLOB NOT NULL,
+    ord          INTEGER NOT NULL,
+    member_queue BLOB NOT NULL,
+    PRIMARY KEY (inbox_id, ord)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS pending (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_id   BLOB NOT NULL,
+    message_id BLOB NOT NULL,
+    envelope   BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pending_by_queue ON pending(queue_id);
+";
+
+fn blob32(bytes: Vec<u8>) -> rusqlite::Result<[u8; 32]> {
+    bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
+}
+
 impl RelayState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open (or create) the persistent relay state at `path`. Every durable
+    /// mutation from here on is written through before it takes effect in
+    /// memory, so dropping the process at ANY point — kill -9 included —
+    /// loses at most requests that were never acknowledged.
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let db = Connection::open(path)?;
+        // WAL keeps single-writer inserts cheap; the relay is the only writer.
+        db.pragma_update(None, "journal_mode", "WAL")?;
+        db.execute_batch(SCHEMA)?;
+
+        let mut queues: HashMap<QueueId, QueueEntry> = HashMap::new();
+        {
+            let mut stmt = db.prepare("SELECT queue_id, send_key, epoch FROM queues")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    blob32(row.get::<_, Vec<u8>>(0)?)?,
+                    blob32(row.get::<_, Vec<u8>>(1)?)?,
+                    row.get::<_, Option<u64>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (queue_id, send_key, epoch) = row?;
+                let kind = match epoch {
+                    None => QueueKind::Mailbox {
+                        pending: VecDeque::new(),
+                    },
+                    Some(epoch) => QueueKind::GroupInbox {
+                        epoch,
+                        fan_out_to: Vec::new(),
+                    },
+                };
+                queues.insert(
+                    queue_id,
+                    QueueEntry {
+                        send_key,
+                        kind,
+                        sent_this_minute: 0,
+                        window_started: Instant::now(),
+                    },
+                );
+            }
+        }
+        {
+            let mut stmt =
+                db.prepare("SELECT inbox_id, member_queue FROM roster ORDER BY inbox_id, ord")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    blob32(row.get::<_, Vec<u8>>(0)?)?,
+                    blob32(row.get::<_, Vec<u8>>(1)?)?,
+                ))
+            })?;
+            for row in rows {
+                let (inbox_id, member) = row?;
+                if let Some(QueueEntry {
+                    kind: QueueKind::GroupInbox { fan_out_to, .. },
+                    ..
+                }) = queues.get_mut(&inbox_id)
+                {
+                    fan_out_to.push(member);
+                }
+            }
+        }
+        let mut storage_bytes_used = 0u64;
+        {
+            let mut stmt = db.prepare("SELECT queue_id, envelope FROM pending ORDER BY seq")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    blob32(row.get::<_, Vec<u8>>(0)?)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                ))
+            })?;
+            for row in rows {
+                let (queue_id, envelope_bytes) = row?;
+                let envelope: Envelope = proto::decode(&envelope_bytes)
+                    .map_err(|e| anyhow::anyhow!("corrupt stored envelope: {e}"))?;
+                storage_bytes_used += envelope.padded_ciphertext.len() as u64;
+                if let Some(QueueEntry {
+                    kind: QueueKind::Mailbox { pending },
+                    ..
+                }) = queues.get_mut(&queue_id)
+                {
+                    pending.push_back((envelope.message_id, envelope));
+                }
+            }
+        }
+
+        Ok(RelayState {
+            inner: Mutex::new(Inner {
+                queues,
+                storage_bytes_used,
+                db: Some(db),
+                ..Inner::default()
+            }),
+        })
     }
 
     pub fn issue_pow_challenge(&self) -> PowChallenge {
@@ -139,6 +275,13 @@ impl RelayState {
         let queue_id = Self::fresh_queue_id(&inner);
         let mut send_key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut send_key);
+        if let Some(db) = &inner.db {
+            db.execute(
+                "INSERT INTO queues (queue_id, send_key, epoch) VALUES (?1, ?2, NULL)",
+                params![queue_id.as_slice(), send_key.as_slice()],
+            )
+            .expect("relay must not hand out a queue it cannot persist");
+        }
         inner.queues.insert(
             queue_id,
             QueueEntry {
@@ -164,6 +307,26 @@ impl RelayState {
         let queue_id = Self::fresh_queue_id(&inner);
         let mut send_key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut send_key);
+        if let Some(db) = inner.db.as_mut() {
+            // One transaction: an inbox must never exist without its roster.
+            let tx = db
+                .transaction()
+                .expect("starting a persistence transaction never fails");
+            tx.execute(
+                "INSERT INTO queues (queue_id, send_key, epoch) VALUES (?1, ?2, ?3)",
+                params![queue_id.as_slice(), send_key.as_slice(), initial_epoch],
+            )
+            .expect("relay must not hand out a queue it cannot persist");
+            for (ord, member) in fan_out_to.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO roster (inbox_id, ord, member_queue) VALUES (?1, ?2, ?3)",
+                    params![queue_id.as_slice(), ord as i64, member.as_slice()],
+                )
+                .expect("relay must not hand out a queue it cannot persist");
+            }
+            tx.commit()
+                .expect("relay must not hand out a queue it cannot persist");
+        }
         inner.queues.insert(
             queue_id,
             QueueEntry {
@@ -276,6 +439,19 @@ impl RelayState {
         if Self::would_exceed_storage_bound(&inner, envelope.padded_ciphertext.len(), 1) {
             return Err(RejectionCode::StorageBoundExceeded);
         }
+        // Durable before acknowledged: the Ok reply must never outlive a
+        // crash that loses the message.
+        if let Some(db) = &inner.db {
+            db.execute(
+                "INSERT INTO pending (queue_id, message_id, envelope) VALUES (?1, ?2, ?3)",
+                params![
+                    queue_id.as_slice(),
+                    message_id.as_slice(),
+                    proto::encode(&envelope)
+                ],
+            )
+            .expect("relay must not acknowledge a message it cannot persist");
+        }
         Self::push_and_notify(&mut inner, queue_id, message_id, envelope);
         Ok(())
     }
@@ -337,6 +513,50 @@ impl RelayState {
         {
             let entry = inner.queues.get_mut(&queue_id).expect("checked above");
             entry.check_and_bump_rate_limit()?;
+        }
+        // Durable before acknowledged, in ONE transaction: the epoch advance
+        // and its fan-out land together or not at all. A crash in between
+        // would otherwise burn the epoch with the winning commit lost — the
+        // loser would then drain forever waiting for a winner that never
+        // arrives.
+        let stored_targets: Vec<QueueId> = fan_out_to
+            .iter()
+            .copied()
+            .filter(|member| {
+                matches!(
+                    inner.queues.get(member),
+                    Some(QueueEntry {
+                        kind: QueueKind::Mailbox { .. },
+                        ..
+                    })
+                )
+            })
+            .collect();
+        let is_commit = matches!(kind, GroupSendKind::Commit { .. });
+        if let Some(db) = inner.db.as_mut() {
+            let tx = db
+                .transaction()
+                .expect("starting a persistence transaction never fails");
+            if is_commit {
+                tx.execute(
+                    "UPDATE queues SET epoch = epoch + 1 WHERE queue_id = ?1",
+                    params![queue_id.as_slice()],
+                )
+                .expect("relay must not acknowledge a commit it cannot persist");
+            }
+            let envelope_bytes = proto::encode(&envelope);
+            for member in &stored_targets {
+                tx.execute(
+                    "INSERT INTO pending (queue_id, message_id, envelope) VALUES (?1, ?2, ?3)",
+                    params![member.as_slice(), message_id.as_slice(), envelope_bytes],
+                )
+                .expect("relay must not acknowledge a message it cannot persist");
+            }
+            tx.commit()
+                .expect("relay must not acknowledge a message it cannot persist");
+        }
+        {
+            let entry = inner.queues.get_mut(&queue_id).expect("checked above");
             if let (GroupSendKind::Commit { .. }, QueueKind::GroupInbox { epoch, .. }) =
                 (kind, &mut entry.kind)
             {
@@ -358,6 +578,13 @@ impl RelayState {
         // never acked at all is still missing — that's relay persistence
         // milestone territory (architecture.md step 5).
         let mut inner = self.inner.lock().unwrap();
+        if let Some(db) = &inner.db {
+            db.execute(
+                "DELETE FROM pending WHERE queue_id = ?1 AND message_id = ?2",
+                params![queue_id.as_slice(), message_id.as_slice()],
+            )
+            .expect("relay must not forget an ack it cannot persist");
+        }
         let mut freed = 0u64;
         if let Some(entry) = inner.queues.get_mut(&queue_id) {
             if let QueueKind::Mailbox { pending } = &mut entry.kind {
@@ -728,6 +955,99 @@ mod tests {
         state.subscribe(&[qid], tx);
         let (_, mid, _) = rx.try_recv().expect("unacked message must be redelivered");
         assert_eq!(mid, e.message_id);
+    }
+
+    #[test]
+    fn state_survives_restart_with_backlog_epochs_and_keys() {
+        // T9 (eng-review OV1): dropping the state at ANY point stands in for
+        // kill -9 — write-through persistence means there is no flush to
+        // miss. Queues, send keys, the unacked backlog, and the DS epoch all
+        // come back; acks are just as durable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay_state.sqlite3");
+
+        let (member, inbox, inbox_key, app_env, commit_env, used_before) = {
+            let state = RelayState::open(&path).unwrap();
+            let (member, _member_key) = state.create_mailbox(solved_pow(&state)).unwrap();
+            let (inbox, inbox_key) = state
+                .create_group_inbox(solved_pow(&state), 1, vec![member])
+                .unwrap();
+
+            // One application message and one epoch-advancing commit land
+            // while nobody is subscribed.
+            let app_env = env(1);
+            let tag = proto::compute_tag(&inbox_key, &inbox, &app_env);
+            state
+                .send_to_group_inbox(inbox, GroupSendKind::Application, tag, app_env.clone())
+                .unwrap();
+            let commit_env = env(2);
+            let tag = proto::compute_tag(&inbox_key, &inbox, &commit_env);
+            state
+                .send_to_group_inbox(
+                    inbox,
+                    GroupSendKind::Commit { epoch: 1 },
+                    tag,
+                    commit_env.clone(),
+                )
+                .unwrap();
+
+            let used = state.inner.lock().unwrap().storage_bytes_used;
+            (member, inbox, inbox_key, app_env, commit_env, used)
+        }; // ← the "crash"
+
+        let state = RelayState::open(&path).unwrap();
+        assert_eq!(
+            state.inner.lock().unwrap().storage_bytes_used,
+            used_before,
+            "storage accounting must be rebuilt from the stored backlog"
+        );
+
+        // The unacked backlog replays on subscribe, in order.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.subscribe(&[member], tx);
+        let (_, mid_1, env_1) = rx.try_recv().expect("backlog message 1 survives restart");
+        let (_, mid_2, env_2) = rx.try_recv().expect("backlog message 2 survives restart");
+        assert_eq!((mid_1, env_1), (app_env.message_id, app_env.clone()));
+        assert_eq!((mid_2, env_2), (commit_env.message_id, commit_env.clone()));
+        assert!(rx.try_recv().is_err());
+
+        // The DS epoch survived the restart: epoch 1 was burned before the
+        // crash, so a stale commit still conflicts and the current one wins.
+        // That the tags verify at all proves the send key survived too.
+        let stale = env(3);
+        let tag = proto::compute_tag(&inbox_key, &inbox, &stale);
+        assert_eq!(
+            state
+                .send_to_group_inbox(inbox, GroupSendKind::Commit { epoch: 1 }, tag, stale)
+                .unwrap_err(),
+            RejectionCode::EpochConflict
+        );
+        let fresh = env(4);
+        let tag = proto::compute_tag(&inbox_key, &inbox, &fresh);
+        state
+            .send_to_group_inbox(
+                inbox,
+                GroupSendKind::Commit { epoch: 2 },
+                tag,
+                fresh.clone(),
+            )
+            .unwrap();
+
+        // Acks are durable too: retire everything, restart again, and the
+        // backlog is gone for good.
+        state.ack(member, app_env.message_id);
+        state.ack(member, commit_env.message_id);
+        state.ack(member, fresh.message_id);
+        drop(state);
+
+        let state = RelayState::open(&path).unwrap();
+        assert_eq!(state.inner.lock().unwrap().storage_bytes_used, 0);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.subscribe(&[member], tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "acked messages must not resurrect across a restart"
+        );
     }
 
     #[test]

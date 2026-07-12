@@ -15,10 +15,16 @@ async fn main() -> anyhow::Result<()> {
         .nth(2)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("relay_identity.der"));
+    // Queue/epoch/backlog state (T9) — the file that makes restarts (and
+    // kill -9) invisible to clients. Override with arg 3.
+    let state_path = std::env::args()
+        .nth(3)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("relay_state.sqlite3"));
 
     let identity = RelayIdentity::load_or_create(&identity_path)?;
     println!("relay TLS fingerprint: {}", identity.fingerprint_hex());
 
-    let state = Arc::new(RelayState::new());
+    let state = Arc::new(RelayState::open(&state_path)?);
     relay::net::serve(&addr, state, &identity).await
 }

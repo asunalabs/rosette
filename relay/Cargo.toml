@@ -26,6 +26,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rcgen = "0.13"
 sha2 = "0.10"
+# T9: bundled so operators need no system SQLite; the relay's whole state is
+# one file next to its identity.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"

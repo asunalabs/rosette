@@ -20,3 +20,4 @@ sha2 = "0.10"
 
 [dev-dependencies]
 relay = { path = "../relay" }
+tempfile = "3"

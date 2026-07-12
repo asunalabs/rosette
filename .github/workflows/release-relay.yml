@@ -1,0 +1,50 @@
+# Relay release pipeline (architecture.md Distribution). Gated on the relay
+# persistence milestone (T9, landed): no operator-facing artifact shipped
+# while relay state was in-memory-only. Two artifacts per tag:
+#   - container image on GHCR
+#   - static musl binary attached to the GitHub Release
+# Trigger: push a tag like relay-v0.1.0.
+
+name: release-relay
+
+on:
+  push:
+    tags:
+      - "relay-v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: relay/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/relay:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}/relay:latest
+
+  musl-binary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release -p relay --target x86_64-unknown-linux-musl
+      - run: mv target/x86_64-unknown-linux-musl/release/relay relay-x86_64-linux-musl
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: relay-x86_64-linux-musl

@@ -270,8 +270,15 @@ actor thread owns a current-thread tokio runtime; callbacks delivered only
 via the dedicated chat-ffi-dispatch thread per OV8; loopback-relay
 callback-delivery test proves the full stack — see ffi-contract.md
 "Real-engine behavior notes" for the two additive EngineError variants and
-the CHAT_RELAY_ADDR/CHAT_RELAY_FINGERPRINT bootstrap knob). **Backend next:
-T9 relay persistence (step 5). T8 (app scaffold) is the frontend track.**
+the CHAT_RELAY_ADDR/CHAT_RELAY_FINGERPRINT bootstrap knob). T9 DONE
+(2026-07-12): relay queue/epoch/backlog state persists via write-through
+SQLite (rusqlite bundled; group sends transactional so an epoch advance and
+its fan-out survive a crash together), unlocking relay/Dockerfile +
+release-relay.yml; full-stack proof in engine/tests/relay_restart.rs (relay
+runtime hard-dropped mid-conversation, restarted from disk, conversation
+resumes through the engines' reconnect loops). **The backend track (steps
+0–5) is COMPLETE. T8 (app scaffold) is the frontend track; step 6 UI work
+remains gated on DT4 (/design-consultation → DESIGN.md).**
 
 0. **`ci.yml` (cargo-only) lands first** (OV10): `cargo test --workspace` on
    every push, so the convergence test guards every step below. Gradle jobs
@@ -355,11 +362,11 @@ step 5.)
 Synthesized from this review's findings. Each task derives from a specific
 finding above. Run with Claude Code or Codex; checkbox as you ship.
 
-- [ ] **T1 (P1, human: ~1d / CC: ~30min)** — ci — `ci.yml` with `cargo test --workspace` on push
+- [x] **T1 (P1, human: ~1d / CC: ~30min)** — ci — `ci.yml` with `cargo test --workspace` on push
   - Surfaced by: Outside voice OV10 — regression net must run during, not after, the refactor
   - Files: `.github/workflows/ci.yml`
   - Verify: convergence test runs on a push to a branch
-- [ ] **T2 (P1, human: ~2d / CC: ~1h)** — proto+relay+cli — TLS via rustls; relay pubkey pinned in ContactLink Endpoint
+- [x] **T2 (P1, human: ~2d / CC: ~1h)** — proto+relay+cli — TLS via rustls; relay pubkey pinned in ContactLink Endpoint
   - Surfaced by: Outside voice OV2 — cleartext send_key in QueueCreated (proto/src/wire.rs:93-96)
   - Files: `proto/src/link.rs`, `relay/src/net.rs`, `cli/src/relay_client.rs`
   - Verify: e2e test over TLS; plaintext socket rejected
@@ -371,7 +378,7 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   - Surfaced by: Outside voice OV3 — subscribe never drains pending (relay/src/state.rs:167-190); nothing acks
   - Files: `relay/src/state.rs`
   - Verify: unit test — enqueue while unsubscribed, resubscribe, receive backlog, ack, storage freed
-- [ ] **T5 (P1, human: ~1d / CC: ~30min)** — relay — fix subscriber leak, unbounded PoW challenge map, subscribe append-vs-replace
+- [x] **T5 (P1, human: ~1d / CC: ~30min)** — relay — fix subscriber leak, unbounded PoW challenge map, subscribe append-vs-replace
   - Surfaced by: Outside voice OV9 — state.rs:170 appends senders forever; state.rs:83-90 unbounded map
   - Files: `relay/src/state.rs`
   - Verify: unit tests for each (dead-sender pruned, challenge cap, no double-delivery)
@@ -387,7 +394,7 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   - Surfaced by: D5 + review 1A + OV7 resolution
   - Files: `app/` (new)
   - Verify: FFI smoke test per target in ci.yml
-- [ ] **T9 (P2, human: ~3d / CC: ~1-2h)** — relay — persistence (SQLite/sled); gates Dockerfile + release-relay.yml
+- [x] **T9 (P2, human: ~3d / CC: ~1-2h)** — relay — persistence (SQLite/sled); gates Dockerfile + release-relay.yml
   - Surfaced by: Outside voice OV1 — in-memory RelayState bricks links on restart
   - Files: `relay/src/state.rs`, `relay/Dockerfile`
   - Verify: kill -9 relay mid-conversation, restart, conversation resumes

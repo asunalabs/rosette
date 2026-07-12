@@ -2,3 +2,11 @@
 .gstack/
 # Relay TLS identity (generated at runtime; each operator has their own)
 relay_identity.der
+# Relay persistent state (T9; lives next to the identity)
+relay_state.sqlite3*
+
+# Gradle / Android (frontend track under app/)
+app/.gradle/
+app/**/build/
+app/local.properties
+app/.kotlin/
