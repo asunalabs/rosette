@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use directory::{AppState, DevOtpVendor, DirectoryConfig, DirectoryStore, RateLimiter};
+use directory::{vendor_from_env, AppState, DirectoryConfig, DirectoryStore, RateLimiter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,9 +29,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let store = Arc::new(DirectoryStore::connect(&database_url).await?);
+    let vendor = vendor_from_env()?;
     let state = Arc::new(AppState {
         store,
-        vendor: Arc::new(DevOtpVendor),
+        vendor,
         pepper,
         config: DirectoryConfig::from_env(),
         rate_limiter: RateLimiter::new(),

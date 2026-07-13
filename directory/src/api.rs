@@ -38,6 +38,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/searchable", post(set_searchable))
         .route("/account", delete(delete_account))
         .route("/search", get(search))
+        .route("/pairing-bootstrap", post(set_pairing_bootstrap))
+        .route("/pairing-bootstrap/request", post(request_pairing_bootstrap))
         .with_state(state)
         .layer(middleware::from_fn(no_store_middleware))
 }
@@ -73,6 +75,7 @@ enum ApiError {
     Unauthorized,
     FeatureDisabled,
     RateLimited,
+    NotFound,
     Internal,
 }
 
@@ -83,6 +86,7 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             ApiError::FeatureDisabled => (StatusCode::SERVICE_UNAVAILABLE, "feature disabled"),
             ApiError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate limited"),
+            ApiError::NotFound => (StatusCode::NOT_FOUND, "not found"),
             ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         };
         (status, Json(serde_json::json!({ "error": msg }))).into_response()
@@ -265,6 +269,84 @@ async fn set_searchable(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+struct PairingBootstrapRequest {
+    /// The exact base64 string `ChatEngine::contact_link()` produces for a
+    /// QR code: a fresh one-time KeyPackage plus this user's bootstrap
+    /// mailbox endpoint. Directory stores and serves it opaquely — it never
+    /// decodes it, so it never needs to depend on `core`/`engine` (T1).
+    contact_link_b64: String,
+}
+
+/// T25: publish (or replenish) this account's one-time pairing bootstrap,
+/// so a directory-search hit can request pairing without a QR/link
+/// exchange. Replenishment after a peer consumes it is a client concern —
+/// this just stores whatever the caller most recently uploaded.
+async fn set_pairing_bootstrap(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<PairingBootstrapRequest>,
+) -> Result<StatusCode, ApiError> {
+    let user_id = authenticate(&headers, &state.store)?;
+    if req.contact_link_b64.trim().is_empty() {
+        return Err(ApiError::BadRequest("contact_link_b64 must not be empty"));
+    }
+    state
+        .store
+        .set_pairing_bootstrap(user_id, &req.contact_link_b64)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct PairingBootstrapQuery {
+    user_id: u64,
+}
+
+#[derive(Serialize)]
+struct PairingBootstrapResponse {
+    contact_link_b64: String,
+}
+
+/// T25: the search-to-pairing handoff. Consumes (deletes) the target's
+/// one-time bootstrap and hands it to the caller — same rate limits and
+/// verified/unverified tiers as `/search`, since this is the same "look up
+/// another user" abuse surface (T20/T22).
+async fn request_pairing_bootstrap(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<PairingBootstrapQuery>,
+) -> Result<Json<PairingBootstrapResponse>, ApiError> {
+    if !state.config.search_enabled {
+        return Err(ApiError::FeatureDisabled);
+    }
+    let caller_id = authenticate(&headers, &state.store)?;
+
+    let caller_verified = state
+        .store
+        .is_verified(caller_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .unwrap_or(false);
+    let limit = if caller_verified {
+        VERIFIED_SEARCH_PER_MINUTE
+    } else {
+        UNVERIFIED_SEARCH_PER_MINUTE
+    };
+    if !state.rate_limiter.check_and_bump(caller_id, limit) {
+        return Err(ApiError::RateLimited);
+    }
+
+    let contact_link_b64 = state
+        .store
+        .consume_pairing_bootstrap(q.user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(PairingBootstrapResponse { contact_link_b64 }))
+}
+
 /// T15/T19: real erasure, not a flag flip — see `DirectoryStore::erase_user`.
 /// Also starts the OQ5 cooldown on the now-freed phone number.
 async fn delete_account(
@@ -362,6 +444,104 @@ mod tests {
             },
             rate_limiter: RateLimiter::new(),
         })
+    }
+
+    #[sqlx::test]
+    async fn pairing_bootstrap_is_consumed_exactly_once(pool: PgPool) {
+        let state = state_for(pool);
+        let target = state.store.create_pending_user("target-hash-0").await.unwrap();
+        state.store.claim_username(target, "pairtarget").await.unwrap();
+        state.store.set_searchable(target, true).await.unwrap();
+        let target_token = state.store.create_session(target);
+
+        let requester = state.store.create_pending_user("requester-hash-0").await.unwrap();
+        let requester_token = state.store.create_session(requester);
+
+        let addr = spawn_for_tests(state).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // No bootstrap uploaded yet: a request finds nothing.
+        let miss = client
+            .post(format!("http://{addr}/pairing-bootstrap/request?user_id={target}"))
+            .header("Authorization", format!("Bearer {requester_token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(miss.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // Target publishes a bootstrap.
+        let upload = client
+            .post(format!("http://{addr}/pairing-bootstrap"))
+            .header("Authorization", format!("Bearer {target_token}"))
+            .json(&serde_json::json!({ "contact_link_b64": "opaque-link-bytes" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), reqwest::StatusCode::NO_CONTENT);
+
+        // First request succeeds and returns exactly what was uploaded.
+        let first = client
+            .post(format!("http://{addr}/pairing-bootstrap/request?user_id={target}"))
+            .header("Authorization", format!("Bearer {requester_token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = first.json().await.unwrap();
+        assert_eq!(body["contact_link_b64"], "opaque-link-bytes");
+
+        // A second request for the same target finds nothing: one-time use.
+        let second = client
+            .post(format!("http://{addr}/pairing-bootstrap/request?user_id={target}"))
+            .header("Authorization", format!("Bearer {requester_token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn pairing_bootstrap_unreachable_for_a_non_searchable_target(pool: PgPool) {
+        let state = state_for(pool);
+        let target = state.store.create_pending_user("target-hash-1").await.unwrap();
+        // Never calls set_searchable(true) — stays private.
+        state
+            .store
+            .set_pairing_bootstrap(target, "opaque-link-bytes")
+            .await
+            .unwrap();
+
+        let requester = state.store.create_pending_user("requester-hash-1").await.unwrap();
+        let requester_token = state.store.create_session(requester);
+
+        let addr = spawn_for_tests(state).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/pairing-bootstrap/request?user_id={target}"))
+            .header("Authorization", format!("Bearer {requester_token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn erasing_a_user_deletes_their_pairing_bootstrap(pool: PgPool) {
+        let state = state_for(pool);
+        let target = state.store.create_pending_user("target-hash-2").await.unwrap();
+        state.store.set_searchable(target, true).await.unwrap();
+        state
+            .store
+            .set_pairing_bootstrap(target, "opaque-link-bytes")
+            .await
+            .unwrap();
+
+        state.store.erase_user(target).await.unwrap();
+
+        assert_eq!(
+            state.store.consume_pairing_bootstrap(target).await.unwrap(),
+            None,
+            "an erased user's bootstrap must not be servable"
+        );
     }
 
     #[sqlx::test]

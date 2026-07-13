@@ -24,10 +24,20 @@ async-trait = "0.1"
 # directory is a centrally-run service, unlike relay's per-operator file.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "migrate", "macros"] }
 axum = "0.7"
+# TwilioOtpVendor (verify.rs). Default (native-tls) backend, same as this
+# crate's pre-existing dev-dependency use of reqwest below — deliberately
+# not rustls-tls: this workspace's other rustls users (relay, engine)
+# thread an explicit ring provider through `_with_provider()` rather than
+# ever installing a process-global default (see engine/src/tls.rs), and
+# reqwest's high-level Client::builder() doesn't expose that hook. Safer to
+# reuse the already-proven-to-build native-tls path for this one outbound
+# HTTPS client than to guess at rustls feature-unification across sqlx's
+# and reqwest's independent transitive pulls without being able to test-build
+# it. Revisit if/when Twilio's Alpine/musl build needs it.
+reqwest = { version = "0.12", features = ["json", "blocking"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-reqwest = { version = "0.12", features = ["json", "blocking"] }
 # T21 crash-isolation test only — never a normal/production dependency of
 # this crate (T1's "directory never imports core/engine" is about the
 # `[dependencies]` graph, not test-only tooling that proves the isolation).

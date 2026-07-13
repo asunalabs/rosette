@@ -100,6 +100,135 @@ impl OtpVendor for DevOtpVendor {
     }
 }
 
+/// Twilio Verify (v2) as the initial `OtpVendor`. Picked per the project
+/// decision to start with one vendor but keep swapping providers a
+/// one-`impl`-block affair — everything code needs from a vendor already
+/// lives behind the `OtpVendor` trait, so a second provider (Vonage, AWS
+/// SNS, ...) is a new struct implementing the same two methods, no changes
+/// anywhere else.
+pub struct TwilioOtpVendor {
+    account_sid: String,
+    auth_token: String,
+    verify_service_sid: String,
+    client: reqwest::blocking::Client,
+}
+
+impl TwilioOtpVendor {
+    pub fn new(account_sid: String, auth_token: String, verify_service_sid: String) -> Self {
+        Self {
+            account_sid,
+            auth_token,
+            verify_service_sid,
+            client: reqwest::blocking::Client::new(),
+        }
+    }
+
+    fn verifications_url(&self) -> String {
+        format!(
+            "https://verify.twilio.com/v2/Services/{}/Verifications",
+            self.verify_service_sid
+        )
+    }
+
+    fn verification_check_url(&self) -> String {
+        format!(
+            "https://verify.twilio.com/v2/Services/{}/VerificationCheck",
+            self.verify_service_sid
+        )
+    }
+}
+
+/// `send_code`/`verify` are sync (the trait predates any vendor that needs
+/// the network — DevOtpVendor never did). `block_in_place` moves the
+/// blocking HTTP call off the async task so it doesn't stall the tokio
+/// executor; it requires the multi-threaded runtime, which is what
+/// `#[tokio::main]` with the `full` feature (main.rs) actually gives us. A
+/// real ceiling, not a hypothetical one: this would panic under a
+/// current-thread runtime. Revisit by making `OtpVendor` async if a future
+/// vendor needs more than a single request/response round trip.
+fn blocking_call<T>(f: impl FnOnce() -> T) -> T {
+    tokio::task::block_in_place(f)
+}
+
+impl OtpVendor for TwilioOtpVendor {
+    fn send_code(&self, e164: &str) -> Result<(), VendorError> {
+        blocking_call(|| {
+            let result = self
+                .client
+                .post(self.verifications_url())
+                .basic_auth(&self.account_sid, Some(&self.auth_token))
+                .form(&[("To", e164), ("Channel", "sms")])
+                .send();
+            match result {
+                Ok(resp) if resp.status().is_success() => Ok(()),
+                Ok(resp) => Err(VendorError::Other(format!(
+                    "twilio start-verification failed: {}",
+                    resp.status()
+                ))),
+                Err(e) if e.is_timeout() => Err(VendorError::Timeout),
+                Err(e) => Err(VendorError::Other(e.to_string())),
+            }
+        })
+    }
+
+    fn verify(&self, e164: &str, code: &str) -> Result<bool, VendorError> {
+        blocking_call(|| {
+            let result = self
+                .client
+                .post(self.verification_check_url())
+                .basic_auth(&self.account_sid, Some(&self.auth_token))
+                .form(&[("To", e164), ("Code", code)])
+                .send();
+            let resp = match result {
+                Ok(resp) if resp.status().is_success() => resp,
+                Ok(resp) => {
+                    return Err(VendorError::Other(format!(
+                        "twilio verification-check failed: {}",
+                        resp.status()
+                    )))
+                }
+                Err(e) if e.is_timeout() => return Err(VendorError::Timeout),
+                Err(e) => return Err(VendorError::Other(e.to_string())),
+            };
+            let body: serde_json::Value = resp
+                .json()
+                .map_err(|e| VendorError::Other(e.to_string()))?;
+            Ok(verification_approved(&body))
+        })
+    }
+}
+
+/// Split out from `verify` so the Twilio response-shape logic is
+/// unit-testable without a network call.
+fn verification_approved(body: &serde_json::Value) -> bool {
+    body.get("status").and_then(|s| s.as_str()) == Some("approved")
+}
+
+/// Picks the OTP vendor from the environment, the same "loud refusal unless
+/// explicitly opted into a dev default" shape main.rs already uses for the
+/// pepper (OQ4) — a real phone number should never silently get the fixed
+/// dev code.
+pub fn vendor_from_env() -> anyhow::Result<std::sync::Arc<dyn OtpVendor>> {
+    let sid = std::env::var("TWILIO_ACCOUNT_SID");
+    let token = std::env::var("TWILIO_AUTH_TOKEN");
+    let service = std::env::var("TWILIO_VERIFY_SERVICE_SID");
+    if let (Ok(sid), Ok(token), Ok(service)) = (sid, token, service) {
+        return Ok(std::sync::Arc::new(TwilioOtpVendor::new(sid, token, service)));
+    }
+    if std::env::var("DIRECTORY_ALLOW_DEV_OTP_VENDOR").is_ok() {
+        tracing::warn!(
+            "TWILIO_* unset — using DevOtpVendor (fixed code, sends nothing). \
+             Never do this in production."
+        );
+        return Ok(std::sync::Arc::new(DevOtpVendor));
+    }
+    anyhow::bail!(
+        "no OTP vendor configured: set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and \
+         TWILIO_VERIFY_SERVICE_SID, or set DIRECTORY_ALLOW_DEV_OTP_VENDOR=1 to run with \
+         an insecure dev default instead."
+    )
+}
+
 pub fn verify_phone(
     vendor: &dyn OtpVendor,
     raw_phone: &str,
@@ -120,6 +249,58 @@ pub fn verify_phone(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn twilio_urls_are_scoped_to_the_configured_verify_service() {
+        let vendor = TwilioOtpVendor::new(
+            "AC_sid".to_string(),
+            "token".to_string(),
+            "VA_service".to_string(),
+        );
+        assert_eq!(
+            vendor.verifications_url(),
+            "https://verify.twilio.com/v2/Services/VA_service/Verifications"
+        );
+        assert_eq!(
+            vendor.verification_check_url(),
+            "https://verify.twilio.com/v2/Services/VA_service/VerificationCheck"
+        );
+    }
+
+    #[test]
+    fn verification_approved_reads_the_twilio_status_field() {
+        assert!(verification_approved(
+            &serde_json::json!({ "status": "approved", "sid": "VE123" })
+        ));
+        assert!(!verification_approved(
+            &serde_json::json!({ "status": "pending" })
+        ));
+        assert!(!verification_approved(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn vendor_from_env_prefers_twilio_and_never_silently_falls_back() {
+        // One test, not two: TWILIO_*/DIRECTORY_ALLOW_DEV_OTP_VENDOR are
+        // process-global, so exercising both branches in the same test
+        // avoids a race against a parallel test thread over the same vars.
+        std::env::remove_var("TWILIO_ACCOUNT_SID");
+        std::env::remove_var("TWILIO_AUTH_TOKEN");
+        std::env::remove_var("TWILIO_VERIFY_SERVICE_SID");
+        std::env::remove_var("DIRECTORY_ALLOW_DEV_OTP_VENDOR");
+        assert!(
+            vendor_from_env().is_err(),
+            "must not fall back to DevOtpVendor without an explicit opt-in"
+        );
+
+        std::env::set_var("TWILIO_ACCOUNT_SID", "AC_test");
+        std::env::set_var("TWILIO_AUTH_TOKEN", "token_test");
+        std::env::set_var("TWILIO_VERIFY_SERVICE_SID", "VA_test");
+        let vendor = vendor_from_env();
+        std::env::remove_var("TWILIO_ACCOUNT_SID");
+        std::env::remove_var("TWILIO_AUTH_TOKEN");
+        std::env::remove_var("TWILIO_VERIFY_SERVICE_SID");
+        assert!(vendor.is_ok(), "fully configured Twilio env must be picked up");
+    }
 
     struct TimeoutVendor;
     impl OtpVendor for TimeoutVendor {

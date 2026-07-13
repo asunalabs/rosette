@@ -1,0 +1,60 @@
+# T18: single-EC2-instance deploy. `directory` + its Postgres + Caddy
+# (automatic Let's Encrypt TLS, reverse-proxying 443 -> directory:7444) all
+# on one box — no ALB/RDS decision needed to get a real TLS endpoint up.
+# Revisit (managed Postgres, multi-instance, ALB) once real load numbers
+# exist; nothing here blocks migrating to those later.
+#
+# Usage on the instance:
+#   cp .env.example .env   # fill in the real values
+#   docker compose up -d
+#
+# DNS: point DIRECTORY_DOMAIN at this instance's IP before starting Caddy,
+# or the ACME HTTP-01 challenge will fail and it'll retry with backoff.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: directory
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: directory
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # Not published to the host — only `directory` reaches it, over the
+    # compose-internal network.
+
+  directory:
+    build:
+      context: ../..
+      dockerfile: directory/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://directory:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/directory
+      DIRECTORY_PEPPER: ${DIRECTORY_PEPPER:?set in .env}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_VERIFY_SERVICE_SID: ${TWILIO_VERIFY_SERVICE_SID:-}
+      DIRECTORY_ALLOW_DEV_OTP_VENDOR: ${DIRECTORY_ALLOW_DEV_OTP_VENDOR:-}
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - directory
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DIRECTORY_DOMAIN: ${DIRECTORY_DOMAIN:?set in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  postgres-data:
+  caddy-data:
+  caddy-config:

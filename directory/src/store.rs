@@ -244,8 +244,63 @@ impl DirectoryStore {
         .bind(user_id as i64)
         .execute(&mut *tx)
         .await?;
+        // T25: an erased user's pairing bootstrap (a live KeyPackage) must
+        // not survive the account it was issued for.
+        sqlx::query("DELETE FROM pairing_bootstrap WHERE user_id = $1")
+            .bind(user_id as i64)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// T25: publish this user's one-time pairing bootstrap (a base64
+    /// `ContactLink` — see migration 0002's comment). Upsert: a re-upload
+    /// replaces whatever was there, so a client can replenish after its
+    /// last one was consumed, or before it's ever been requested.
+    pub async fn set_pairing_bootstrap(
+        &self,
+        user_id: u64,
+        contact_link_b64: &str,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO pairing_bootstrap (user_id, contact_link_b64, uploaded_at)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (user_id) DO UPDATE SET
+                contact_link_b64 = excluded.contact_link_b64,
+                uploaded_at = excluded.uploaded_at",
+        )
+        .bind(user_id as i64)
+        .bind(contact_link_b64)
+        .bind(now_unix())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// T25: one-time fetch — the row is deleted in the same statement it's
+    /// read from (`DELETE ... RETURNING`), so two concurrent requesters can
+    /// never both receive the same KeyPackage (MLS one-time-use, not just a
+    /// convention the caller has to honor). Only serves a target that's
+    /// still `searchable` and not deleted — the only legitimate way to have
+    /// learned this `user_id` is a directory search result, which already
+    /// requires both.
+    pub async fn consume_pairing_bootstrap(&self, user_id: u64) -> sqlx::Result<Option<String>> {
+        let row = sqlx::query(
+            "DELETE FROM pairing_bootstrap
+             WHERE user_id = $1
+               AND EXISTS (
+                   SELECT 1 FROM users
+                   WHERE users.user_id = pairing_bootstrap.user_id
+                     AND users.searchable = true
+                     AND users.deleted_at IS NULL
+               )
+             RETURNING contact_link_b64",
+        )
+        .bind(user_id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<String, _>("contact_link_b64")))
     }
 
     pub fn create_session(&self, user_id: u64) -> String {
