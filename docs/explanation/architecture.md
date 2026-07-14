@@ -384,6 +384,15 @@ then.**
 - **iOS distribution** — blocked on TODOS #5; only the build target ships now.
 - **SQLCipher persistence** — T5/T8, next milestone after app skeleton; the
   layout already names its home (core storage provider + engine wiring).
+  Confirmed as a hard product requirement (2026-07-14, founder): Signal's
+  model exactly — an SQLCipher-encrypted SQLite database on-device is the
+  *only* durable store for messages/contacts/keys; relay servers hold nothing
+  beyond transient undelivered queues (relay persistence in step 5 is
+  queue/epoch state for restart-survivability, never message history).
+- **E2EE audio/video calling** — future roadmap, post-v1 (2026-07-14,
+  founder). Tracked as TODOS.md #10; needs its own design pass (WebRTC/SRTP
+  vs custom, TURN relay metadata exposure vs the no-identifier promise).
+  Not load-bearing for any current milestone.
 - **Push notifications (FCM/UnifiedPush/APNs)** — needs its own design pass;
   interacts with TODOS #5 and the no-identifier promise.
 - **Splitting the monorepo** — revisit only if external platform teams appear.
