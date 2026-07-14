@@ -47,6 +47,7 @@ fn spawn_directory_subprocess() -> (Child, String) {
     let child = Command::new(bin)
         .env("DATABASE_URL", &database_url)
         .env("DIRECTORY_ALLOW_DEV_PEPPER", "1")
+        .env("DIRECTORY_ALLOW_DEV_OTP_VENDOR", "1")
         .env("DIRECTORY_ADDR", &addr)
         .spawn()
         .expect("failed to spawn the directory binary");
