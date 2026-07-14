@@ -390,9 +390,15 @@ then.**
   beyond transient undelivered queues (relay persistence in step 5 is
   queue/epoch state for restart-survivability, never message history).
 - **E2EE audio/video calling** — future roadmap, post-v1 (2026-07-14,
-  founder). Tracked as TODOS.md #10; needs its own design pass (WebRTC/SRTP
-  vs custom, TURN relay metadata exposure vs the no-identifier promise).
-  Not load-bearing for any current milestone.
+  founder). Tracked as TODOS.md #10, design posture decided same day:
+  Signal's model (libwebrtc/RingRTC-style from the Rust core, DTLS-SRTP
+  keyed off MLS identity, signaling over the relay SUBSCRIBE channel,
+  contacts P2P / strangers relayed / always-relay toggle). Not
+  load-bearing for any current milestone, with ONE reservation: the wire
+  protocol should tolerate a future "signaling" message class with
+  ephemeral delivery semantics (no durable queueing, expires in seconds)
+  so call signaling doesn't have to be retrofitted — a wire-format
+  reservation like A2's multi-relay one, not a feature build.
 - **Push notifications (FCM/UnifiedPush/APNs)** — needs its own design pass;
   interacts with TODOS #5 and the no-identifier promise.
 - **Splitting the monorepo** — revisit only if external platform teams appear.
