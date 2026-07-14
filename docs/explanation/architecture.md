@@ -312,7 +312,19 @@ libchat_ffi.so into the APK (arm64-v8a + x86_64); ffi/ moved to uniffi
 the timeboxed spike per the split gate — needs Mac hardware, not startable
 from this machine. **Step 6 UI work remains gated on DT4
 (/design-consultation → DESIGN.md); composeApp stays a walking shell until
-then.**
+then.** SQLCipher client persistence (T5/T8) DONE (2026-07-14):
+`core::storage::Store` (SQLCipher via rusqlite, wrong-key refusal,
+ciphertext-on-disk test), `ChatSession::snapshot/restore` (whole
+openmls-storage-map snapshot — disclosed ponytail ceiling, granular
+StorageProvider if group scale demands), engine write-through on every
+state change (always persist-before-ack; sends persist-before-send so a
+resumed engine never replays its own echo into MLS) plus
+`ChatEngine::attach_store`/`resume`; engine/tests/persistence.rs kills the
+client mid-conversation and resumes it from disk, including across an
+epoch advance. Remaining disclosed gap: a crash between a *commit's*
+relay-accept and its persist strands the group an epoch ahead (inflight
+marker + merge-own-echo-on-resume is the fix; nothing outside tests
+rotates keys yet).
 
 0. **`ci.yml` (cargo-only) lands first** (OV10): `cargo test --workspace` on
    every push, so the convergence test guards every step below. Gradle jobs
@@ -382,8 +394,8 @@ then.**
   the wire format; operational story is post-beta.
 - **Play Store pipeline** — blocked on TODOS #2 (CEO-level decision).
 - **iOS distribution** — blocked on TODOS #5; only the build target ships now.
-- **SQLCipher persistence** — T5/T8, next milestone after app skeleton; the
-  layout already names its home (core storage provider + engine wiring).
+- **SQLCipher persistence** — DONE 2026-07-14 (see status above; was: T5/T8,
+  next milestone after app skeleton).
   Confirmed as a hard product requirement (2026-07-14, founder): Signal's
   model exactly — an SQLCipher-encrypted SQLite database on-device is the
   *only* durable store for messages/contacts/keys; relay servers hold nothing

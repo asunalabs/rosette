@@ -17,5 +17,12 @@ tracing.workspace = true
 openmls = "0.8.1"
 openmls_rust_crypto = "0.5.1"
 openmls_memory_storage = "0.5.0"
-openmls_basic_credential = "0.5.0"
+openmls_basic_credential = { version = "0.5.0", features = ["clonable"] }
 sha2 = "0.10"
+# Same rusqlite version as relay; the sqlcipher feature wins feature
+# unification workspace-wide (relay's unkeyed DBs are unaffected — an
+# unkeyed SQLCipher build reads/writes plain SQLite files).
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+[dev-dependencies]
+tempfile = "3"

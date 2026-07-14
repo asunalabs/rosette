@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail};
 use base64::Engine as _;
-use chatcore::{message_id_for, ChatSession, Incoming};
+use chatcore::{message_id_for, ChatSession, Incoming, Store};
 use proto::{
     ContactLink, DeliveryMode, Endpoint, Envelope, GroupSendKind, MessageId, QueueId, RejectionCode,
 };
@@ -58,6 +58,24 @@ pub struct ChatEngine {
     /// pops; `commit_self_update`'s conflict drain also parks displaced
     /// events here.
     pending_events: VecDeque<Event>,
+    /// SQLCipher write-through (T5/T8): every state-changing operation
+    /// persists BEFORE its ack, so a crash between the two redelivers into
+    /// an already-updated seen set. None = in-memory engine (tests, and any
+    /// caller that hasn't attached a store yet).
+    store: Option<Store>,
+}
+
+/// The non-MLS half of what `resume` needs — queue credentials and relay
+/// identity. The MLS half lives in the session snapshot, the seen set in
+/// its own table.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedEngine {
+    display_name: String,
+    relay_addr: String,
+    relay_fingerprint: [u8; 32],
+    mailbox_qid: QueueId,
+    mailbox_key: [u8; 32],
+    inbox: Option<(QueueId, [u8; 32])>,
 }
 
 fn wrap(wire_bytes: &[u8]) -> anyhow::Result<Envelope> {
@@ -97,7 +115,80 @@ impl ChatEngine {
             inbox: None,
             seen: HashSet::new(),
             pending_events: VecDeque::new(),
+            store: None,
         })
+    }
+
+    /// Make this engine durable: every state change from here on writes
+    /// through to the encrypted store, and `resume` can rebuild it after a
+    /// process death. Attach BEFORE `await_pairing` so the pairing itself is
+    /// crash-safe; after `pair_with_link`, attach immediately on return.
+    // ponytail: the scan side has a millisecond window between pairing and
+    // attach where a crash loses the pairing (peer keeps a dead group) —
+    // recovery is "re-scan the QR". Constructor-injected stores if that
+    // window ever matters.
+    pub fn attach_store(&mut self, store: Store) -> anyhow::Result<()> {
+        self.store = Some(store);
+        let all_seen: Vec<MessageId> = self.seen.iter().copied().collect();
+        self.persist(&all_seen)
+    }
+
+    /// Rebuild a durable engine from its store and reconnect. The relay
+    /// replays the unacked backlog on subscribe (T4); the persisted seen
+    /// set suppresses everything already applied before the crash.
+    pub async fn resume(store: Store) -> anyhow::Result<Self> {
+        let rec: PersistedEngine = bincode::deserialize(
+            &store
+                .get("engine")?
+                .ok_or_else(|| anyhow!("store holds no engine state — nothing to resume"))?,
+        )?;
+        let session = ChatSession::restore(
+            &store
+                .get("session")?
+                .ok_or_else(|| anyhow!("store holds no session state — nothing to resume"))?,
+        )?;
+        let seen = store
+            .seen_ids()?
+            .into_iter()
+            .map(|v| {
+                MessageId::try_from(v.as_slice()).map_err(|_| anyhow!("corrupt seen-id row"))
+            })
+            .collect::<anyhow::Result<HashSet<_>>>()?;
+        let relay = RelayClient::connect(&rec.relay_addr, rec.relay_fingerprint).await?;
+        relay.subscribe(vec![rec.mailbox_qid]).await?;
+        Ok(ChatEngine {
+            display_name: rec.display_name,
+            session,
+            relay,
+            relay_addr: rec.relay_addr,
+            relay_fingerprint: rec.relay_fingerprint,
+            mailbox_qid: rec.mailbox_qid,
+            mailbox_key: rec.mailbox_key,
+            inbox: rec.inbox,
+            seen,
+            pending_events: VecDeque::new(),
+            store: Some(store),
+        })
+    }
+
+    /// Write-through: engine record + full session snapshot + new seen ids,
+    /// one transaction. No-op for in-memory engines.
+    fn persist(&mut self, new_seen: &[MessageId]) -> anyhow::Result<()> {
+        let Some(store) = self.store.as_mut() else {
+            return Ok(());
+        };
+        let rec = bincode::serialize(&PersistedEngine {
+            display_name: self.display_name.clone(),
+            relay_addr: self.relay_addr.clone(),
+            relay_fingerprint: self.relay_fingerprint,
+            mailbox_qid: self.mailbox_qid,
+            mailbox_key: self.mailbox_key,
+            inbox: self.inbox,
+        })?;
+        let session = self.session.snapshot()?;
+        let seen: Vec<&[u8]> = new_seen.iter().map(|id| id.as_slice()).collect();
+        store.commit(&[("engine", &rec), ("session", &session)], &seen)?;
+        Ok(())
     }
 
     /// The base64 string a QR code encodes: a fresh KeyPackage plus this
@@ -170,6 +261,7 @@ impl ChatEngine {
                 .join_from_welcome(&payload.welcome_wire, &payload.tree_wire)?;
             self.seen.insert(envelope.message_id);
             self.inbox = Some((payload.inbox_qid, payload.inbox_key));
+            self.persist(&[envelope.message_id])?;
             self.try_ack(qid, envelope.message_id).await?;
             return Ok(());
         }
@@ -201,6 +293,14 @@ impl ChatEngine {
         let wire = self.session.encrypt_application(plaintext)?;
         let envelope = wrap(&wire)?;
         let message_id = envelope.message_id;
+        // Persist BEFORE the send: `encrypt_application` already advanced
+        // the sender ratchet, and the seen entry pre-suppresses the own
+        // fan-out echo. A crash after persist but before send at worst
+        // skips a ratchet generation, which receivers tolerate; the reverse
+        // order would let a redelivered own echo hit the session as an
+        // undecryptable foreign message after resume.
+        self.seen.insert(message_id);
+        self.persist(&[message_id])?;
         loop {
             match self
                 .relay
@@ -212,10 +312,7 @@ impl ChatEngine {
                 )
                 .await
             {
-                Ok(Ok(())) => {
-                    self.seen.insert(message_id); // own fan-out echo, pre-suppressed
-                    return Ok(());
-                }
+                Ok(Ok(())) => return Ok(()),
                 Ok(Err(code)) => bail!("send rejected: {code:?}"),
                 Err(e) if is_connection_closed(&e) => self.reconnect().await?,
                 Err(e) => return Err(e),
@@ -255,6 +352,12 @@ impl ChatEngine {
                 Ok(()) => {
                     self.seen.insert(envelope.message_id);
                     self.session.merge_pending_commit()?;
+                    // ponytail: a crash between the relay accepting this
+                    // commit and this persist strands the group one epoch
+                    // ahead of the stored state — an inflight-commit marker
+                    // plus merge-own-echo-on-resume logic closes it; add
+                    // when anything beyond tests actually rotates keys.
+                    self.persist(&[envelope.message_id])?;
                     return Ok(self.session.epoch()?);
                 }
                 Err(RejectionCode::EpochConflict) => {
@@ -316,6 +419,10 @@ impl ChatEngine {
                         Incoming::CommitApplied => Event::EpochAdvanced(self.session.epoch()?),
                     };
                     self.pending_events.push_back(event);
+                    // Persist before the ack (A9): a crash between the two
+                    // redelivers into the already-updated seen set instead
+                    // of replaying into MLS.
+                    self.persist(&[id])?;
                 }
                 self.try_ack(qid, id).await
             }

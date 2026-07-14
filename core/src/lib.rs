@@ -7,7 +7,9 @@ pub mod identity;
 pub mod pairing;
 pub mod provider;
 pub mod session;
+pub mod storage;
 
 pub use identity::Identity;
 pub use provider::{Provider, CIPHERSUITE};
 pub use session::{message_id_for, ChatSession, Incoming, SessionError};
+pub use storage::{Store, StoreError};

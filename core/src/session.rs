@@ -3,15 +3,19 @@
 //! in the workspace that touches OpenMLS directly; proto/, relay/, and cli/
 //! only ever see opaque wire bytes.
 //!
-//! v0.1 scope cut (disclosed): state lives in memory only
-//! (`openmls_memory_storage`), not SQLCipher. Amendments A8/A9 (encrypted
-//! export, atomic commit-processing + persistence, crash recovery test) are
-//! step-4 work — tracked as T5/T8 in tasks-eng-review-*.jsonl — and require
-//! a real storage provider this wrapper doesn't yet have.
+//! Persistence (A8/A9): the session runs on `openmls_memory_storage` and is
+//! made durable by `snapshot`/`restore` — the whole storage map plus the
+//! identity, serialized as one blob the engine writes into the SQLCipher
+//! `Store` (storage.rs) after every state-changing operation, atomically
+//! with the seen-set and before any ack. Encryption-at-rest is SQLCipher's,
+//! not the snapshot's — the blob itself is plaintext to whoever holds the
+//! database key.
+// ponytail: whole-map snapshot per operation, not a granular openmls
+// StorageProvider impl — a 2-member group's map is tiny. Implement the real
+// trait against rusqlite if profiling ever shows snapshot cost at group scale.
 
 use openmls::prelude::tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use openmls::prelude::*;
-use openmls_memory_storage::MemoryStorage;
 use sha2::{Digest, Sha256};
 
 use crate::identity::Identity;
@@ -58,6 +62,18 @@ pub struct ChatSession {
     group: Option<MlsGroup>,
 }
 
+/// Everything `restore` needs to rebuild a live session: the identity
+/// (signer + credential), the group id to re-load the `MlsGroup` handle by,
+/// and the full openmls storage map (which holds the actual group/ratchet
+/// state — `MlsGroup` is just a handle over it).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SessionSnapshot {
+    credential_with_key: CredentialWithKey,
+    signer: openmls_basic_credential::SignatureKeyPair,
+    group_id: Option<Vec<u8>>,
+    storage: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+}
+
 impl ChatSession {
     /// Exposed so `pairing::key_package_from_link` can validate a scanned
     /// KeyPackage against this identity's own crypto backend.
@@ -73,6 +89,58 @@ impl ChatSession {
             identity,
             group: None,
         }
+    }
+
+    /// Serialize the entire session — identity, group handle, and the full
+    /// openmls storage map — into one blob for the encrypted store.
+    pub fn snapshot(&self) -> Result<Vec<u8>, SessionError> {
+        let storage = self
+            .provider
+            .storage()
+            .values
+            .read()
+            .expect("storage lock is never poisoned — no panics while held")
+            .clone();
+        let snap = SessionSnapshot {
+            credential_with_key: self.identity.credential_with_key.clone(),
+            signer: self.identity.signer.clone(),
+            group_id: self
+                .group
+                .as_ref()
+                .map(|g| g.group_id().as_slice().to_vec()),
+            storage,
+        };
+        bincode::serialize(&snap).map_err(|e| SessionError::Decode(e.to_string()))
+    }
+
+    /// Rebuild a live session from a `snapshot` blob.
+    pub fn restore(bytes: &[u8]) -> Result<Self, SessionError> {
+        let snap: SessionSnapshot =
+            bincode::deserialize(bytes).map_err(|e| SessionError::Decode(e.to_string()))?;
+        let provider = Provider::default();
+        *provider
+            .storage()
+            .values
+            .write()
+            .expect("storage lock is never poisoned — no panics while held") = snap.storage;
+        let group = match snap.group_id {
+            Some(gid) => Some(
+                MlsGroup::load(provider.storage(), &GroupId::from_slice(&gid))
+                    .map_err(|e| SessionError::Mls(e.to_string()))?
+                    .ok_or_else(|| {
+                        SessionError::Mls("snapshot names a group its storage lacks".into())
+                    })?,
+            ),
+            None => None,
+        };
+        Ok(ChatSession {
+            provider,
+            identity: Identity {
+                credential_with_key: snap.credential_with_key,
+                signer: snap.signer,
+            },
+            group,
+        })
     }
 
     /// A fresh KeyPackage this identity can be invited with — the thing a
@@ -260,9 +328,3 @@ impl ChatSession {
         }
     }
 }
-
-// MemoryStorage is openmls_memory_storage's concrete provider; named here
-// only so the disclosed-cut doc comment above has something to point at in
-// rustdoc — Provider (provider.rs) is what's actually used.
-#[allow(dead_code)]
-type _StorageDoc = MemoryStorage;
