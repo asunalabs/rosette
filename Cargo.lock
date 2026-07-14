@@ -426,9 +426,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "bincode",
+ "chatcore",
  "engine",
  "proto",
  "relay",
+ "serde",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "uniffi",

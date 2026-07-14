@@ -34,7 +34,8 @@ them to start.
 
 | Method | Signature | Purpose |
 |--------|-----------|---------|
-| `new` | `(display_name: String) -> ChatEngine` | Create the engine. Name is local-only, never a network id. |
+| `new` | `(display_name: String) -> ChatEngine` | Create an in-memory engine (tests/throwaway; nothing survives process death). |
+| `new_persistent` **ADDITIVE** | `(display_name: String, db_path: String, db_key: String) -> Result<ChatEngine, EngineError>` | Create the engine backed by a SQLCipher database — the constructor the app actually ships. See persistence notes below. |
 | `set_listener` | `(EngineEventListener)` | Register the event callback (once, after construction). |
 | `create_contact_link` | `() -> String` | The base64 string your QR code encodes (wireframe-v1 frame B). |
 | `pair_with_link` | `(link: String) -> Result<String, EngineError>` | Consume a scanned link, return the new conversation id. |
@@ -78,6 +79,25 @@ request-ids, reconnect, and real MLS underneath.
   a coroutine off the main thread.
 - `display_name` in `Conversation` is the peer's MLS-credential name
   (decoration only, never an identifier); `"New contact"` if absent.
+
+### ADDITIVE (2026-07-14, T5/T8): persistence via `new_persistent`
+
+- **`new_persistent(display_name, db_path, db_key)`** backs the engine with
+  a SQLCipher-encrypted database at `db_path`. First run creates it; later
+  runs RESUME: identity, pairing, MLS state, conversation list, and message
+  history all survive process death. `conversations()`/`messages()` are
+  populated synchronously from disk — render immediately, before any network.
+- **`db_key` is the caller's responsibility**: derive it from the platform
+  keystore (Android Keystore / iOS Keychain). It is never written anywhere.
+- **`EngineError` gained `StorageFailed { reason }`** — wrong key or corrupt
+  file. Deliberately loud: a wrong key is never answered with silently fresh
+  state. New exception subclass on the Kotlin side; existing code compiles.
+- **Resume reconnects in the background.** Construction never blocks on the
+  network; if the relay is unreachable you get
+  `ConnectionStateChanged { online: false }`, sends fail fast with
+  `SendFailed("still reconnecting…")`, and the engine keeps retrying until
+  the relay returns (then `online: true`).
+- `new` (in-memory) is unchanged and stays for tests.
 
 ## Frontend: consuming it via Gobley
 

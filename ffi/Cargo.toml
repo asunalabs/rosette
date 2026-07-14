@@ -17,11 +17,15 @@ crate-type = ["lib", "cdylib", "staticlib"]
 uniffi = "=0.29.4"
 thiserror.workspace = true
 engine.workspace = true
+chatcore.workspace = true
 proto.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+bincode.workspace = true
 # Same version as engine/'s so error downcasts see the same type.
 base64 = "0.22"
 
 [dev-dependencies]
 relay = { path = "../relay" }
+tempfile = "3"

@@ -28,6 +28,9 @@ impl Store {
     /// keystore; it never lives in this file's schema.
     pub fn open(path: &Path, key: &str) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
+        // Two connections share the file in the app (engine write-through +
+        // UI history); wait out the other writer instead of erroring BUSY.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "key", key)?;
         // First real read is where a wrong key surfaces ("file is not a
         // database") — map it to a loud, typed refusal.
