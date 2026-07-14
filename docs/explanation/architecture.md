@@ -467,7 +467,8 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
 - [ ] **DT1 (P2, human: ~1d / CC: ~1h)** — app — pairing flow screens (EmptyState=QR, AddContact My-code/Scan, Verification sheet) per wireframe-v1
 - [ ] **DT2 (P2, human: ~1d / CC: ~1h)** — app — interaction states (reconnect banner, failed-send bubble, key-change system line, skeleton loading)
 - [ ] **DT3 (P2, human: ~4h / CC: ~30min)** — app — 700dp breakpoint + a11y baseline (semantics, 48dp, 4.5:1, keyboard)
-- [ ] **DT4 (P3, human: ~1d)** — design — run /design-consultation for DESIGN.md tokens + identicon signature (gates step 6)
+- [x] **DT4 (P3, human: ~1d)** — design — run /design-consultation for DESIGN.md tokens + identicon signature (gates step 6)
+  - **Done 2026-07-14.** `DESIGN.md` ("The Instrument") + `docs/design/design-preview.html` (rendered tokens, live guilloché Rosette identicon algorithm v0). Step 6 UI work unblocked.
 
 ## GSTACK REVIEW REPORT
 

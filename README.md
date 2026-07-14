@@ -30,6 +30,7 @@ cargo run -p cli -- connect "<link>"                      # 3: bob → chat
 
 | Doc | What it's for |
 |-----|---------------|
+| [Project guide](docs/explanation/project-guide.md) | Start here: what everything does, why it's shaped this way, current status |
 | [Getting started](docs/tutorials/getting-started.md) | Tutorial: full stack running locally, first encrypted message |
 | [How to run a relay](docs/how-to/run-a-relay.md) | Operators: binary or Docker, persistence, fingerprint handling |
 | [How to chat from the CLI](docs/how-to/chat-from-the-cli.md) | Pair and chat from the terminal |

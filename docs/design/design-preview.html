@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Instrument — Design System Preview</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root, [data-theme="light"] {
+    --bg: #FFFFFF;
+    --surface: #F7F6F6;
+    --surface-2: #EFEDEE;
+    --ink: #1A1618;
+    --muted: #625B5E;
+    --hairline: #E5E1E3;
+    --accent: #5B3A6C;
+    --accent-strong: #432852;
+    --accent-soft: #EDE4F2;
+    --error: #C62828;
+    --error-soft: #FBE9E7;
+    --warning: #8F6400;
+    --warning-soft: #F5ECD4;
+    --info: #4C5A6B;
+    --bubble-mine: #ECE3F1;
+    --bubble-theirs: #F7F6F6;
+    --shadow: 0 1px 10px rgba(27, 22, 24, 0.08);
+  }
+  [data-theme="dark"] {
+    --bg: #121013;
+    --surface: #1B181B;
+    --surface-2: #242023;
+    --ink: #ECE9EB;
+    --muted: #948D91;
+    --hairline: #2F2A2E;
+    --accent: #B08CC9;
+    --accent-strong: #C3A4D8;
+    --accent-soft: #2B2233;
+    --error: #E5484D;
+    --error-soft: #35201B;
+    --warning: #D4A945;
+    --warning-soft: #322B18;
+    --info: #94A3B8;
+    --bubble-mine: #2C2235;
+    --bubble-theirs: #1B181B;
+    --shadow: 0 1px 12px rgba(0,0,0,0.5);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font-family: 'IBM Plex Sans', sans-serif; font-size: 16px; line-height: 1.6;
+    transition: background .2s ease-out, color .2s ease-out;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px 96px; }
+
+  header { padding: 72px 0 44px; border-bottom: 1px solid var(--hairline); position: relative; }
+  .kicker { font-size: 12.5px; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; color: var(--accent); margin-bottom: 22px;}
+  h1.pledge {
+    font-weight: 700; font-size: clamp(32px, 5vw, 54px); line-height: 1.08;
+    letter-spacing: -0.025em; max-width: 21ch;
+  }
+  h1 .accent { color: var(--accent); }
+  .sub { margin-top: 22px; color: var(--muted); max-width: 62ch; font-size: 15.5px;}
+  .toggle {
+    position: absolute; top: 32px; right: 0;
+    font: 600 13px 'IBM Plex Sans'; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--hairline); border-radius: 8px; padding: 9px 16px; cursor: pointer;
+    transition: transform .12s ease-out;
+  }
+  .toggle:active { transform: scale(.97); }
+
+  section { padding: 56px 0 8px; }
+  h2 { font-weight: 700; font-size: 25px; margin-bottom: 6px; letter-spacing: -0.02em;}
+  .lede { color: var(--muted); margin-bottom: 30px; max-width: 68ch; font-size: 15px;}
+  h3 { font-size: 12.5px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: 26px 0 12px; }
+
+  .spec { background: var(--surface); border: 1px solid var(--hairline); border-radius: 10px; padding: 28px 30px; margin-bottom: 16px; }
+  .spec .label { font-size: 12px; font-weight: 600; color: var(--accent); letter-spacing: .12em; text-transform: uppercase; margin-bottom: 14px;}
+  .spec .display { font-size: 29px; font-weight: 700; line-height: 1.2; letter-spacing: -0.02em; }
+  .spec .body { font-size: 16px; max-width: 62ch; }
+  .spec .ui-row { display:flex; gap: 26px; flex-wrap: wrap; align-items: center; margin-top: 6px;}
+  .spec .name { font-weight: 600; font-size: 16px; }
+  .spec .handle { font-weight: 500; color: var(--muted); font-feature-settings: 'tnum'; }
+  .spec .mono { font-family: 'IBM Plex Mono', monospace; font-size: 14.5px; letter-spacing: .03em; }
+  .spec .note { font-size: 13px; color: var(--muted); margin-top: 14px; }
+
+  .swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .sw { border-radius: 10px; border: 1px solid var(--hairline); overflow: hidden; background: var(--surface); }
+  .sw .chip { height: 64px; }
+  .sw .meta { padding: 10px 12px; font-size: 12.5px; }
+  .sw .meta b { display: block; font-size: 13px; font-weight: 600;}
+  .sw .meta span { color: var(--muted); font-family: 'IBM Plex Mono', monospace; font-size: 11.5px;}
+
+  .components { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 18px;}
+  .btn { font: 600 15px 'IBM Plex Sans'; border-radius: 9px; padding: 12px 22px; cursor: pointer; border: none; transition: transform .12s ease-out;}
+  .btn:active { transform: scale(.97); }
+  .btn.primary { background: var(--accent); color: #FFFFFF; }
+  [data-theme="dark"] .btn.primary { color: #121013; }
+  .btn.secondary { background: transparent; color: var(--ink); border: 1.5px solid var(--hairline); }
+  .btn.ghost { background: transparent; color: var(--accent); }
+  .input { font: 500 15px 'IBM Plex Sans'; color: var(--ink); background: var(--bg); border: 1.5px solid var(--hairline); border-radius: 9px; padding: 12px 16px; min-width: 220px;}
+  .input:focus { outline: none; border-color: var(--accent); }
+  .alerts { display: grid; gap: 10px; margin-top: 18px; max-width: 560px;}
+  .alert { border-radius: 9px; padding: 12px 16px; font-size: 14.5px; font-weight: 500; border: 1px solid transparent;}
+  .alert.ok { background: var(--accent-soft); color: var(--accent-strong); }
+  [data-theme="dark"] .alert.ok { color: var(--accent); }
+  .alert.warn { background: var(--warning-soft); color: var(--warning); }
+  .alert.err { background: var(--error-soft); color: var(--error); }
+  .alert.info { background: var(--surface-2); color: var(--info); }
+
+  .seal-row { display: flex; gap: 26px; flex-wrap: wrap; align-items: flex-end; margin-top: 8px;}
+  .seal-cell { text-align: center; }
+  .seal-cell .cap { font-size: 12px; color: var(--muted); margin-top: 8px; max-width: 104px;}
+  .seal-sizes { display: flex; gap: 22px; align-items: center; margin-top: 26px;}
+
+  .phones { display: flex; gap: 28px; flex-wrap: wrap; margin-top: 10px; }
+  .phone {
+    width: 320px; background: var(--bg); border: 1px solid var(--hairline);
+    border-radius: 22px; overflow: hidden; box-shadow: var(--shadow);
+  }
+  .phone .bar { display:flex; align-items:center; gap: 12px; padding: 14px 16px; background: var(--surface); border-bottom: 1px solid var(--hairline);}
+  .phone .bar .t { font-weight: 700; font-size: 17px; letter-spacing: -0.01em;}
+  .phone .bar .t small { display:block; font-weight: 500; font-size: 11.5px; color: var(--accent); letter-spacing: 0;}
+  .rows { background: var(--bg); }
+  .row { display: flex; gap: 12px; padding: 12px 16px; align-items: center; height: 72px; border-bottom: 1px solid var(--hairline);}
+  .row .txt { flex: 1; min-width: 0;}
+  .row .nm { font-weight: 600; font-size: 15px; display: flex; align-items: center; gap: 6px;}
+  .row .nm .vf { color: var(--accent); font-size: 13px; }
+  .row .pv { font-size: 13.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+  .row .meta { text-align: right; font-size: 11.5px; color: var(--muted); font-feature-settings: 'tnum';}
+  .row .meta .dot { display:inline-block; min-width: 18px; height: 18px; border-radius: 9px; background: var(--accent); color: #FFF; font-weight: 700; font-size: 11px; line-height: 18px; text-align: center; padding: 0 5px; margin-top: 5px;}
+  [data-theme="dark"] .row .meta .dot { color: #121013; }
+  .chat { padding: 14px 12px; display: flex; flex-direction: column; gap: 4px; background: var(--bg); min-height: 300px;}
+  .bub { max-width: 78%; padding: 8px 12px; font-size: 14.5px; line-height: 1.45; }
+  .bub.theirs { align-self: flex-start; background: var(--bubble-theirs); border: 1px solid var(--hairline); border-radius: 3px 12px 12px 12px; }
+  .bub.mine { align-self: flex-end; background: var(--bubble-mine); border-radius: 12px 3px 12px 12px; }
+  .bub .tm { display: block; font-size: 10.5px; color: var(--muted); margin-top: 3px; text-align: right; font-feature-settings: 'tnum';}
+  .gap { height: 12px; }
+  .sysline { text-align: center; font-size: 12px; color: var(--accent); padding: 10px 0; }
+  .compose { display: flex; gap: 10px; padding: 10px 12px; background: var(--surface); border-top: 1px solid var(--hairline); align-items: center;}
+  .compose .field { flex: 1; background: var(--bg); border: 1.5px solid var(--hairline); border-radius: 10px; padding: 9px 14px; font-size: 14px; color: var(--muted);}
+  .compose .send { width: 38px; height: 38px; border-radius: 9px; background: var(--accent); border: none; color: #FFF; font-size: 16px; cursor: pointer;}
+  [data-theme="dark"] .compose .send { color: #121013; }
+  .empty { padding: 34px 24px 30px; text-align: center; background: var(--bg);}
+  .empty h4 { font-weight: 700; font-size: 22px; line-height: 1.2; margin: 18px 0 10px; letter-spacing: -0.02em;}
+  .empty p { font-size: 13.5px; color: var(--muted); max-width: 30ch; margin: 0 auto 22px;}
+  .qr { width: 148px; height: 148px; margin: 0 auto; border-radius: 12px; background: var(--surface); border: 1px solid var(--hairline); display: grid; place-items: center;}
+  .verify { padding: 24px 20px; background: var(--surface); border-top: 1px solid var(--hairline);}
+  .verify h5 { font-weight: 700; font-size: 17px; margin-bottom: 6px; letter-spacing: -0.01em;}
+  .verify p { font-size: 12.5px; color: var(--muted); margin-bottom: 14px;}
+  .words { font-family: 'IBM Plex Mono', monospace; font-size: 14px; letter-spacing: .03em; background: var(--bg); border: 1px solid var(--hairline); border-radius: 9px; padding: 12px 14px; text-align: center; margin-bottom: 14px;}
+  .verify .btns { display: flex; gap: 10px; }
+  .verify .btns .btn { flex: 1; padding: 11px 0; font-size: 14px;}
+
+  footer { margin-top: 72px; padding-top: 28px; border-top: 1px solid var(--hairline); color: var(--muted); font-size: 13.5px; }
+  footer b { color: var(--ink); font-weight: 600;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <button class="toggle" onclick="flip()">◐ Light / Dark</button>
+  <div class="kicker">chat (working name · OQ1) — design system preview · direction 2: the instrument</div>
+  <h1 class="pledge">If we are ever forced to choose between your data and our existence, <span class="accent">we shut down.</span></h1>
+  <p class="sub">The Instrument — precision-engineered software in the visual language of things built to be trusted: banknotes, passports, instruments. Pure white and near-black ink, one aubergine, fine-line guilloché identity marks. No warmth theater, no paranoia theater.</p>
+</header>
+
+<section>
+  <h2>Typography — one engineered superfamily</h2>
+  <p class="lede">IBM Plex Sans everywhere, IBM Plex Mono for cryptographic facts. Voice comes from weight and scale, not from a second family. Full Latin extended + Cyrillic + Greek — every EU name renders in-family.</p>
+
+  <div class="spec">
+    <div class="label">Plex Sans 700, tight — the statement voice: pledge, onboarding, empty states</div>
+    <div class="display">Nothing to read here but your own words.<br>No one else has the key — including us.</div>
+    <p class="note">Same family as the UI, turned up. Conviction as weight and negative tracking, not as a costume change.</p>
+  </div>
+
+  <div class="spec">
+    <div class="label">Plex Sans 400–600 — the working voice: every screen, every control</div>
+    <p class="body">Messages, names, buttons, timestamps. Plex was drawn as an engineering brand face: neutral without being characterless, honest strokes, superb at 12sp. Ольга and Αλέκος render with no fallback seam.</p>
+    <div class="ui-row">
+      <span class="name">mira <span style="color:var(--accent)">✓</span></span>
+      <span class="handle">mira#07</span>
+      <span class="handle">kasper#113</span>
+      <button class="btn primary">Send</button>
+      <button class="btn secondary">Scan code</button>
+    </div>
+    <p class="note">Discriminators use tabular figures — <b>mira#07</b> aligns in lists — and stay in Plex Sans. Usernames belong to people.</p>
+  </div>
+
+  <div class="spec">
+    <div class="label">Plex Mono — the cryptographic fact: safety numbers and codes only</div>
+    <div class="mono">tundra · velvet · anchor · sparrow · limestone</div>
+    <p class="note">Same superfamily, so even the quarantined voice matches the instrument. Monospace = "this is a verifiable fact," nothing else.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Color — white, ink, and aubergine</h2>
+  <p class="lede">Restrained: pure white paper, near-black ink, and ONE working color — a deep aubergine, regal and completely unowned in messaging. Serious without ever being an alarm. Error red stays clearly brighter and warmer, so the two never blur. The accent is a single swap-point token: change two hex values and the whole system (buttons, badges, verified marks, rosette ink family) follows.</p>
+  <div class="swatches" id="swatches"></div>
+
+  <h3>Components in the palette</h3>
+  <div class="components">
+    <button class="btn primary">Start a chat</button>
+    <button class="btn secondary">Show my code</button>
+    <button class="btn ghost">How keys work</button>
+    <input class="input" placeholder="Search by username…">
+  </div>
+  <div class="alerts">
+    <div class="alert ok">✓ mira is verified — you compared the five words in person.</div>
+    <div class="alert info">Connecting… messages will send when you're back online.</div>
+    <div class="alert warn">This invite link expires in 24 hours.</div>
+    <div class="alert err">Message not sent — tap to retry.</div>
+  </div>
+</section>
+
+<section>
+  <h2>The Rosette — guilloché identity, engraved from the key</h2>
+  <p class="lede">Banknotes and passports carry fine-line guilloché engravings because they are mathematically hard to forge — the exact right heritage for a mark derived from a cryptographic fingerprint. Deterministic: petal count, waveform, phase, and ink are all read from the key's bytes. One curated 12-ink engraving palette, never random RGB. These are live — the algorithm runs in this page.</p>
+  <div class="seal-row" id="seals"></div>
+  <h3>Scale + the verified engraving</h3>
+  <div class="seal-sizes" id="sealsizes"></div>
+  <p class="note" style="font-size:13px;color:var(--muted);margin-top:14px;max-width:68ch;">Verified = a second concentric guilloché band engraved around the rosette, plus the quiet aubergine ✓ by the name. Never a shield, never a warning; unverified marks render at full confidence.</p>
+</section>
+
+<section>
+  <h2>The product, roughly</h2>
+  <p class="lede">The wireframe screens wearing the system — chat list, conversation (instrument bubbles: 12dp, cut to 3dp toward the sender's mark), first-launch pledge + verification sheet.</p>
+  <div class="phones">
+
+    <div class="phone">
+      <div class="bar"><span class="t" style="flex:1">Chats</span><span style="color:var(--muted);font-size:18px">⌕</span></div>
+      <div class="rows" id="chatlist"></div>
+      <div class="compose" style="justify-content:flex-end"><button class="send" style="width:auto;padding:0 16px;border-radius:9px;height:38px;font:600 13px 'IBM Plex Sans';cursor:pointer">＋ New chat</button></div>
+    </div>
+
+    <div class="phone">
+      <div class="bar"><span id="hdr-seal"></span>
+        <span class="t" style="flex:1">mira <span style="color:var(--accent);font-size:13px">✓</span><small>verified contact</small></span>
+        <span style="color:var(--muted);font-size:18px">⋮</span></div>
+      <div class="chat">
+        <div class="bub theirs">Landed. That was the easiest setup I've ever done — it just asked for a name?<span class="tm">14:02</span></div>
+        <div class="bub theirs">Wait, where do I find you though<span class="tm">14:02</span></div>
+        <div class="gap"></div>
+        <div class="bub mine">Search mira#07 — or we scan codes when you're here Friday<span class="tm">14:05</span></div>
+        <div class="sysline">— you verified mira · security code confirmed —</div>
+        <div class="bub theirs">Done. Watched the ring engrave itself. Very passport.<span class="tm">14:07</span></div>
+        <div class="bub mine">That band means it's really you. Stays there forever.<span class="tm">14:08</span></div>
+      </div>
+      <div class="compose"><span class="field">Message…</span><button class="send">↑</button></div>
+    </div>
+
+    <div class="phone">
+      <div class="empty">
+        <div class="qr" id="qrseal"></div>
+        <h4>Your words stay yours.<br>That's the whole point.</h4>
+        <p>Add your first contact — scan their code, or let them find you as <b style="color:var(--ink)">you#__</b>.</p>
+        <button class="btn primary" style="width:100%">Scan a contact code</button>
+      </div>
+      <div class="verify">
+        <h5>Make sure it's really mira</h5>
+        <p>Read these five words to each other. Same words = only the two of you hold the keys.</p>
+        <div class="words">tundra · velvet · anchor · sparrow · limestone</div>
+        <div class="btns"><button class="btn secondary">Later</button><button class="btn primary">They match</button></div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<section>
+  <h2>Motion — instrument precision</h2>
+  <p class="lede">Immediate and exact: 120–200ms deceleration, nothing bounces, nothing floats. One ceremony exists: verification, where the second guilloché band draws itself around the rosette (a 400ms stroke-reveal — an engraving, not a confetti moment). Security operations get steady fades, never skeleton shimmer.</p>
+</section>
+
+<footer>
+  <b>The Instrument</b> — generated by /design-consultation · IBM Plex Sans + Plex Mono (OFL) · Aubergine #5B3A6C on white / #B08CC9 on near-black · Rosette guilloché identicon v0 (live on this page) · toggle top-right for dark.
+</footer>
+</div>
+
+<script>
+function flip(){
+  const h = document.documentElement;
+  h.dataset.theme = h.dataset.theme === 'light' ? 'dark' : 'light';
+  renderAll();
+}
+
+const SWATCHES = [
+  ['Paper','--bg','#FFFFFF','#121013'],['Surface','--surface','#F7F6F6','#1B181B'],
+  ['Ink','--ink','#1A1618','#ECE9EB'],['Muted','--muted','#625B5E','#948D91'],
+  ['Aubergine (accent)','--accent','#5B3A6C','#B08CC9'],['Aubergine strong','--accent-strong','#432852','#C3A4D8'],
+  ['Error','--error','#C62828','#E5484D'],['Warning','--warning','#8F6400','#D4A945'],
+  ['Info','--info','#4C5A6B','#94A3B8'],['Hairline','--hairline','#E5E1E3','#2F2A2E'],
+];
+function renderSwatches(){
+  const dark = document.documentElement.dataset.theme==='dark';
+  document.getElementById('swatches').innerHTML = SWATCHES.map(([n,v,l,d])=>`
+    <div class="sw"><div class="chip" style="background:var(${v})"></div>
+    <div class="meta"><b>${n}</b><span>${dark?d:l}</span></div></div>`).join('');
+}
+
+/* ---------- the Rosette: guilloché algorithm v0, deterministic ---------- */
+/* 12 curated engraving inks — passport-office family: [light, dark] pairs */
+const INKS = [
+  ['#5B3A6C','#B08CC9'],['#432852','#9A77B5'],['#6E4555','#B07E92'],['#7E2A3E','#C98A97'],
+  ['#5B4A68','#9C89B0'],['#4A5568','#8B9BB4'],['#2F4858','#7593A6'],['#365F71','#6FA3B8'],
+  ['#584338','#A08575'],['#706030','#B5A253'],['#3C3C3C','#9A9A9A'],['#432E3B','#8E7185'],
+];
+function bytesFrom(hex){ const b=[]; for(let i=0;i<hex.length-1;i+=2) b.push(parseInt(hex.slice(i,i+2),16)); return b; }
+/* guilloché band: r(t) = base + amp1*cos(k*t + ph) + amp2*cos(2k*t) */
+function bandPath(cx, cy, base, amp1, amp2, k, ph, steps){
+  let d='';
+  for(let i=0;i<=steps;i++){
+    const t = (i/steps)*Math.PI*2;
+    const r = base + amp1*Math.cos(k*t+ph) + amp2*Math.cos(2*k*t);
+    const x = cx + r*Math.cos(t), y = cy + r*Math.sin(t);
+    d += (i===0?'M':'L') + x.toFixed(2) + ' ' + y.toFixed(2);
+  }
+  return d+'Z';
+}
+function rosette(hex, size, verified){
+  const B = bytesFrom(hex), dark = document.documentElement.dataset.theme==='dark';
+  const ink = INKS[B[0]%12][dark?1:0];
+  const ink2 = INKS[(B[0]%12 + 3 + B[1]%5)%12][dark?1:0];
+  const k = 5 + (B[2]%5);                     // 5..9 petals
+  const base = 26 + (B[3]%8);                 // base radius
+  const amp1 = 6 + (B[4]%9);
+  const amp2 = 1 + (B[5]%5);
+  const ph0 = (B[6]%64)/64*Math.PI*2;
+  const nLines = size>=56 ? 5 : 3;            // fewer, thicker lines when small
+  const swMain = size>=56 ? 1.1 : 1.7;
+  let bands='';
+  for(let i=0;i<nLines;i++){
+    const shrink = 1 - i*(0.10 + (B[7]%4)*0.012);
+    const ph = ph0 + i*((B[8]%16)/40);
+    const col = (i===nLines-2) ? ink2 : ink;
+    bands += `<path d="${bandPath(50,50, base*shrink, amp1*shrink, amp2, k, ph, 220)}" fill="none" stroke="${col}" stroke-width="${swMain}" opacity="${i===0?0.95:0.75}"/>`;
+  }
+  const core = 2.4 + (B[9]%4);
+  const bgCol = getComputedStyle(document.documentElement).getPropertyValue(dark?'--surface-2':'--surface').trim();
+  const hairline = getComputedStyle(document.documentElement).getPropertyValue('--hairline').trim();
+  let ring='';
+  if(verified){
+    const rw = size>=56 ? 0.9 : 1.3;
+    ring = `<path d="${bandPath(50,50, 45.5, 1.6, 0.6, k*3, ph0, 260)}" fill="none" stroke="${ink}" stroke-width="${rw}" opacity="0.95"/>`;
+  }
+  return `<svg width="${size}" height="${size}" viewBox="0 0 100 100" style="display:block">
+    <circle cx="50" cy="50" r="49" fill="${bgCol}" stroke="${hairline}" stroke-width="1"/>
+    ${bands}<circle cx="50" cy="50" r="${core}" fill="${ink}"/>${ring}</svg>`;
+}
+const FPS = ['a3f21b9c44d2e07188aa','7e01c9d25fb63a4890ff','f00d5e77a1b2c3d4e5f6','1c8e2b4a6d9f31527486','9b7d3c1e5a2f48601234','04d2a6b8c1e3f5079283'];
+function renderSeals(){
+  const caps=['kasper#113','mira#07 · verified','sami#4402','lena#88','yusuf#036','ana#71'];
+  document.getElementById('seals').innerHTML = FPS.map((f,i)=>`
+    <div class="seal-cell">${rosette(f,88,i===1)}<div class="cap">${caps[i]}</div></div>`).join('');
+  document.getElementById('sealsizes').innerHTML =
+    rosette(FPS[1],96,true)+rosette(FPS[1],56,true)+rosette(FPS[1],40,false)+rosette(FPS[1],24,false)
+    +`<span style="font-size:12.5px;color:var(--muted);margin-left:8px">96 · 56 · 40 · 24 dp — line count and weight adapt so the identity survives every size</span>`;
+  document.getElementById('hdr-seal').innerHTML = rosette(FPS[1],36,true);
+  document.getElementById('qrseal').innerHTML = rosette(FPS[2],108,false);
+  const people=[['mira ✓','mira#07 · Watched the ring engrave itself.','14:07','',1,true],
+                ['kasper','kasper#113 · are we still on for friday?','13:40','3',0,false],
+                ['sami','sami#4402 · voice note (0:41)','11:18','',3,false],
+                ['reading circle','lena: chapter six broke me','yesterday','12',4,false]];
+  document.getElementById('chatlist').innerHTML = people.map(([n,pv,t,unread,fi,vf])=>`
+    <div class="row">${rosette(FPS[fi],48,vf)}
+      <div class="txt"><div class="nm">${n.replace(' ✓',' <span class=vf>✓</span>')}</div><div class="pv">${pv}</div></div>
+      <div class="meta">${t}${unread?`<br><span class="dot">${unread}</span>`:''}</div></div>`).join('');
+}
+function renderAll(){ renderSwatches(); renderSeals(); }
+renderAll();
+</script>
+</body>
+</html>
