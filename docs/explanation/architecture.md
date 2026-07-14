@@ -411,6 +411,9 @@ rotates keys yet).
   ephemeral delivery semantics (no durable queueing, expires in seconds)
   so call signaling doesn't have to be retrofitted — a wire-format
   reservation like A2's multi-relay one, not a feature build.
+  **Reservation DONE (2026-07-14):** `DeliveryMode::Signaling` in
+  proto/src/envelope.rs, reject-don't-fallback semantics documented on the
+  variant, wire indices frozen by test.
 - **Push notifications (FCM/UnifiedPush/APNs)** — needs its own design pass;
   interacts with TODOS #5 and the no-identifier promise.
 - **Splitting the monorepo** — revisit only if external platform teams appear.

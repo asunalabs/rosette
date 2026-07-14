@@ -42,6 +42,14 @@ pub enum DeliveryMode {
     /// default. A future client MUST treat an unknown-future variant here as
     /// unsupported rather than silently falling back to RelayFanout.
     Pairwise,
+    /// Reserved, not implemented (TODOS.md #10 wire reservation, 2026-07-14).
+    /// Ephemeral delivery for call signaling: NEVER durably queued, NEVER
+    /// redelivered, expires relay-side in seconds if the recipient is not
+    /// connected, and needs no ack. Same posture as Pairwise: an
+    /// implementation that has not built this MUST reject it, never fall
+    /// back to the durable RelayFanout path (a queued stale "ring" is worse
+    /// than a missed one).
+    Signaling,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,5 +102,20 @@ mod tests {
         let bytes = crate::encode(&env);
         let decoded: Envelope = crate::decode(&bytes).unwrap();
         assert_eq!(env, decoded);
+    }
+
+    /// The reserved variants are wire-format promises: their encoding (a
+    /// bincode variant index, i.e. their declaration ORDER) must never
+    /// change. Reordering this enum is a silent protocol break this test
+    /// exists to make loud.
+    #[test]
+    fn delivery_mode_wire_indices_are_frozen() {
+        for (mode, index) in [
+            (DeliveryMode::RelayFanout, 0u32),
+            (DeliveryMode::Pairwise, 1),
+            (DeliveryMode::Signaling, 2),
+        ] {
+            assert_eq!(crate::encode(&mode), crate::encode(&index));
+        }
     }
 }
