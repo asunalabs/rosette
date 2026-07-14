@@ -25,6 +25,14 @@ v1.1 at the earliest (OQ8 unanswered).
   server-side pepper held outside the DB) over the E.164-normalized number,
   plus a short `phone_hash_prefix` for bucketed search. Raw numbers are
   never persisted.
+- **Phone verification gates access to the app itself, Signal-style
+  (decided 2026-07-14, not yet enforced — T27):** you cannot get past
+  onboarding without registering and verifying a phone number — anti-spam.
+  Verification stops being just the ticket into directory search; there is
+  no unverified-but-usable app state. Onboarding order: verify phone →
+  claim username → app unlocks. Transport-level enforcement at the
+  account-less relay is T27's open eng question, and T2's soft-gate
+  degraded mode needs a re-decision under this rule.
 - **Phone-search visibility is opt-in and off by default** for every
   account regardless of age (`searchable BOOLEAN DEFAULT FALSE`, toggled
   via `POST /searchable`). This, not an age gate, is what limits

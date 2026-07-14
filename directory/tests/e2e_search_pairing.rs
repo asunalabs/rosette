@@ -40,18 +40,26 @@ async fn search_hit_carries_the_identity_info_a_future_pairing_handoff_would_nee
         rate_limiter: RateLimiter::new(),
     });
     let phone = "+15559990099";
-    let hash = directory::phone_hash(
+    let auth_hash = directory::phone_hash(
         &directory::normalize_e164(phone).unwrap(),
         directory::Pepper(b"e2e-test-pepper"),
     )
     .unwrap();
-    let user_id = state.store.create_pending_user(&hash).await.unwrap();
+    let user_id = state.store.create_pending_user(&auth_hash).await.unwrap();
     state.store.claim_username(user_id, "findme").await.unwrap();
-    state.store.set_searchable(user_id, true).await.unwrap();
+    // The search hash is a SEPARATE, unkeyed value a real client computes
+    // locally (SHA-256 of the normalized number, no server secret) — not
+    // the keyed auth hash above, which no client can reproduce (OQ4).
+    let search_hash = format!("findme0{}", "0".repeat(57));
+    state
+        .store
+        .set_searchable(user_id, true, Some(&search_hash))
+        .await
+        .unwrap();
     let token = state.store.create_session(user_id);
 
     let addr = directory::spawn_for_tests(state).await.unwrap();
-    let prefix = directory::hash_prefix(&hash);
+    let prefix = directory::hash_prefix(&search_hash);
     let resp = reqwest::Client::new()
         .get(format!("http://{addr}/search?prefix={prefix}"))
         .header("Authorization", format!("Bearer {token}"))

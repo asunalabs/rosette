@@ -35,6 +35,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/signup", post(signup))
         .route("/verify", post(verify_handler))
         .route("/username", post(claim_username))
+        .route("/username-lookup", get(username_lookup))
         .route("/searchable", post(set_searchable))
         .route("/account", delete(delete_account))
         .route("/search", get(search))
@@ -253,6 +254,14 @@ async fn claim_username(
 #[derive(Deserialize)]
 struct SearchableRequest {
     searchable: bool,
+    /// Client-computed, unkeyed SHA-256 hex digest of the account's
+    /// normalized phone number (see `store::DirectoryStore::set_searchable`)
+    /// — required when `searchable` is true.
+    phone_search_hash: Option<String>,
+}
+
+fn is_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 async fn set_searchable(
@@ -261,12 +270,56 @@ async fn set_searchable(
     Json(req): Json<SearchableRequest>,
 ) -> Result<StatusCode, ApiError> {
     let user_id = authenticate(&headers, &state.store)?;
+    let hash = if req.searchable {
+        let Some(hash) = &req.phone_search_hash else {
+            return Err(ApiError::BadRequest(
+                "phone_search_hash is required when searchable is true",
+            ));
+        };
+        if !is_hex(hash, 64) {
+            return Err(ApiError::BadRequest(
+                "phone_search_hash must be a 64-hex-char SHA-256 digest",
+            ));
+        }
+        Some(hash.as_str())
+    } else {
+        None
+    };
     state
         .store
-        .set_searchable(user_id, req.searchable)
+        .set_searchable(user_id, req.searchable, hash)
         .await
         .map_err(|_| ApiError::Internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct UsernameLookupQuery {
+    nickname: String,
+    discriminator: u32,
+}
+
+#[derive(Serialize)]
+struct UsernameLookupResponse {
+    user_id: u64,
+}
+
+/// Public username lookup (OQ10) — the default discovery path, no
+/// `searchable` gate (claiming a handle is itself the opt-in). Still
+/// authenticated + logged-nothing, same posture as every other endpoint.
+async fn username_lookup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<UsernameLookupQuery>,
+) -> Result<Json<UsernameLookupResponse>, ApiError> {
+    authenticate(&headers, &state.store)?;
+    let user_id = state
+        .store
+        .find_user_by_handle(&q.nickname, q.discriminator)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(UsernameLookupResponse { user_id }))
 }
 
 #[derive(Deserialize)]
@@ -371,6 +424,14 @@ struct SearchQuery {
 struct SearchResultEntry {
     user_id: u64,
     handle: String,
+    /// The unkeyed search hash (see migration 0003) for this bucket member
+    /// — HIBP-style k-anonymity requires the *client* to do the final exact
+    /// match against hashes it computed for its own contacts; the server
+    /// only ever narrows to a ~20-bit bucket (T3/T17), never picks the
+    /// match itself. Deliberately present, unlike `phone_hash` (T8): this
+    /// value has no server secret behind it and is exactly what search
+    /// exists to hand back — see `search_hash_is_present_but_the_keyed_auth_hash_never_is`.
+    search_hash: String,
 }
 
 #[derive(Serialize)]
@@ -415,12 +476,14 @@ async fn search(
     let bucket = search_by_prefix(state.store.as_ref(), &q.prefix).await;
     let mut results = Vec::with_capacity(bucket.len());
     for entry in bucket {
-        // T8: the response type has no field for phone_hash at all — it
-        // physically cannot leak here, not just "isn't rendered."
+        // T8: the response type has no field for the KEYED auth phone_hash
+        // — it physically cannot leak here. `search_hash` below is the
+        // separate, unkeyed value this endpoint exists to return.
         if let Ok(Some(handle)) = state.store.handle_for(entry.user_id).await {
             results.push(SearchResultEntry {
                 user_id: entry.user_id,
                 handle,
+                search_hash: entry.phone_hash,
             });
         }
     }
@@ -451,7 +514,7 @@ mod tests {
         let state = state_for(pool);
         let target = state.store.create_pending_user("target-hash-0").await.unwrap();
         state.store.claim_username(target, "pairtarget").await.unwrap();
-        state.store.set_searchable(target, true).await.unwrap();
+        state.store.set_searchable(target, true, Some(&"a".repeat(64))).await.unwrap();
         let target_token = state.store.create_session(target);
 
         let requester = state.store.create_pending_user("requester-hash-0").await.unwrap();
@@ -528,7 +591,7 @@ mod tests {
     async fn erasing_a_user_deletes_their_pairing_bootstrap(pool: PgPool) {
         let state = state_for(pool);
         let target = state.store.create_pending_user("target-hash-2").await.unwrap();
-        state.store.set_searchable(target, true).await.unwrap();
+        state.store.set_searchable(target, true, Some(&"a".repeat(64))).await.unwrap();
         state
             .store
             .set_pairing_bootstrap(target, "opaque-link-bytes")
@@ -614,7 +677,12 @@ mod tests {
             .await
             .unwrap();
         state.store.claim_username(user_id, "temp").await.unwrap();
-        state.store.set_searchable(user_id, true).await.unwrap();
+        let search_hash = format!("erase0{}", "0".repeat(58));
+        state
+            .store
+            .set_searchable(user_id, true, Some(&search_hash))
+            .await
+            .unwrap();
         let token = state.store.create_session(user_id);
 
         let addr = spawn_for_tests(state).await.unwrap();
@@ -639,9 +707,13 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn search_response_never_contains_a_phone_hash_field(pool: PgPool) {
-        // T8: even inspecting the raw JSON, there's no key that could hold
-        // one — the response type doesn't have the field.
+    async fn search_response_carries_the_search_hash_but_never_the_keyed_auth_one(pool: PgPool) {
+        // T8, refined: the response type still has no field that could hold
+        // the KEYED auth phone_hash (`create_pending_user`'s argument below
+        // never appears). It DOES now carry `search_hash` — the separate,
+        // unkeyed value the client needs to do the final exact match
+        // locally (HIBP-style); that's the endpoint's whole point, not a
+        // leak of the thing T8 originally protected.
         let state = state_for(pool);
         let user_id = state
             .store
@@ -653,7 +725,12 @@ mod tests {
             .claim_username(user_id, "findable")
             .await
             .unwrap();
-        state.store.set_searchable(user_id, true).await.unwrap();
+        let search_hash = format!("aaaaa{}", "0".repeat(59));
+        state
+            .store
+            .set_searchable(user_id, true, Some(&search_hash))
+            .await
+            .unwrap();
         let token = state.store.create_session(user_id);
 
         let addr = spawn_for_tests(state).await.unwrap();
@@ -670,5 +747,90 @@ mod tests {
             "response leaked a phone-shaped field: {text}"
         );
         assert!(text.contains("findable"));
+        assert_eq!(
+            body["results"][0]["search_hash"], search_hash,
+            "client needs the full search hash back to do the exact match itself"
+        );
+    }
+
+    #[sqlx::test]
+    async fn username_lookup_finds_a_claimed_handle_and_404s_for_an_unknown_one(pool: PgPool) {
+        let state = state_for(pool);
+        let target = state.store.create_pending_user("lookup-hash").await.unwrap();
+        let (slot, _width) = state.store.claim_username(target, "findbyname").await.unwrap();
+        let requester = state.store.create_pending_user("requester-hash").await.unwrap();
+        let token = state.store.create_session(requester);
+
+        let addr = spawn_for_tests(state).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let hit = client
+            .get(format!(
+                "http://{addr}/username-lookup?nickname=findbyname&discriminator={slot}"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hit.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = hit.json().await.unwrap();
+        assert_eq!(body["user_id"], target);
+
+        let miss = client
+            .get(format!(
+                "http://{addr}/username-lookup?nickname=findbyname&discriminator={}",
+                slot + 1
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(miss.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn set_searchable_rejects_missing_or_malformed_hash(pool: PgPool) {
+        let state = state_for(pool);
+        let user_id = state.store.create_pending_user("h").await.unwrap();
+        let token = state.store.create_session(user_id);
+        let addr = spawn_for_tests(state).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let missing = client
+            .post(format!("http://{addr}/searchable"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({ "searchable": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let too_short = client
+            .post(format!("http://{addr}/searchable"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({ "searchable": true, "phone_search_hash": "abc" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(too_short.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let not_hex = client
+            .post(format!("http://{addr}/searchable"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({ "searchable": true, "phone_search_hash": "z".repeat(64) }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(not_hex.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // Turning it off never needs a hash.
+        let off = client
+            .post(format!("http://{addr}/searchable"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({ "searchable": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(off.status(), reqwest::StatusCode::NO_CONTENT);
     }
 }

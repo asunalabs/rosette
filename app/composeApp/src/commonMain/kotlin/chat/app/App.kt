@@ -1,45 +1,97 @@
 package chat.app
 
-import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.ui.Alignment
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
+import chat.app.chatlist.ChatListScreen
+import chat.app.chatlist.ConversationScreen
+import chat.app.directory.DirectoryClient
+import chat.app.directory.DirectoryException
+import chat.app.onboarding.OnboardingFlow
+import chat.app.pairing.FindPeopleScreen
+import chat.app.session.Session
+import chat.app.session.rememberSessionStore
+import chat.app.theme.ChatTheme
+import chat.app.theme.InstrumentTabBar
+import chat.app.theme.LocalChatPalette
 import chat.engine.ChatEngine
+import chat.engine.Conversation
 
 /**
- * Walking-shell screen: constructs the real engine across the FFI seam and
- * shows what it says. NOT a wireframe screen — those are step 6, gated on
- * DT4 (DESIGN.md). This exists so every target has a runnable app proving
- * the whole stack links.
+ * T27: phone verification gates the app itself — no unverified-but-usable
+ * state. `session` is null until onboarding (signup -> verify -> claim
+ * username) completes; only then can `EngineScreen` construct `ChatEngine`.
+ * A completed session is persisted (SessionStore) so onboarding doesn't
+ * re-run on every app start.
  */
 @Composable
 fun App() {
-    MaterialTheme {
-        Surface(modifier = Modifier.fillMaxSize()) {
-            // remember {} — one engine per composition, as the contract
-            // prescribes one per app start.
-            val engine = remember { ChatEngine("dev") }
-            val conversationCount = remember { engine.conversations().size }
-            Column(
-                modifier = Modifier.fillMaxSize().padding(24.dp),
-                verticalArrangement = Arrangement.Center,
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Text(style = MaterialTheme.typography.headlineSmall, text = "chat")
-                Text("engine up — $conversationCount conversation(s)")
-                Text(
-                    style = MaterialTheme.typography.bodySmall,
-                    text = "walking skeleton · UI lands after DESIGN.md (DT4)",
-                )
+    ChatTheme {
+        val store = rememberSessionStore()
+        var session by remember { mutableStateOf(store.load()) }
+        val current = session
+        val client = remember { DirectoryClient() }
+        if (current == null) {
+            OnboardingFlow(client) { token, claimedHandle, phone ->
+                val newSession = Session(token, claimedHandle, phone)
+                store.save(newSession)
+                session = newSession
+            }
+        } else {
+            EngineScreen(client = client, session = current)
+        }
+    }
+}
+
+private enum class Tab { Chats, FindPeople }
+
+@Composable
+private fun EngineScreen(client: DirectoryClient, session: Session) {
+    val palette = LocalChatPalette.current
+    // remember {} — one engine per composition, as the contract prescribes
+    // one per app start.
+    val engine = remember { ChatEngine(session.handle) }
+    var tab by remember { mutableStateOf(Tab.Chats) }
+    var openConversation by remember { mutableStateOf<Conversation?>(null) }
+
+    // T25: best-effort — publish a fresh one-time pairing bootstrap so a
+    // directory search hit can find and pair with this device. Silently
+    // skipped offline/on failure: nothing here blocks the chat UI on it.
+    LaunchedEffect(session.sessionToken) {
+        val link = engine.createContactLink()
+        if (link.isNotEmpty()) {
+            try {
+                client.publishPairingBootstrap(session.sessionToken, link)
+            } catch (_: DirectoryException) {
+                // best-effort; the user can still pair via QR/link directly.
             }
         }
+    }
+
+    val conversation = openConversation
+    if (conversation != null) {
+        ConversationScreen(engine = engine, conversation = conversation, onBack = { openConversation = null })
+        return
+    }
+
+    Column(modifier = Modifier.fillMaxSize().background(palette.bg)) {
+        Column(modifier = Modifier.weight(1f)) {
+            when (tab) {
+                Tab.Chats -> ChatListScreen(engine = engine, onOpenConversation = { openConversation = it })
+                Tab.FindPeople -> FindPeopleScreen(client, session, engine, onBack = { tab = Tab.Chats })
+            }
+        }
+        InstrumentTabBar(
+            tabs = listOf("Chats", "Find people"),
+            selected = tab.ordinal,
+            onSelect = { tab = Tab.entries[it] },
+        )
     }
 }

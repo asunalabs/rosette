@@ -63,13 +63,13 @@ async fn fresh_account_reaches_search_findable_state_end_to_end(pool: PgPool) {
     let handle_body: serde_json::Value = username.json().await.unwrap();
     assert_eq!(handle_body["handle"], "e2ealice#01");
 
+    // A real client computes this locally (unkeyed SHA-256 of the
+    // normalized number) — a fixed stand-in is fine for the test, it just
+    // needs to be a stable 64-hex-char value.
+    let search_hash = format!("e2ea1ce{}", "0".repeat(57));
+    let prefix = directory::hash_prefix(&search_hash);
+
     // Not found yet — hasn't opted in to search (T24: off by default).
-    let hash = directory::phone_hash(
-        &directory::normalize_e164(phone).unwrap(),
-        directory::Pepper(b"e2e-test-pepper"),
-    )
-    .unwrap();
-    let prefix = directory::hash_prefix(&hash);
     let search_before = client
         .get(format!("{base}/search?prefix={prefix}"))
         .header("Authorization", format!("Bearer {token}"))
@@ -83,7 +83,7 @@ async fn fresh_account_reaches_search_findable_state_end_to_end(pool: PgPool) {
     let opt_in = client
         .post(format!("{base}/searchable"))
         .header("Authorization", format!("Bearer {token}"))
-        .json(&serde_json::json!({ "searchable": true }))
+        .json(&serde_json::json!({ "searchable": true, "phone_search_hash": search_hash }))
         .send()
         .await
         .unwrap();
@@ -156,7 +156,10 @@ async fn degraded_soft_gate_account_never_becomes_findable(pool: PgPool) {
     client
         .post(format!("{base}/searchable"))
         .header("Authorization", format!("Bearer {token}"))
-        .json(&serde_json::json!({ "searchable": true }))
+        .json(&serde_json::json!({
+            "searchable": true,
+            "phone_search_hash": format!("degrade{}", "0".repeat(57)),
+        }))
         .send()
         .await
         .unwrap();

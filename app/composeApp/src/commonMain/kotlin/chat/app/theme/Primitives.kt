@@ -1,0 +1,346 @@
+package chat.app.theme
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+
+/**
+ * DESIGN.md "Quiet Room" primitives — soft surfaces, full-pill buttons and
+ * inputs, 18dp bubbles. Deliberately not Material3's Button/
+ * OutlinedTextField/Switch: those read as generic Android chrome, which the
+ * system rejects (see DESIGN.md "Mood"). Composable names still carry the
+ * legacy Instrument- prefix; renaming them is churn, not design.
+ */
+
+@Composable
+fun InstrumentButton(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    loading: Boolean = false,
+    primary: Boolean = true,
+) {
+    val palette = LocalChatPalette.current
+    val bg = if (!enabled) palette.surface2 else if (primary) palette.accent else palette.surface
+    val fg = if (!enabled) palette.muted else if (primary) palette.onAccent else palette.ink
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(52.dp)
+            .clip(RoundedCornerShape(50))
+            .background(bg)
+            .clickable(enabled = enabled && !loading, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (loading) {
+            CircularProgressIndicator(modifier = Modifier.size(20.dp), color = fg, strokeWidth = 2.dp)
+        } else {
+            Text(text, style = MaterialTheme.typography.labelLarge, color = fg)
+        }
+    }
+}
+
+@Composable
+fun InstrumentField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    label: String = "",
+    placeholder: String = "",
+    mono: Boolean = false,
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
+) {
+    val palette = LocalChatPalette.current
+    val interaction = remember { MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    val textStyle = (if (mono) ChatMonoStyle else MaterialTheme.typography.bodyLarge).copy(color = palette.ink)
+
+    Column(modifier = modifier) {
+        if (label.isNotEmpty()) {
+            Text(label, style = MaterialTheme.typography.labelSmall, color = palette.muted)
+            Spacer(Modifier.height(6.dp))
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(52.dp)
+                .clip(RoundedCornerShape(50))
+                .background(palette.surface)
+                .then(if (focused) Modifier.border(1.5.dp, palette.accent, RoundedCornerShape(50)) else Modifier)
+                .padding(horizontal = 20.dp),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            if (value.isEmpty() && placeholder.isNotEmpty()) {
+                Text(placeholder, style = textStyle.copy(color = palette.muted))
+            }
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                singleLine = true,
+                textStyle = textStyle,
+                cursorBrush = SolidColor(palette.accent),
+                interactionSource = interaction,
+                keyboardOptions = keyboardOptions,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+// ponytail: curated EU-heavy calling-code→flag map (longer codes first), 🌐 fallback —
+// a full ITU table adds nothing until country selection becomes a real picker.
+private val FLAGS = listOf(
+    "+420" to "🇨🇿", "+421" to "🇸🇰", "+358" to "🇫🇮", "+380" to "🇺🇦", "+351" to "🇵🇹", "+353" to "🇮🇪",
+    "+49" to "🇩🇪", "+43" to "🇦🇹", "+48" to "🇵🇱", "+33" to "🇫🇷", "+39" to "🇮🇹", "+34" to "🇪🇸",
+    "+31" to "🇳🇱", "+32" to "🇧🇪", "+45" to "🇩🇰", "+46" to "🇸🇪", "+47" to "🇳🇴", "+36" to "🇭🇺",
+    "+40" to "🇷🇴", "+30" to "🇬🇷", "+41" to "🇨🇭", "+44" to "🇬🇧", "+1" to "🇺🇸",
+)
+
+fun flagFor(code: String): String = FLAGS.firstOrNull { code.startsWith(it.first) }?.second ?: "🌐"
+
+/**
+ * Signal's phone-entry pill (DESIGN.md "Layout"): flag + country code in the
+ * leading segment, hairline divider, then the number.
+ */
+@Composable
+fun InstrumentPhoneField(
+    countryCode: String,
+    onCountryCodeChange: (String) -> Unit,
+    number: String,
+    onNumberChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val palette = LocalChatPalette.current
+    val fieldStyle = MaterialTheme.typography.bodyLarge.copy(color = palette.ink)
+    val phoneKeyboard = KeyboardOptions(keyboardType = KeyboardType.Phone)
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(56.dp)
+            .clip(RoundedCornerShape(50))
+            .background(palette.surface)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(flagFor(countryCode.ifBlank { "+420" }), style = fieldStyle)
+        Spacer(Modifier.width(8.dp))
+        Box(modifier = Modifier.width(52.dp)) {
+            if (countryCode.isEmpty()) {
+                Text("+420", style = fieldStyle.copy(color = palette.muted))
+            }
+            BasicTextField(
+                value = countryCode,
+                onValueChange = onCountryCodeChange,
+                singleLine = true,
+                textStyle = fieldStyle,
+                cursorBrush = SolidColor(palette.accent),
+                keyboardOptions = phoneKeyboard,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        Text("⌄", style = MaterialTheme.typography.labelMedium, color = palette.muted)
+        Spacer(Modifier.width(12.dp))
+        Box(Modifier.width(1.dp).height(24.dp).background(palette.hairline))
+        Spacer(Modifier.width(12.dp))
+        Box(modifier = Modifier.weight(1f)) {
+            if (number.isEmpty()) {
+                Text("Your phone number", style = fieldStyle.copy(color = palette.muted))
+            }
+            BasicTextField(
+                value = number,
+                onValueChange = onNumberChange,
+                singleLine = true,
+                textStyle = fieldStyle,
+                cursorBrush = SolidColor(palette.accent),
+                keyboardOptions = phoneKeyboard,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+@Composable
+fun InstrumentToggle(checked: Boolean, onCheckedChange: (Boolean) -> Unit, modifier: Modifier = Modifier) {
+    val palette = LocalChatPalette.current
+    Box(
+        modifier = modifier
+            .width(48.dp)
+            .height(28.dp)
+            .clip(RoundedCornerShape(50))
+            .background(if (checked) palette.accent else palette.surface2)
+            .clickable { onCheckedChange(!checked) }
+            .padding(3.dp),
+        contentAlignment = if (checked) Alignment.CenterEnd else Alignment.CenterStart,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(22.dp)
+                .clip(RoundedCornerShape(50))
+                .background(if (checked) palette.onAccent else palette.muted),
+        )
+    }
+}
+
+@Composable
+fun HairlineDivider(modifier: Modifier = Modifier, color: Color = LocalChatPalette.current.hairline, thickness: Dp = 1.dp) {
+    Box(modifier.fillMaxWidth().height(thickness).background(color))
+}
+
+/** Two-way segmented switch (e.g. FindPeopleScreen's Username/Phone toggle) — pill chips. */
+@Composable
+fun InstrumentSegments(labels: List<String>, selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier) {
+    val palette = LocalChatPalette.current
+    Row(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        labels.forEachIndexed { i, label ->
+            val isSelected = i == selected
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(if (isSelected) palette.surface2 else Color.Transparent)
+                    .clickable { onSelect(i) }
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+            ) {
+                Text(label, style = MaterialTheme.typography.labelMedium, color = if (isSelected) palette.ink else palette.muted)
+            }
+        }
+    }
+}
+
+/** DESIGN.md "Bottom navigation": floating pill tab bar, selected tab = surface2 pill. */
+@Composable
+fun InstrumentTabBar(tabs: List<String>, selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier) {
+    val palette = LocalChatPalette.current
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+            .clip(RoundedCornerShape(50))
+            .background(palette.surface)
+            .padding(6.dp),
+    ) {
+        tabs.forEachIndexed { i, label ->
+            val isSelected = i == selected
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(50))
+                    .background(if (isSelected) palette.surface2 else Color.Transparent)
+                    .clickable { onSelect(i) }
+                    .padding(vertical = 10.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(label, style = MaterialTheme.typography.labelMedium, color = if (isSelected) palette.ink else palette.muted)
+            }
+        }
+    }
+}
+
+/**
+ * DESIGN.md "Shape" bubbles: uniformly rounded 18dp; mine = solid accent
+ * family + white text, theirs = quiet gray; timestamp trails the last line
+ * inline, never its own row.
+ */
+@Composable
+fun MessageBubble(body: String, mine: Boolean, modifier: Modifier = Modifier, time: String? = null) {
+    val palette = LocalChatPalette.current
+    val bg = if (mine) palette.bubbleMine else palette.bubbleTheirs
+    val fg = if (mine) palette.onBubbleMine else palette.ink
+    Row(modifier = modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(18.dp))
+                .background(bg)
+                .padding(horizontal = 14.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.Bottom,
+        ) {
+            Text(
+                body,
+                style = MaterialTheme.typography.bodyLarge,
+                color = fg,
+                overflow = TextOverflow.Clip,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            if (time != null) {
+                Spacer(Modifier.width(8.dp))
+                Text(time, style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = fg.copy(alpha = 0.72f))
+            }
+        }
+    }
+}
+
+/** Signal-alike chat-list row (72dp per DESIGN.md "Spacing"), Rosette instead of a photo avatar. */
+@Composable
+fun ChatListRow(
+    displayName: String,
+    lastMessage: String?,
+    unread: Int,
+    verified: Boolean,
+    seed: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val palette = LocalChatPalette.current
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(72.dp)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Rosette(seed = seed, verified = verified, size = 48.dp)
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(displayName, style = MaterialTheme.typography.labelLarge, color = palette.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(2.dp))
+            Text(
+                lastMessage ?: "No messages yet",
+                style = MaterialTheme.typography.labelMedium,
+                color = palette.muted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (unread > 0) {
+            Spacer(Modifier.width(8.dp))
+            Box(
+                modifier = Modifier.clip(RoundedCornerShape(50)).background(palette.accent).padding(horizontal = 7.dp, vertical = 2.dp),
+            ) {
+                Text(unread.toString(), style = MaterialTheme.typography.labelSmall, color = palette.onAccent)
+            }
+        }
+    }
+}

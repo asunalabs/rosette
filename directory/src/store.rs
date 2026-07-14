@@ -176,12 +176,50 @@ impl DirectoryStore {
         Ok((slot, width))
     }
 
-    pub async fn set_searchable(&self, user_id: u64, searchable: bool) -> sqlx::Result<()> {
-        sqlx::query("UPDATE users SET searchable = $1 WHERE user_id = $2")
-            .bind(searchable)
-            .bind(user_id as i64)
-            .execute(&self.pool)
-            .await?;
+    /// `phone_search_hash` is client-computed (unkeyed SHA-256, no server
+    /// secret involved — distinct from the Argon2id `phone_hash`/pepper used
+    /// for auth, OQ4, untouched). Required when turning search on; cleared
+    /// whenever it's turned off, so a stolen DB only ever exposes the
+    /// reversible hash of currently-opted-in accounts, never a lapsed one.
+    /// Public username lookup (OQ10's discoverability wedge): claiming a
+    /// handle is itself the opt-in, unlike phone search — no `searchable`
+    /// gate here.
+    pub async fn find_user_by_handle(
+        &self,
+        nickname: &str,
+        discriminator: u32,
+    ) -> sqlx::Result<Option<u64>> {
+        let row = sqlx::query(
+            "SELECT user_id FROM users
+             WHERE nickname = $1 AND discriminator = $2 AND deleted_at IS NULL",
+        )
+        .bind(nickname)
+        .bind(discriminator as i32)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<i64, _>("user_id") as u64))
+    }
+
+    pub async fn set_searchable(
+        &self,
+        user_id: u64,
+        searchable: bool,
+        phone_search_hash: Option<&str>,
+    ) -> sqlx::Result<()> {
+        let (hash, prefix) = match (searchable, phone_search_hash) {
+            (true, Some(h)) => (h, crate::search::hash_prefix(h)),
+            _ => ("", ""),
+        };
+        sqlx::query(
+            "UPDATE users SET searchable = $1, phone_search_hash = $2, phone_search_hash_prefix = $3
+             WHERE user_id = $4",
+        )
+        .bind(searchable)
+        .bind(hash)
+        .bind(prefix)
+        .bind(user_id as i64)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -237,7 +275,7 @@ impl DirectoryStore {
         }
         sqlx::query(
             "UPDATE users SET phone_hash = '', phone_hash_prefix = '', searchable = false,
-                deleted_at = $1
+                phone_search_hash = '', phone_search_hash_prefix = '', deleted_at = $1
              WHERE user_id = $2",
         )
         .bind(now_unix())
@@ -323,9 +361,12 @@ impl DirectoryStore {
 #[async_trait::async_trait]
 impl PrefixIndex for DirectoryStore {
     async fn bucket(&self, prefix: &str) -> Vec<PhoneEntry> {
+        // Buckets on phone_search_hash_prefix (client-computed, unkeyed) —
+        // NOT phone_hash_prefix (the keyed Argon2id auth hash, OQ4), which
+        // no client can reproduce without the server's secret pepper.
         let rows = sqlx::query(
-            "SELECT phone_hash, user_id FROM users
-             WHERE phone_hash_prefix = $1 AND searchable = true AND deleted_at IS NULL",
+            "SELECT phone_search_hash, user_id FROM users
+             WHERE phone_search_hash_prefix = $1 AND searchable = true AND deleted_at IS NULL",
         )
         .bind(prefix)
         .fetch_all(&self.pool)
@@ -334,7 +375,7 @@ impl PrefixIndex for DirectoryStore {
             Ok(rows) => rows
                 .into_iter()
                 .map(|r| PhoneEntry {
-                    phone_hash: r.get("phone_hash"),
+                    phone_hash: r.get("phone_search_hash"),
                     user_id: r.get::<i64, _>("user_id") as u64,
                 })
                 .collect(),
@@ -402,7 +443,10 @@ mod tests {
             .await
             .unwrap();
         store.claim_username(u, "bob").await.unwrap();
-        store.set_searchable(u, true).await.unwrap();
+        store
+            .set_searchable(u, true, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
 
         store.erase_user(u).await.unwrap();
 
@@ -426,14 +470,63 @@ mod tests {
     #[sqlx::test]
     async fn erased_user_excluded_from_search_even_if_searchable_flag_was_set(pool: PgPool) {
         let store = DirectoryStore::from_pool(pool);
-        let full_hash = "findme-hash-0000000000000000000000000000000000000000000000000000000000";
-        let u = store.create_pending_user(full_hash).await.unwrap();
-        store.set_searchable(u, true).await.unwrap();
-        let prefix = crate::search::hash_prefix(full_hash).to_string();
+        // auth phone_hash (create_pending_user) and the search hash
+        // (set_searchable) are deliberately independent columns now — this
+        // one exercises the search hash the client would actually compute.
+        let search_hash = format!("findme0{}", "0".repeat(57));
+        let u = store
+            .create_pending_user("unrelated-auth-hash")
+            .await
+            .unwrap();
+        store
+            .set_searchable(u, true, Some(&search_hash))
+            .await
+            .unwrap();
+        let prefix = crate::search::hash_prefix(&search_hash).to_string();
         assert_eq!(PrefixIndex::bucket(&store, &prefix).await.len(), 1);
 
         store.erase_user(u).await.unwrap();
         assert_eq!(PrefixIndex::bucket(&store, &prefix).await.len(), 0);
+    }
+
+    #[sqlx::test]
+    async fn opting_out_of_search_clears_the_search_hash(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let search_hash = format!("optout0{}", "0".repeat(57));
+        let u = store.create_pending_user("auth-hash").await.unwrap();
+        store
+            .set_searchable(u, true, Some(&search_hash))
+            .await
+            .unwrap();
+        let prefix = crate::search::hash_prefix(&search_hash).to_string();
+        assert_eq!(PrefixIndex::bucket(&store, &prefix).await.len(), 1);
+
+        store.set_searchable(u, false, None).await.unwrap();
+        assert_eq!(
+            PrefixIndex::bucket(&store, &prefix).await.len(),
+            0,
+            "opting out must clear the stored search hash, not just the flag"
+        );
+    }
+
+    #[sqlx::test]
+    async fn find_user_by_handle_matches_claimed_username(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let u = store.create_pending_user("h").await.unwrap();
+        let (slot, _width) = store.claim_username(u, "carol").await.unwrap();
+
+        assert_eq!(
+            store.find_user_by_handle("carol", slot).await.unwrap(),
+            Some(u)
+        );
+        assert_eq!(
+            store.find_user_by_handle("carol", slot + 1).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            store.find_user_by_handle("nobody", 1).await.unwrap(),
+            None
+        );
     }
 
     #[sqlx::test]
