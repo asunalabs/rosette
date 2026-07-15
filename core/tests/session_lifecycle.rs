@@ -95,3 +95,17 @@ fn discarded_pending_commit_leaves_epoch_unchanged() {
         "a discarded commit must not advance the local epoch"
     );
 }
+
+#[test]
+fn stripped_snapshot_restores_as_an_unpaired_session_with_a_working_identity() {
+    // Issue #2: the recovery blob carries identity only — the group handle
+    // and ratchet state must not survive the strip (no time-travel).
+    let mut alice = ChatSession::new("alice");
+    alice.create_group().unwrap();
+    let full = alice.snapshot().unwrap();
+    let stripped = chatcore::strip_snapshot_to_identity(&full).unwrap();
+    assert!(stripped.len() < full.len(), "strip must actually drop state");
+    let restored = ChatSession::restore(&stripped).unwrap();
+    assert!(restored.epoch().is_err(), "group must not survive the strip");
+    restored.generate_key_package().unwrap();
+}
