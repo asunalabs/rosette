@@ -20,6 +20,8 @@ import chat.app.onboarding.OnboardingFlow
 import chat.app.pairing.FindPeopleScreen
 import chat.app.session.Session
 import chat.app.session.rememberSessionStore
+import chat.app.settings.ChangePinScreen
+import chat.app.settings.SettingsScreen
 import chat.app.theme.ChatTheme
 import chat.app.theme.InstrumentTabBar
 import chat.app.theme.LocalChatPalette
@@ -59,6 +61,9 @@ fun App() {
 
 private enum class Tab { Chats, FindPeople }
 
+/** Issue #4: full-screen surfaces above the tab bar. */
+private enum class Screen { Main, Settings, ChangePin }
+
 @Composable
 private fun EngineScreen(client: DirectoryClient, session: Session) {
     val palette = LocalChatPalette.current
@@ -68,6 +73,7 @@ private fun EngineScreen(client: DirectoryClient, session: Session) {
     var tab by remember { mutableStateOf(Tab.Chats) }
     var openConversation by remember { mutableStateOf<Conversation?>(null) }
     val scope = rememberCoroutineScope()
+    var screen by remember { mutableStateOf(Screen.Main) }
     // Issue #2: one debounced recovery-bundle re-upload per contact change.
     // Inert until backupEnroll has run on a persistent engine.
     val backupUploader = remember { BackupUploader(scope, engine, client, session.sessionToken) }
@@ -92,10 +98,36 @@ private fun EngineScreen(client: DirectoryClient, session: Session) {
         return
     }
 
+    // Issue #4: settings + Change PIN sit above the tabbed surface.
+    when (screen) {
+        Screen.Settings -> {
+            SettingsScreen(
+                session = session,
+                onBack = { screen = Screen.Main },
+                onChangePin = { screen = Screen.ChangePin },
+            )
+            return
+        }
+        Screen.ChangePin -> {
+            ChangePinScreen(
+                engine = engine,
+                client = client,
+                session = session,
+                onBack = { screen = Screen.Settings },
+            )
+            return
+        }
+        Screen.Main -> {}
+    }
+
     Column(modifier = Modifier.fillMaxSize().background(palette.bg)) {
         Column(modifier = Modifier.weight(1f)) {
             when (tab) {
-                Tab.Chats -> ChatListScreen(engine = engine, onOpenConversation = { openConversation = it })
+                Tab.Chats -> ChatListScreen(
+                    engine = engine,
+                    onOpenConversation = { openConversation = it },
+                    onOpenSettings = { screen = Screen.Settings },
+                )
                 Tab.FindPeople -> FindPeopleScreen(
                     client,
                     session,

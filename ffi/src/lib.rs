@@ -858,6 +858,37 @@ impl ChatEngine {
         Ok(Some(bundle.into()))
     }
 
+    /// Issue #4 (Change PIN gate): check a PIN or phrase against the stored
+    /// bundle locally — no server call, no attempt counting. With the DB
+    /// already open BK is readable anyway; this is consent UX, not a
+    /// security boundary. False when not enrolled or not persistent. Runs
+    /// an Argon2id derivation — call from a background thread.
+    pub fn backup_verify_secret(&self, secret: String) -> Result<bool, EngineError> {
+        let mut disk = self.shared.disk.lock().unwrap();
+        let Some(disk) = disk.as_mut() else {
+            return Ok(false);
+        };
+        let Some(bundle_bytes) =
+            disk.get("backup.bundle")
+                .map_err(|e| EngineError::StorageFailed {
+                    reason: e.to_string(),
+                })?
+        else {
+            return Ok(false);
+        };
+        let bundle: chatcore::backup::BackupBundle = bincode::deserialize(&bundle_bytes)
+            .map_err(|e| EngineError::StorageFailed {
+                reason: e.to_string(),
+            })?;
+        let ok = if chatcore::backup::validate_pin(&secret) {
+            chatcore::backup::unwrap_bk(&secret, &bundle.salt_p, &bundle.w_pin).is_ok()
+        } else {
+            let phrase = chatcore::backup::normalize_phrase(&secret);
+            chatcore::backup::unwrap_bk(&phrase, &bundle.salt_f, &bundle.w_phrase).is_ok()
+        };
+        Ok(ok)
+    }
+
     /// Issue #3 (phrase-path restore) and 2c (Change PIN): re-wrap the
     /// stored BK under a new PIN with fresh salts and refresh the stored
     /// bundle. The phrase wrap and blob are untouched — BK never changes.
@@ -1306,6 +1337,19 @@ mod tests {
             bk,
             "phrase wrap must survive a PIN rewrap"
         );
+    }
+
+    #[test]
+    fn verify_secret_checks_locally_without_touching_the_wraps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.db").to_string_lossy().into_owned();
+        let e = ChatEngine::new_persistent("ann#09".to_string(), path, "k".to_string()).unwrap();
+        assert!(!e.backup_verify_secret("1234".to_string()).unwrap(), "not enrolled yet");
+        let enrollment = e.backup_enroll("1234".to_string()).unwrap();
+        assert!(e.backup_verify_secret("1234".to_string()).unwrap());
+        assert!(!e.backup_verify_secret("1235".to_string()).unwrap());
+        assert!(e.backup_verify_secret(format!(" {} ", enrollment.phrase.to_uppercase())).unwrap());
+        assert!(!ChatEngine::new("x".to_string()).backup_verify_secret("1234".to_string()).unwrap());
     }
 
     #[test]
