@@ -19,6 +19,8 @@ tokio.workspace = true
 anyhow.workspace = true
 argon2 = "0.5"
 rand = "0.8"
+# Recovery-bundle upload bodies (issue #2) — same version as engine/ffi.
+base64 = "0.22"
 async-trait = "0.1"
 # Real client-server DB (Signal/Telegram-style), not embedded SQLite —
 # directory is a centrally-run service, unlike relay's per-operator file.

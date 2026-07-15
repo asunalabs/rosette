@@ -733,6 +733,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "axum",
+ "base64",
  "engine",
  "proto",
  "rand 0.8.7",

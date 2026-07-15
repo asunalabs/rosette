@@ -28,6 +28,22 @@ pub enum ClaimError {
     Db(#[from] sqlx::Error),
 }
 
+/// Issue #2: one account's recovery upload — ciphertexts, salts, and auth
+/// hashes only (see migration 0004). Field names follow the client bundle;
+/// the `_hash` suffixes match the columns they land in.
+#[derive(Clone)]
+pub struct BackupUpload {
+    pub blob: Vec<u8>,
+    pub w_pin: Vec<u8>,
+    pub salt_p: Vec<u8>,
+    pub w_phrase: Vec<u8>,
+    pub salt_f: Vec<u8>,
+    pub auth_pin_hash: Vec<u8>,
+    pub salt_a: Vec<u8>,
+    pub auth_phrase_hash: Vec<u8>,
+    pub salt_pa: Vec<u8>,
+}
+
 pub struct DirectoryStore {
     pool: PgPool,
     // Ephemeral, in-process only — see module docs.
@@ -288,6 +304,13 @@ impl DirectoryStore {
             .bind(user_id as i64)
             .execute(&mut *tx)
             .await?;
+        // Issue #2: the recovery bundle only exists to resurrect the account
+        // it belongs to — real erasure (T15/T19) takes it too. (The FK is
+        // CASCADE, but users rows are scrubbed, never deleted.)
+        sqlx::query("DELETE FROM backups WHERE user_id = $1")
+            .bind(user_id as i64)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -339,6 +362,46 @@ impl DirectoryStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.get::<String, _>("contact_link_b64")))
+    }
+
+    /// Issue #2: upsert this account's recovery bundle. A fresh upload
+    /// resets the PIN-attempt lockout — the uploader holds a valid session
+    /// (already inside the account), and new material means the old attempt
+    /// count is meaningless.
+    pub async fn upsert_backup(&self, user_id: u64, b: &BackupUpload) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO backups (user_id, blob, w_pin, salt_p, w_phrase, salt_f,
+                 auth_pin_hash, salt_a, auth_phrase_hash, salt_pa,
+                 pin_attempts, locked_until, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, NULL, $11)
+             ON CONFLICT (user_id) DO UPDATE SET
+                blob = excluded.blob,
+                w_pin = excluded.w_pin,
+                salt_p = excluded.salt_p,
+                w_phrase = excluded.w_phrase,
+                salt_f = excluded.salt_f,
+                auth_pin_hash = excluded.auth_pin_hash,
+                salt_a = excluded.salt_a,
+                auth_phrase_hash = excluded.auth_phrase_hash,
+                salt_pa = excluded.salt_pa,
+                pin_attempts = 0,
+                locked_until = NULL,
+                updated_at = excluded.updated_at",
+        )
+        .bind(user_id as i64)
+        .bind(&b.blob)
+        .bind(&b.w_pin)
+        .bind(&b.salt_p)
+        .bind(&b.w_phrase)
+        .bind(&b.salt_f)
+        .bind(&b.auth_pin_hash)
+        .bind(&b.salt_a)
+        .bind(&b.auth_phrase_hash)
+        .bind(&b.salt_pa)
+        .bind(now_unix())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub fn create_session(&self, user_id: u64) -> String {
@@ -536,5 +599,64 @@ mod tests {
         let token = store.create_session(u);
         assert_eq!(store.session_user_id(&token), Some(u));
         assert_eq!(store.session_user_id("not-a-real-token"), None);
+    }
+
+    fn backup_upload() -> BackupUpload {
+        BackupUpload {
+            blob: vec![1],
+            w_pin: vec![2],
+            salt_p: vec![3; 16],
+            w_phrase: vec![4],
+            salt_f: vec![5; 16],
+            auth_pin_hash: vec![6; 32],
+            salt_a: vec![7; 16],
+            auth_phrase_hash: vec![8; 32],
+            salt_pa: vec![9; 16],
+        }
+    }
+
+    #[sqlx::test]
+    async fn backup_upsert_replaces_and_resets_the_lockout(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let u = store.create_pending_user("h").await.unwrap();
+        store.upsert_backup(u, &backup_upload()).await.unwrap();
+
+        // Simulate a lockout in progress; a fresh upload must clear it.
+        sqlx::query("UPDATE backups SET pin_attempts = 7, locked_until = 9999999999 WHERE user_id = $1")
+            .bind(u as i64)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let replacement = BackupUpload {
+            blob: vec![42],
+            ..backup_upload()
+        };
+        store.upsert_backup(u, &replacement).await.unwrap();
+
+        let row = sqlx::query(
+            "SELECT blob, pin_attempts, locked_until FROM backups WHERE user_id = $1",
+        )
+        .bind(u as i64)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<Vec<u8>, _>("blob"), vec![42]);
+        assert_eq!(row.get::<i32, _>("pin_attempts"), 0);
+        assert_eq!(row.get::<Option<i64>, _>("locked_until"), None);
+    }
+
+    #[sqlx::test]
+    async fn erase_user_deletes_the_backup(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let u = store.create_pending_user("h").await.unwrap();
+        store.upsert_backup(u, &backup_upload()).await.unwrap();
+        store.erase_user(u).await.unwrap();
+        let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM backups WHERE user_id = $1")
+            .bind(u as i64)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+            .get("n");
+        assert_eq!(n, 0, "recovery bundle must not survive erasure");
     }
 }

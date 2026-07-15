@@ -10,14 +10,15 @@ use axum::extract::{Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::config::DirectoryConfig;
 use crate::ratelimit::{RateLimiter, UNVERIFIED_SEARCH_PER_MINUTE, VERIFIED_SEARCH_PER_MINUTE};
 use crate::search::{search_by_prefix, PREFIX_LEN_HEX};
-use crate::store::{ClaimError, DirectoryStore};
+use crate::store::{BackupUpload, ClaimError, DirectoryStore};
 use crate::username::format_handle;
 use crate::verify::{self, OtpVendor, Pepper, VerificationOutcome, VerifyError};
 
@@ -41,6 +42,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/search", get(search))
         .route("/pairing-bootstrap", post(set_pairing_bootstrap))
         .route("/pairing-bootstrap/request", post(request_pairing_bootstrap))
+        .route("/v1/backup", put(put_backup))
         .with_state(state)
         .layer(middleware::from_fn(no_store_middleware))
 }
@@ -490,6 +492,66 @@ async fn search(
     Ok(Json(SearchResponse { results }))
 }
 
+/// Issue #2: base64 fields straight from the client's `BackupBundle`.
+#[derive(Deserialize)]
+struct BackupPutRequest {
+    blob: String,
+    w_pin: String,
+    salt_p: String,
+    w_phrase: String,
+    salt_f: String,
+    auth_pin: String,
+    salt_a: String,
+    auth_phrase: String,
+    salt_pa: String,
+}
+
+/// Issue #2: store this account's E2E-encrypted recovery bundle (upsert on
+/// the caller's own row — the target is never chosen by the client). The
+/// server checks shapes only; contents are opaque ciphertext by design.
+/// Retrieval, with PIN/phrase proof and the 10-attempt lockout, is issue #3.
+async fn put_backup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<BackupPutRequest>,
+) -> Result<StatusCode, ApiError> {
+    let user_id = authenticate(&headers, &state.store)?;
+    let b64 = |s: &str| {
+        base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .map_err(|_| ApiError::BadRequest("all bundle fields must be base64"))
+    };
+    let upload = BackupUpload {
+        blob: b64(&req.blob)?,
+        w_pin: b64(&req.w_pin)?,
+        salt_p: b64(&req.salt_p)?,
+        w_phrase: b64(&req.w_phrase)?,
+        salt_f: b64(&req.salt_f)?,
+        auth_pin_hash: b64(&req.auth_pin)?,
+        salt_a: b64(&req.salt_a)?,
+        auth_phrase_hash: b64(&req.auth_phrase)?,
+        salt_pa: b64(&req.salt_pa)?,
+    };
+    if [&upload.salt_p, &upload.salt_f, &upload.salt_a, &upload.salt_pa]
+        .iter()
+        .any(|s| s.len() != 16)
+    {
+        return Err(ApiError::BadRequest("salts must be 16 bytes"));
+    }
+    if upload.auth_pin_hash.len() != 32 || upload.auth_phrase_hash.len() != 32 {
+        return Err(ApiError::BadRequest("auth hashes must be 32 bytes"));
+    }
+    if upload.blob.is_empty() || upload.w_pin.is_empty() || upload.w_phrase.is_empty() {
+        return Err(ApiError::BadRequest("ciphertexts must not be empty"));
+    }
+    state
+        .store
+        .upsert_backup(user_id, &upload)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +569,85 @@ mod tests {
             },
             rate_limiter: RateLimiter::new(),
         })
+    }
+
+    fn backup_body() -> serde_json::Value {
+        let b64 =
+            |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        serde_json::json!({
+            "blob": b64(&[1, 2, 3]),
+            "w_pin": b64(&[4; 56]),
+            "salt_p": b64(&[5; 16]),
+            "w_phrase": b64(&[6; 56]),
+            "salt_f": b64(&[7; 16]),
+            "auth_pin": b64(&[8; 32]),
+            "salt_a": b64(&[9; 16]),
+            "auth_phrase": b64(&[10; 32]),
+            "salt_pa": b64(&[11; 16]),
+        })
+    }
+
+    #[sqlx::test]
+    async fn backup_put_requires_auth(pool: PgPool) {
+        let state = state_for(pool);
+        let addr = spawn_for_tests(state).await.unwrap();
+        let resp = reqwest::Client::new()
+            .put(format!("http://{addr}/v1/backup"))
+            .json(&backup_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test]
+    async fn backup_put_upserts_own_row_and_rejects_malformed_fields(pool: PgPool) {
+        let state = state_for(pool);
+        let u = state.store.create_pending_user("backup-hash").await.unwrap();
+        let token = state.store.create_session(u);
+        let addr = spawn_for_tests(state).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let ok = client
+            .put(format!("http://{addr}/v1/backup"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&backup_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), reqwest::StatusCode::NO_CONTENT);
+
+        // Second PUT replaces, not duplicates (204 again, no conflict).
+        let again = client
+            .put(format!("http://{addr}/v1/backup"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&backup_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), reqwest::StatusCode::NO_CONTENT);
+
+        let mut short_salt = backup_body();
+        short_salt["salt_p"] = serde_json::json!("YWJj"); // 3 bytes
+        let bad = client
+            .put(format!("http://{addr}/v1/backup"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&short_salt)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let mut not_b64 = backup_body();
+        not_b64["blob"] = serde_json::json!("!!! not base64 !!!");
+        let bad = client
+            .put(format!("http://{addr}/v1/backup"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&not_b64)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
     }
 
     #[sqlx::test]
