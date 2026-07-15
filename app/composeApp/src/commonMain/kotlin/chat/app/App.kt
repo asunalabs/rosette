@@ -1,8 +1,14 @@
 package chat.app
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -10,23 +16,32 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import chat.app.chatlist.ChatListScreen
 import chat.app.chatlist.ConversationScreen
 import chat.app.directory.BackupUploader
 import chat.app.directory.DirectoryClient
 import chat.app.directory.DirectoryException
 import chat.app.onboarding.OnboardingFlow
-import chat.app.pairing.FindPeopleScreen
 import chat.app.session.Session
 import chat.app.session.rememberSessionStore
+import chat.app.pairing.FindPeopleScreen
 import chat.app.settings.ChangePinScreen
 import chat.app.settings.SettingsScreen
+import chat.app.storage.DbConfig
+import chat.app.storage.deleteDbFile
+import chat.app.storage.rememberDbConfig
 import chat.app.theme.ChatTheme
+import chat.app.theme.InstrumentButton
 import chat.app.theme.InstrumentTabBar
 import chat.app.theme.LocalChatPalette
 import chat.engine.ChatEngine
 import chat.engine.Conversation
+import chat.engine.EngineException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * T27: phone verification gates the app itself — no unverified-but-usable
@@ -42,19 +57,55 @@ fun App() {
         var session by remember { mutableStateOf(store.load()) }
         val current = session
         val client = remember { DirectoryClient() }
+        val db = rememberDbConfig()
+        // Enroll/restore build the persistent engine mid-onboarding;
+        // EngineScreen picks it up instead of reopening the same SQLCipher
+        // file it already holds.
+        var pendingEngine by remember { mutableStateOf<ChatEngine?>(null) }
         if (current == null) {
-            // ponytail: enroll/restore = null until #1's persistent engine
-            // lands — then enroll does backupEnroll + putBackup (PIN/phrase
-            // steps become mandatory, issue #2 acceptance 1) and restore
-            // does ChatEngine.newFromBackup + optional backupRewrapPin +
-            // putBackup + session save (issue #3).
-            OnboardingFlow(client, enroll = null, restore = null) { token, claimedHandle, phone ->
+            OnboardingFlow(
+                client = client,
+                // Issue #2 acceptance 1: enroll is always passed, so the
+                // PIN + phrase steps are mandatory on every fresh signup.
+                enroll = { token, handle, pin ->
+                    withContext(Dispatchers.Default) {
+                        // An existing DB here is an orphan from an abandoned
+                        // onboarding (a saved session skips this flow):
+                        // newPersistent reopens it and backupEnroll simply
+                        // overwrites the recovery material.
+                        val engine = pendingEngine
+                            ?: ChatEngine.newPersistent(handle, db.dbPath, db.dbKey)
+                                .also { pendingEngine = it }
+                        val enrollment = engine.backupEnroll(pin)
+                        client.putBackup(token, enrollment.bundle)
+                        enrollment.phrase
+                    }
+                },
+                // Issue #3: runs on Dispatchers.Default via fetchBundle.
+                restore = { req ->
+                    // Same orphan rule; newFromBackup refuses to overwrite
+                    // an existing file, so clear it first.
+                    deleteDbFile(db.dbPath)
+                    val engine = ChatEngine.newFromBackup(
+                        "", db.dbPath, db.dbKey, req.bundle, req.secret,
+                    )
+                    if (req.newPin != null) {
+                        // Phrase path: the forced fresh PIN replaces the old
+                        // wrap server-side before the app opens.
+                        client.putBackup(req.sessionToken, engine.backupRewrapPin(req.newPin))
+                    }
+                    pendingEngine = engine
+                    val restored = Session(req.sessionToken, engine.displayName(), req.phone)
+                    store.save(restored)
+                    session = restored
+                },
+            ) { token, claimedHandle, phone ->
                 val newSession = Session(token, claimedHandle, phone)
                 store.save(newSession)
                 session = newSession
             }
         } else {
-            EngineScreen(client = client, session = current)
+            EngineScreen(client = client, session = current, db = db, initial = pendingEngine)
         }
     }
 }
@@ -65,11 +116,28 @@ private enum class Tab { Chats, FindPeople }
 private enum class Screen { Main, Settings, ChangePin }
 
 @Composable
-private fun EngineScreen(client: DirectoryClient, session: Session) {
+private fun EngineScreen(client: DirectoryClient, session: Session, db: DbConfig, initial: ChatEngine?) {
     val palette = LocalChatPalette.current
-    // remember {} — one engine per composition, as the contract prescribes
-    // one per app start.
-    val engine = remember { ChatEngine(session.handle) }
+    // Issue #1: SQLCipher-persistent engine — identity, pairing, and history
+    // survive restarts. remember {} — one engine per composition, as the
+    // contract prescribes one per app start. [initial] is the engine
+    // enroll/restore already built this run, if any.
+    fun open(): ChatEngine? = try {
+        ChatEngine.newPersistent(session.handle, db.dbPath, db.dbKey)
+    } catch (_: EngineException) {
+        // BadKey/StorageFailed: the key store lost the key but the DB file
+        // survived (e.g. device-to-device data copy). Unreadable forever —
+        // offer the reset path, never crash, never silent fresh state.
+        null
+    }
+    var engineOrNull by remember { mutableStateOf(initial ?: open()) }
+    val engine = engineOrNull ?: run {
+        ResetLocalDataScreen(onReset = {
+            deleteDbFile(db.dbPath)
+            engineOrNull = open()
+        })
+        return
+    }
     var tab by remember { mutableStateOf(Tab.Chats) }
     var openConversation by remember { mutableStateOf<Conversation?>(null) }
     val scope = rememberCoroutineScope()
@@ -142,5 +210,32 @@ private fun EngineScreen(client: DirectoryClient, session: Session) {
             selected = tab.ordinal,
             onSelect = { tab = Tab.entries[it] },
         )
+    }
+}
+
+/** Issue #1 failure path: key store wiped but the DB file survived. */
+@Composable
+private fun ResetLocalDataScreen(onReset: () -> Unit) {
+    val palette = LocalChatPalette.current
+    Column(
+        modifier = Modifier.fillMaxSize().background(palette.bg).padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            "This device can't read its local data",
+            style = MaterialTheme.typography.headlineSmall,
+            color = palette.ink,
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "The key protecting this device's messages is gone, so the data " +
+                "stored here can't be opened. Reset to start fresh — your " +
+                "account itself is not affected.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = palette.muted,
+        )
+        Spacer(Modifier.height(24.dp))
+        InstrumentButton("Reset local data", onClick = onReset)
     }
 }
