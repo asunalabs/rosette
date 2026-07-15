@@ -127,6 +127,36 @@ impl From<chatcore::backup::BackupBundle> for BackupBundle {
     }
 }
 
+impl From<BackupBundle> for chatcore::backup::BackupBundle {
+    fn from(b: BackupBundle) -> Self {
+        chatcore::backup::BackupBundle {
+            blob: b.blob,
+            w_pin: b.w_pin,
+            salt_p: b.salt_p,
+            w_phrase: b.w_phrase,
+            salt_f: b.salt_f,
+            auth_pin: b.auth_pin,
+            salt_a: b.salt_a,
+            auth_phrase: b.auth_phrase,
+            salt_pa: b.salt_pa,
+        }
+    }
+}
+
+/// Issue #3: SHA256(Argon2id(secret, salt)) — the proof the directory's
+/// restore endpoint compares against its stored auth hash. Runs one Argon2id
+/// derivation (seconds by design); call off the UI thread. Phrase input is
+/// normalized exactly like `new_from_backup` normalizes it.
+#[uniffi::export]
+pub fn backup_auth_proof(secret: String, salt: Vec<u8>) -> Vec<u8> {
+    let secret = if chatcore::backup::validate_pin(&secret) {
+        secret
+    } else {
+        chatcore::backup::normalize_phrase(&secret)
+    };
+    chatcore::backup::auth_hash(&secret, &salt)
+}
+
 /// One-time result of `backup_enroll`. The phrase is shown to the user once
 /// and never persisted in plaintext anywhere — here or on the server.
 #[derive(uniffi::Record)]
@@ -162,6 +192,11 @@ pub enum EngineError {
     /// 4-6 ASCII digits.
     #[error("PIN must be 4-6 digits")]
     InvalidPin,
+    /// ADDITIVE (issue #3): the PIN or phrase given to `new_from_backup`
+    /// does not open this bundle. The AEAD tag cannot say which part was
+    /// wrong, and no database is left behind.
+    #[error("wrong PIN or recovery phrase")]
+    WrongRecoverySecret,
 }
 
 /// The UI implements this to receive pushes. `on_event` is always called from
@@ -342,6 +377,103 @@ impl ChatEngine {
         Ok(engine)
     }
 
+    /// ADDITIVE (issue #3): create the engine by restoring an account from
+    /// its recovery bundle on a NEW device. `secret` is the PIN or the
+    /// 5-word phrase (normalized here). Unwraps BK, decrypts the blob, and
+    /// seeds a fresh SQLCipher database at `db_path` with the restored
+    /// identity, username, contacts, and recovery material — then behaves
+    /// exactly like `new_persistent`. A wrong secret fails with
+    /// `WrongRecoverySecret` and leaves no database behind. Runs an Argon2id
+    /// derivation — call from a background thread.
+    #[uniffi::constructor]
+    pub fn new_from_backup(
+        display_name: String,
+        db_path: String,
+        db_key: String,
+        bundle: BackupBundle,
+        secret: String,
+    ) -> Result<Arc<Self>, EngineError> {
+        let core_bundle: chatcore::backup::BackupBundle = bundle.into();
+        // Unwrap BK before touching the filesystem: a wrong secret must
+        // leave no trace. PIN-shaped secrets try the PIN wrap, everything
+        // else the phrase wrap.
+        let bk = if chatcore::backup::validate_pin(&secret) {
+            chatcore::backup::unwrap_bk(&secret, &core_bundle.salt_p, &core_bundle.w_pin)
+        } else {
+            let phrase = chatcore::backup::normalize_phrase(&secret);
+            chatcore::backup::unwrap_bk(&phrase, &core_bundle.salt_f, &core_bundle.w_phrase)
+        }
+        .map_err(|_| EngineError::WrongRecoverySecret)?;
+        let payload_bytes = chatcore::backup::open_blob(&bk, &core_bundle.blob)
+            .map_err(|_| EngineError::WrongRecoverySecret)?;
+        let payload: chatcore::backup::BackupPayload = bincode::deserialize(&payload_bytes)
+            .map_err(|e| EngineError::StorageFailed {
+                reason: format!("backup blob is corrupt: {e}"),
+            })?;
+
+        if Path::new(&db_path).exists() {
+            return Err(EngineError::StorageFailed {
+                reason: "a database already exists at this path".to_string(),
+            });
+        }
+        let mut disk = DiskStore::open(Path::new(&db_path), &db_key).map_err(|e| {
+            EngineError::StorageFailed {
+                reason: e.to_string(),
+            }
+        })?;
+
+        let name = payload.username.clone().unwrap_or(display_name);
+        let mut ui_state = Store::default();
+        if let Some(first) = payload.contacts.first() {
+            // ponytail: v0.1 single-conversation model — restore surfaces
+            // the contact as an unpaired stub; the normal pairing flow
+            // re-pairs it (create_conversation upserts by id). Widen when
+            // multi-conversation lands.
+            ui_state.conversations.push(Conversation {
+                id: CONVERSATION_ID.to_string(),
+                display_name: first.clone(),
+                last_message: None,
+                unread: 0,
+                verified: false,
+            });
+            ui_state
+                .messages
+                .insert(CONVERSATION_ID.to_string(), Vec::new());
+        }
+        let ui_blob =
+            bincode::serialize(&(&ui_state, 1u64)).expect("ui state is always serializable");
+        let bundle_bytes =
+            bincode::serialize(&core_bundle).expect("bundle is always serializable");
+
+        let mut kv: Vec<(&str, &[u8])> = vec![
+            ("backup.bk", &bk[..]),
+            ("backup.bundle", &bundle_bytes),
+            ("ui.state", &ui_blob),
+        ];
+        if let Some(identity) = payload.identity.as_deref() {
+            kv.push(("session", identity));
+        }
+        if let Err(e) = disk.commit(&kv, &[]) {
+            drop(disk);
+            let _ = std::fs::remove_file(&db_path);
+            return Err(EngineError::StorageFailed {
+                reason: e.to_string(),
+            });
+        }
+
+        let cfg = PersistCfg {
+            path: db_path,
+            key: db_key,
+        };
+        Ok(Self::build(name, Some(cfg), Some(disk), ui_state, 1))
+    }
+
+    /// The engine's display name. After `new_from_backup` this is the
+    /// restored account's username — the app reads it back for its session.
+    pub fn display_name(&self) -> String {
+        self.display_name.clone()
+    }
+
     /// Register (or replace) the event listener. Call once after construction.
     /// Events that arrived earlier are delivered immediately, in order.
     pub fn set_listener(&self, listener: Box<dyn EngineEventListener>) {
@@ -473,14 +605,25 @@ impl ChatEngine {
                     .build()
                     .expect("building the engine runtime never fails");
                 rt.block_on(async move {
-                    let mut core =
-                        match CoreEngine::connect(&name, &cfg.addr, cfg.fingerprint).await {
-                            Ok(core) => core,
-                            Err(e) => {
-                                let _ = init_tx.send(Err(e));
-                                return;
-                            }
-                        };
+                    let attempt = match restored_session(persist.as_ref()) {
+                        Some(session) => {
+                            CoreEngine::connect_with_session(
+                                &name,
+                                &cfg.addr,
+                                cfg.fingerprint,
+                                session,
+                            )
+                            .await
+                        }
+                        None => CoreEngine::connect(&name, &cfg.addr, cfg.fingerprint).await,
+                    };
+                    let mut core = match attempt {
+                        Ok(core) => core,
+                        Err(e) => {
+                            let _ = init_tx.send(Err(e));
+                            return;
+                        }
+                    };
                     if let Err(e) = attach_disk(&mut core, persist.as_ref()) {
                         let _ = init_tx.send(Err(e));
                         return;
@@ -537,13 +680,15 @@ impl ChatEngine {
                     .build()
                     .expect("building the engine runtime never fails");
                 rt.block_on(async move {
-                    let mut core = match CoreEngine::pair_with_link(&name, &link).await {
-                        Ok(core) => core,
-                        Err(e) => {
-                            let _ = init_tx.send(Err(e));
-                            return;
-                        }
-                    };
+                    let session = restored_session(persist.as_ref());
+                    let mut core =
+                        match CoreEngine::pair_with_link_using(&name, &link, session).await {
+                            Ok(core) => core,
+                            Err(e) => {
+                                let _ = init_tx.send(Err(e));
+                                return;
+                            }
+                        };
                     if let Err(e) = attach_disk(&mut core, persist.as_ref()) {
                         let _ = init_tx.send(Err(e));
                         return;
@@ -712,6 +857,51 @@ impl ChatEngine {
             .map_err(map_err)?;
         Ok(Some(bundle.into()))
     }
+
+    /// Issue #3 (phrase-path restore) and 2c (Change PIN): re-wrap the
+    /// stored BK under a new PIN with fresh salts and refresh the stored
+    /// bundle. The phrase wrap and blob are untouched — BK never changes.
+    /// Returns the bundle for re-upload. Runs two Argon2id derivations —
+    /// call from a background thread.
+    pub fn backup_rewrap_pin(&self, new_pin: String) -> Result<BackupBundle, EngineError> {
+        if !chatcore::backup::validate_pin(&new_pin) {
+            return Err(EngineError::InvalidPin);
+        }
+        let mut disk = self.shared.disk.lock().unwrap();
+        let Some(disk) = disk.as_mut() else {
+            return Err(EngineError::NotSupported {
+                reason: "recovery needs the persistent engine (new_persistent)".to_string(),
+            });
+        };
+        let map_err = |e: chatcore::StoreError| EngineError::StorageFailed {
+            reason: e.to_string(),
+        };
+        let (Some(bk), Some(bundle_bytes)) = (
+            disk.get("backup.bk").map_err(map_err)?,
+            disk.get("backup.bundle").map_err(map_err)?,
+        ) else {
+            return Err(EngineError::NotSupported {
+                reason: "no recovery enrollment to re-wrap".to_string(),
+            });
+        };
+        let bk: [u8; 32] = bk.try_into().map_err(|_| EngineError::StorageFailed {
+            reason: "stored backup key is corrupt".to_string(),
+        })?;
+        let mut bundle: chatcore::backup::BackupBundle = bincode::deserialize(&bundle_bytes)
+            .map_err(|e| EngineError::StorageFailed {
+                reason: e.to_string(),
+            })?;
+        let salt_p = chatcore::backup::random_bytes::<16>();
+        let salt_a = chatcore::backup::random_bytes::<16>();
+        bundle.w_pin = chatcore::backup::wrap_bk(&new_pin, &salt_p, &bk);
+        bundle.salt_p = salt_p.to_vec();
+        bundle.auth_pin = chatcore::backup::auth_hash(&new_pin, &salt_a);
+        bundle.salt_a = salt_a.to_vec();
+        let bundle_bytes = bincode::serialize(&bundle).expect("bundle is always serializable");
+        disk.commit(&[("backup.bundle", &bundle_bytes)], &[])
+            .map_err(map_err)?;
+        Ok(bundle.into())
+    }
 }
 
 /// Wire the engine's SQLCipher write-through, opening its own connection to
@@ -791,20 +981,40 @@ fn reject_offline(cmd: Command) {
     }
 }
 
+/// Issue #3: a restored device has a "session" identity in kv but no
+/// "engine" record yet — pick that identity up for the first connect so
+/// peers see the same signer. Never fails the connect path: a fresh session
+/// is the correct fallback for every non-restore case.
+fn restored_session(persist: Option<&PersistCfg>) -> Option<chatcore::ChatSession> {
+    let cfg = persist?;
+    let disk = DiskStore::open(Path::new(&cfg.path), &cfg.key).ok()?;
+    if disk.get("engine").ok()?.is_some() {
+        return None; // a live engine resumes instead — never re-connects here
+    }
+    let bytes = disk.get("session").ok()??;
+    chatcore::ChatSession::restore(&bytes).ok()
+}
+
 /// Register the (single, v0.1) conversation in the store once pairing
-/// completes, on either side.
+/// completes, on either side. Upserts by id: a restored contact stub
+/// (issue #3) becomes the live pairing instead of a duplicate row.
 fn create_conversation(shared: &Shared, peer_name: Option<String>) -> String {
     let id = CONVERSATION_ID.to_string();
     {
         let mut store = shared.store.lock().unwrap();
-        store.conversations.push(Conversation {
-            id: id.clone(),
-            display_name: peer_name.unwrap_or_else(|| "New contact".to_string()),
-            last_message: None,
-            unread: 0,
-            verified: false,
-        });
-        store.messages.insert(id.clone(), Vec::new());
+        let display_name = peer_name.unwrap_or_else(|| "New contact".to_string());
+        if let Some(existing) = store.conversations.iter_mut().find(|c| c.id == id) {
+            existing.display_name = display_name;
+        } else {
+            store.conversations.push(Conversation {
+                id: id.clone(),
+                display_name,
+                last_message: None,
+                unread: 0,
+                verified: false,
+            });
+        }
+        store.messages.entry(id.clone()).or_default();
     }
     shared.persist_ui();
     shared.dispatch(EngineEvent::ConversationUpdated {
@@ -1026,6 +1236,88 @@ mod tests {
             chatcore::backup::unwrap_bk(&enrollment.phrase, &bundle.salt_f, &bundle.w_phrase)
                 .unwrap(),
             bk
+        );
+    }
+
+    #[test]
+    fn restore_roundtrips_and_wrong_secret_leaves_no_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.db").to_string_lossy().into_owned();
+        let a = ChatEngine::new_persistent("mira#04".to_string(), path_a, "ka".to_string())
+            .unwrap();
+        let enrollment = a.backup_enroll("4321".to_string()).unwrap();
+
+        // Wrong secret: typed error, no file left behind.
+        let path_bad = dir.path().join("bad.db");
+        let result = ChatEngine::new_from_backup(
+            "ignored".to_string(),
+            path_bad.to_string_lossy().into_owned(),
+            "kb".to_string(),
+            enrollment.bundle.clone(),
+            "9999".to_string(),
+        );
+        assert!(matches!(result, Err(EngineError::WrongRecoverySecret)));
+        assert!(!path_bad.exists(), "wrong secret must not create a DB");
+
+        // PIN path restores the username as the display name.
+        let path_b = dir.path().join("b.db").to_string_lossy().into_owned();
+        let b = ChatEngine::new_from_backup(
+            "ignored".to_string(),
+            path_b,
+            "kb".to_string(),
+            enrollment.bundle.clone(),
+            "4321".to_string(),
+        )
+        .unwrap();
+        assert_eq!(b.display_name(), "mira#04");
+        assert!(b.backup_bundle_current().unwrap().is_some());
+
+        // Phrase path, typed sloppily, normalizes and works too.
+        let path_c = dir.path().join("c.db").to_string_lossy().into_owned();
+        let sloppy = format!("  {}  ", enrollment.phrase.to_uppercase());
+        let c = ChatEngine::new_from_backup(
+            "ignored".to_string(),
+            path_c,
+            "kc".to_string(),
+            enrollment.bundle,
+            sloppy,
+        )
+        .unwrap();
+        assert_eq!(c.display_name(), "mira#04");
+    }
+
+    #[test]
+    fn rewrap_pin_moves_the_pin_wrap_and_keeps_the_phrase_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.db").to_string_lossy().into_owned();
+        let e = ChatEngine::new_persistent("bob#02".to_string(), path, "k".to_string()).unwrap();
+        let enrollment = e.backup_enroll("1111".to_string()).unwrap();
+
+        let rewrapped = e.backup_rewrap_pin("222222".to_string()).unwrap();
+        assert!(
+            chatcore::backup::unwrap_bk("1111", &rewrapped.salt_p, &rewrapped.w_pin).is_err(),
+            "old PIN must stop working"
+        );
+        let bk =
+            chatcore::backup::unwrap_bk("222222", &rewrapped.salt_p, &rewrapped.w_pin).unwrap();
+        assert_eq!(
+            chatcore::backup::unwrap_bk(&enrollment.phrase, &rewrapped.salt_f, &rewrapped.w_phrase)
+                .unwrap(),
+            bk,
+            "phrase wrap must survive a PIN rewrap"
+        );
+    }
+
+    #[test]
+    fn auth_proof_matches_core_and_normalizes_phrases() {
+        let salt = chatcore::backup::random_bytes::<16>().to_vec();
+        assert_eq!(
+            backup_auth_proof("1234".to_string(), salt.clone()),
+            chatcore::backup::auth_hash("1234", &salt)
+        );
+        assert_eq!(
+            backup_auth_proof("  Word ONE  two ".to_string(), salt.clone()),
+            chatcore::backup::auth_hash("word one two", &salt)
         );
     }
 }

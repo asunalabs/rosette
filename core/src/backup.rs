@@ -67,6 +67,16 @@ pub fn validate_pin(pin: &str) -> bool {
     (4..=6).contains(&pin.len()) && pin.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Restore-side phrase normalization: what the user typed → what
+/// `generate_phrase` produced. Lowercase, trimmed, single spaces.
+pub fn normalize_phrase(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// 5 words drawn uniformly from the embedded EFF large wordlist
 /// (7776 words, ~64.6 bits total), lowercase, space-joined.
 pub fn generate_phrase() -> String {
@@ -141,6 +151,12 @@ pub fn unwrap_bk(secret: &str, salt: &[u8], wrapped: &[u8]) -> Result<[u8; BK_LE
         .map_err(|_| BackupError::WrongSecret)
 }
 
+/// Wrap BK under a secret — `unwrap_bk`'s inverse. Used at enroll and by
+/// Change PIN (2c)/phrase-path restore (#3) to re-wrap with a new PIN.
+pub fn wrap_bk(secret: &str, salt: &[u8], bk: &[u8; BK_LEN]) -> Vec<u8> {
+    aead_seal(&derive(secret.as_bytes(), salt), bk)
+}
+
 /// Build the full upload bundle from fresh salts. Four Argon2 derivations —
 /// takes a couple of seconds by design; callers run it off the UI thread.
 pub fn build_bundle(
@@ -158,9 +174,9 @@ pub fn build_bundle(
     let salt_pa = random_bytes::<SALT_LEN>();
     Ok(BackupBundle {
         blob: seal_blob(bk, payload),
-        w_pin: aead_seal(&derive(pin.as_bytes(), &salt_p), bk),
+        w_pin: wrap_bk(pin, &salt_p, bk),
         salt_p: salt_p.to_vec(),
-        w_phrase: aead_seal(&derive(phrase.as_bytes(), &salt_f), bk),
+        w_phrase: wrap_bk(phrase, &salt_f, bk),
         salt_f: salt_f.to_vec(),
         auth_pin: auth_hash(pin, &salt_a),
         salt_a: salt_a.to_vec(),
@@ -244,6 +260,25 @@ mod tests {
         assert_eq!(auth_hash("1234", &salt1), auth_hash("1234", &salt1));
         assert_ne!(auth_hash("1234", &salt1), auth_hash("1234", &salt2));
         assert_ne!(auth_hash("1234", &salt1), auth_hash("1235", &salt1));
+    }
+
+    #[test]
+    fn phrase_normalization_matches_generation() {
+        assert_eq!(
+            normalize_phrase("  Correct  HORSE\tbattery staple  extra "),
+            "correct horse battery staple extra"
+        );
+        let generated = generate_phrase();
+        assert_eq!(normalize_phrase(&generated), generated);
+    }
+
+    #[test]
+    fn wrap_bk_roundtrips_with_unwrap_bk() {
+        let bk = random_bytes::<BK_LEN>();
+        let salt = random_bytes::<SALT_LEN>();
+        let wrapped = wrap_bk("9999", &salt, &bk);
+        assert_eq!(unwrap_bk("9999", &salt, &wrapped).unwrap(), bk);
+        assert!(unwrap_bk("9998", &salt, &wrapped).is_err());
     }
 
     #[test]
