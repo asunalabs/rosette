@@ -107,18 +107,18 @@ data class RestoreRequest(
 
 /**
  * [enroll] runs the recovery enrollment (engine `backupEnroll` + bundle
- * upload) and returns the 5-word phrase. Null skips the PIN/phrase steps —
- * only until #1's persistent engine lands in App.kt; they are mandatory
- * once it does (issue #2 acceptance 1).
+ * upload) and returns the 5-word phrase; it gets the session token and
+ * claimed handle because it builds the persistent engine (issue #1) before
+ * the first backup upload. Null skips the PIN/phrase steps (tests only —
+ * App.kt always passes it; issue #2 acceptance 1 makes the steps mandatory).
  */
 @Composable
 fun OnboardingFlow(
     client: DirectoryClient,
-    enroll: (suspend (pin: String) -> String)? = null,
+    enroll: (suspend (sessionToken: String, handle: String, pin: String) -> String)? = null,
     /**
      * Issue #3: finishes a restore (engine + session). Null keeps the
-     * Welcome CTA on its "not available yet" stub — only until #1's
-     * persistent engine lands in App.kt.
+     * Welcome CTA on its "not available yet" stub (tests only).
      */
     restore: (suspend (RestoreRequest) -> Unit)? = null,
     onComplete: (sessionToken: String, handle: String, phone: String) -> Unit,
@@ -225,7 +225,7 @@ fun OnboardingFlow(
                     loading = true; error = null
                     scope.launch {
                         try {
-                            val phrase = checkNotNull(enroll)(pin)
+                            val phrase = checkNotNull(enroll)(s.sessionToken, s.handle, pin)
                             state = OnboardingState.ShowPhrase(s.sessionToken, s.handle, s.phone, phrase)
                         } catch (e: Exception) {
                             // DirectoryException or the engine's own error —
