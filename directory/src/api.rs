@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::DirectoryConfig;
 use crate::ratelimit::{RateLimiter, UNVERIFIED_SEARCH_PER_MINUTE, VERIFIED_SEARCH_PER_MINUTE};
 use crate::search::{search_by_prefix, PREFIX_LEN_HEX};
-use crate::store::{BackupUpload, ClaimError, DirectoryStore};
+use crate::store::{BackupUpload, ClaimError, DirectoryStore, RestoreVerdict};
 use crate::username::format_handle;
 use crate::verify::{self, OtpVendor, Pepper, VerificationOutcome, VerifyError};
 
@@ -43,6 +43,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/pairing-bootstrap", post(set_pairing_bootstrap))
         .route("/pairing-bootstrap/request", post(request_pairing_bootstrap))
         .route("/v1/backup", put(put_backup))
+        .route("/v1/backup/restore/begin", post(restore_begin))
+        .route("/v1/backup/restore/complete", post(restore_complete))
         .with_state(state)
         .layer(middleware::from_fn(no_store_middleware))
 }
@@ -80,6 +82,11 @@ enum ApiError {
     RateLimited,
     NotFound,
     Internal,
+    /// Issue #3: wrong restore secret. The message carries the remaining
+    /// attempts (PIN path) so the client can show it verbatim.
+    WrongSecret { remaining: Option<i32> },
+    /// Issue #3: PIN path locked out; the message names the wait verbatim.
+    Locked { seconds: i64 },
 }
 
 impl IntoResponse for ApiError {
@@ -91,6 +98,35 @@ impl IntoResponse for ApiError {
             ApiError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate limited"),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found"),
             ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+            ApiError::WrongSecret { remaining } => {
+                let msg = match remaining {
+                    Some(n) => format!("wrong PIN — {n} attempts left before a lockout"),
+                    None => "wrong recovery phrase".to_string(),
+                };
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": msg,
+                        "remaining_attempts": remaining,
+                    })),
+                )
+                    .into_response();
+            }
+            ApiError::Locked { seconds } => {
+                let human = if seconds >= 3600 {
+                    format!("{} h", (seconds + 3599) / 3600)
+                } else {
+                    format!("{} min", ((seconds + 59) / 60).max(1))
+                };
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": format!("too many wrong PINs — try again in {human}, or use your recovery phrase"),
+                        "retry_after_secs": seconds,
+                    })),
+                )
+                    .into_response();
+            }
         };
         (status, Json(serde_json::json!({ "error": msg }))).into_response()
     }
@@ -552,6 +588,160 @@ async fn put_backup(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Issue #3: restore tokens live this long — enough for a couple of PIN
+/// attempts, short enough that a stolen token is nearly useless.
+const RESTORE_TOKEN_TTL_SECS: i64 = 600;
+
+fn b64e(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[derive(Deserialize)]
+struct RestoreBeginRequest {
+    phone: String,
+    code: String,
+}
+
+#[derive(Serialize)]
+struct RestoreBeginResponse {
+    restore_token: String,
+    session_token: String,
+    salt_a: String,
+    salt_pa: String,
+}
+
+/// Issue #3, step 1: phone re-verification for restore. Returns the two auth
+/// salts (public by design) plus a short-lived restore token; the bundle
+/// itself is unreachable until `restore_complete` proves the PIN or phrase —
+/// phone OTP alone must never hand a SIM-swapper material to brute-force
+/// offline. Requires a hard `Verified` outcome: a degraded OTP vendor is
+/// good enough to create an account, never to hand one over.
+async fn restore_begin(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RestoreBeginRequest>,
+) -> Result<Json<RestoreBeginResponse>, ApiError> {
+    if !state.config.accounts_enabled {
+        return Err(ApiError::FeatureDisabled);
+    }
+    let (hash, outcome) = verify::verify_phone(
+        state.vendor.as_ref(),
+        &req.phone,
+        &req.code,
+        Pepper(&state.pepper),
+    )
+    .map_err(|e| match e {
+        VerifyError::CodeRejected => ApiError::BadRequest("code rejected"),
+        VerifyError::InvalidPhoneFormat => ApiError::BadRequest("invalid phone"),
+        VerifyError::Hash(_) | VerifyError::Vendor(_) => ApiError::Internal,
+    })?;
+    if !matches!(outcome, VerificationOutcome::Verified) {
+        return Err(ApiError::Unauthorized);
+    }
+    let user_id = state
+        .store
+        .find_user_by_phone_hash(&hash)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+    let (salt_a, salt_pa) = state
+        .store
+        .backup_salts(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+    // The phone is re-verified, so a normal session is fair game too — the
+    // restored client needs one for /username-lookup, pairing, re-upload.
+    let session_token = state.store.create_session(user_id);
+    let restore_token = state
+        .store
+        .create_restore_token(user_id, RESTORE_TOKEN_TTL_SECS);
+    Ok(Json(RestoreBeginResponse {
+        restore_token,
+        session_token,
+        salt_a: b64e(&salt_a),
+        salt_pa: b64e(&salt_pa),
+    }))
+}
+
+#[derive(Deserialize)]
+struct RestoreCompleteRequest {
+    restore_token: String,
+    /// "pin" or "phrase" — which auth hash the proof targets.
+    method: String,
+    /// base64 SHA256(Argon2id(secret, salt)) — see ffi `backup_auth_proof`.
+    auth: String,
+}
+
+#[derive(Serialize)]
+struct RestoreCompleteResponse {
+    blob: String,
+    w_pin: String,
+    salt_p: String,
+    w_phrase: String,
+    salt_f: String,
+    auth_pin: String,
+    salt_a: String,
+    auth_phrase: String,
+    salt_pa: String,
+}
+
+/// Issue #3, step 2: prove the PIN or phrase, get the bundle. Wrong PIN
+/// counts toward the 10-attempt lockout (schedule in store.rs); the phrase
+/// path is never locked. The restore token survives failed attempts and is
+/// consumed exactly once — on success.
+async fn restore_complete(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RestoreCompleteRequest>,
+) -> Result<Json<RestoreCompleteResponse>, ApiError> {
+    if !state.config.accounts_enabled {
+        return Err(ApiError::FeatureDisabled);
+    }
+    let user_id = state
+        .store
+        .restore_token_user(&req.restore_token)
+        .ok_or(ApiError::Unauthorized)?;
+    let is_pin = match req.method.as_str() {
+        "pin" => true,
+        "phrase" => false,
+        _ => return Err(ApiError::BadRequest("method must be \"pin\" or \"phrase\"")),
+    };
+    let auth = base64::engine::general_purpose::STANDARD
+        .decode(&req.auth)
+        .map_err(|_| ApiError::BadRequest("auth must be base64"))?;
+    if auth.len() != 32 {
+        return Err(ApiError::BadRequest("auth must be 32 bytes"));
+    }
+    let verdict = state
+        .store
+        .verify_backup_auth(user_id, &auth, is_pin)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+    match verdict {
+        RestoreVerdict::Match(row) => {
+            state.store.consume_restore_token(&req.restore_token);
+            Ok(Json(RestoreCompleteResponse {
+                blob: b64e(&row.blob),
+                w_pin: b64e(&row.w_pin),
+                salt_p: b64e(&row.salt_p),
+                w_phrase: b64e(&row.w_phrase),
+                salt_f: b64e(&row.salt_f),
+                auth_pin: b64e(&row.auth_pin_hash),
+                salt_a: b64e(&row.salt_a),
+                auth_phrase: b64e(&row.auth_phrase_hash),
+                salt_pa: b64e(&row.salt_pa),
+            }))
+        }
+        RestoreVerdict::WrongPin { remaining } => Err(ApiError::WrongSecret {
+            remaining: Some(remaining),
+        }),
+        RestoreVerdict::WrongPhrase => Err(ApiError::WrongSecret { remaining: None }),
+        RestoreVerdict::Locked { until } => Err(ApiError::Locked {
+            seconds: (until - crate::store::now_unix()).max(1),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,6 +838,183 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    /// Seeds a user with a backup row whose auth hashes are known bytes.
+    /// Returns (phone, pin_auth_b64, phrase_auth_b64).
+    async fn restore_fixture(state: &Arc<AppState>) -> (String, String, String) {
+        let phone = "+15559990001";
+        let hash = crate::verify::phone_hash(phone, Pepper(&state.pepper)).unwrap();
+        let u = state.store.create_pending_user(&hash).await.unwrap();
+        let store_upload = crate::store::BackupUpload {
+            blob: vec![1, 2, 3],
+            w_pin: vec![4; 56],
+            salt_p: vec![5; 16],
+            w_phrase: vec![6; 56],
+            salt_f: vec![7; 16],
+            auth_pin_hash: vec![8; 32],
+            salt_a: vec![9; 16],
+            auth_phrase_hash: vec![10; 32],
+            salt_pa: vec![11; 16],
+        };
+        state.store.upsert_backup(u, &store_upload).await.unwrap();
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        (phone.to_string(), b64(&[8u8; 32]), b64(&[10u8; 32]))
+    }
+
+    #[sqlx::test]
+    async fn restore_flow_hands_out_the_bundle_only_after_pin_proof(pool: PgPool) {
+        let state = state_for(pool);
+        let (phone, pin_auth, _) = restore_fixture(&state).await;
+        let addr = spawn_for_tests(state).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // Begin: OTP verify (dev vendor code 000000) → token + salts, and
+        // crucially NO bundle field in the response.
+        let begin = client
+            .post(format!("http://{addr}/v1/backup/restore/begin"))
+            .json(&serde_json::json!({ "phone": phone, "code": "000000" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(begin.status(), reqwest::StatusCode::OK);
+        let begin: serde_json::Value = begin.json().await.unwrap();
+        let text = begin.to_string();
+        assert!(!text.contains("blob") && !text.contains("w_pin"),
+            "phone OTP alone must never expose bundle material: {text}");
+        let token = begin["restore_token"].as_str().unwrap().to_string();
+
+        // Wrong method string is a 400.
+        let bad = client
+            .post(format!("http://{addr}/v1/backup/restore/complete"))
+            .json(&serde_json::json!({ "restore_token": token, "method": "hunch", "auth": pin_auth }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // Wrong proof → 401 naming remaining attempts; token survives.
+        let wrong_auth = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let wrong = client
+            .post(format!("http://{addr}/v1/backup/restore/complete"))
+            .json(&serde_json::json!({ "restore_token": token, "method": "pin", "auth": wrong_auth }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let wrong: serde_json::Value = wrong.json().await.unwrap();
+        assert_eq!(wrong["remaining_attempts"], 9);
+
+        // Right proof → full bundle; token is consumed by success.
+        let ok = client
+            .post(format!("http://{addr}/v1/backup/restore/complete"))
+            .json(&serde_json::json!({ "restore_token": token, "method": "pin", "auth": pin_auth }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), reqwest::StatusCode::OK);
+        let bundle: serde_json::Value = ok.json().await.unwrap();
+        assert_eq!(
+            bundle["blob"],
+            base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3])
+        );
+        let replay = client
+            .post(format!("http://{addr}/v1/backup/restore/complete"))
+            .json(&serde_json::json!({ "restore_token": token, "method": "pin", "auth": pin_auth }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED, "token is single-use");
+    }
+
+    #[sqlx::test]
+    async fn restore_locks_the_pin_path_but_never_the_phrase_path(pool: PgPool) {
+        let state = state_for(pool);
+        let (phone, pin_auth, phrase_auth) = restore_fixture(&state).await;
+        let addr = spawn_for_tests(state).await.unwrap();
+        let client = reqwest::Client::new();
+        let begin: serde_json::Value = client
+            .post(format!("http://{addr}/v1/backup/restore/begin"))
+            .json(&serde_json::json!({ "phone": phone, "code": "000000" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let token = begin["restore_token"].as_str().unwrap().to_string();
+
+        let wrong_auth = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let mut last_status = reqwest::StatusCode::OK;
+        let mut last_body = serde_json::Value::Null;
+        for _ in 0..10 {
+            let resp = client
+                .post(format!("http://{addr}/v1/backup/restore/complete"))
+                .json(&serde_json::json!({ "restore_token": token, "method": "pin", "auth": wrong_auth }))
+                .send()
+                .await
+                .unwrap();
+            last_status = resp.status();
+            last_body = resp.json().await.unwrap();
+        }
+        assert_eq!(last_status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            last_body["error"].as_str().unwrap().contains("try again in"),
+            "locked response must name the wait: {last_body}"
+        );
+
+        // Right PIN while locked: still refused.
+        let locked = client
+            .post(format!("http://{addr}/v1/backup/restore/complete"))
+            .json(&serde_json::json!({ "restore_token": token, "method": "pin", "auth": pin_auth }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(locked.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+        // Phrase path sails through the lockout.
+        let phrase = client
+            .post(format!("http://{addr}/v1/backup/restore/complete"))
+            .json(&serde_json::json!({ "restore_token": token, "method": "phrase", "auth": phrase_auth }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(phrase.status(), reqwest::StatusCode::OK);
+    }
+
+    #[sqlx::test]
+    async fn restore_begin_404s_without_an_account_or_backup(pool: PgPool) {
+        let state = state_for(pool);
+        // A user with no backup row.
+        let phone = "+15559990002";
+        let hash = crate::verify::phone_hash(phone, Pepper(&state.pepper)).unwrap();
+        state.store.create_pending_user(&hash).await.unwrap();
+        let addr = spawn_for_tests(state).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let no_backup = client
+            .post(format!("http://{addr}/v1/backup/restore/begin"))
+            .json(&serde_json::json!({ "phone": phone, "code": "000000" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_backup.status(), reqwest::StatusCode::NOT_FOUND);
+
+        let no_account = client
+            .post(format!("http://{addr}/v1/backup/restore/begin"))
+            .json(&serde_json::json!({ "phone": "+15550000000", "code": "000000" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_account.status(), reqwest::StatusCode::NOT_FOUND);
+
+        let bad_code = client
+            .post(format!("http://{addr}/v1/backup/restore/begin"))
+            .json(&serde_json::json!({ "phone": phone, "code": "111111" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_code.status(), reqwest::StatusCode::BAD_REQUEST);
     }
 
     #[sqlx::test]
