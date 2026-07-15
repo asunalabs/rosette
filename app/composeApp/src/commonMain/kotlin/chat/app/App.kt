@@ -41,10 +41,12 @@ fun App() {
         val current = session
         val client = remember { DirectoryClient() }
         if (current == null) {
-            // ponytail: enroll = null until #1's persistent engine lands —
-            // then pass a lambda doing backupEnroll + putBackup and the PIN
-            // and phrase steps become mandatory (issue #2 acceptance 1).
-            OnboardingFlow(client, enroll = null) { token, claimedHandle, phone ->
+            // ponytail: enroll/restore = null until #1's persistent engine
+            // lands — then enroll does backupEnroll + putBackup (PIN/phrase
+            // steps become mandatory, issue #2 acceptance 1) and restore
+            // does ChatEngine.newFromBackup + optional backupRewrapPin +
+            // putBackup + session save (issue #3).
+            OnboardingFlow(client, enroll = null, restore = null) { token, claimedHandle, phone ->
                 val newSession = Session(token, claimedHandle, phone)
                 store.save(newSession)
                 session = newSession
