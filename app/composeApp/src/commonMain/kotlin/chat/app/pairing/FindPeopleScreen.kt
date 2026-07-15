@@ -52,6 +52,8 @@ fun FindPeopleScreen(
     session: Session,
     engine: ChatEngine,
     onBack: () -> Unit,
+    /** Issue #2: fired after a successful pairing so the caller can schedule a recovery-bundle re-upload. */
+    onContactAdded: () -> Unit = {},
 ) {
     val palette = LocalChatPalette.current
     var mode by remember { mutableStateOf(LookupMode.Username) }
@@ -69,6 +71,7 @@ fun FindPeopleScreen(
                 } else {
                     engine.pairWithLink(link)
                     status = "Paired with $label."
+                    onContactAdded()
                 }
             } catch (e: DirectoryException) {
                 status = e.message

@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -59,10 +60,31 @@ sealed interface OnboardingState {
     data object PhoneEntry : OnboardingState
     data class AwaitingOtp(val phone: String) : OnboardingState
     data class ClaimUsername(val sessionToken: String, val phone: String) : OnboardingState
+
+    /** Issue #2: mandatory recovery PIN, set right after the username. */
+    data class SetPin(val sessionToken: String, val handle: String, val phone: String) : OnboardingState
+
+    /** Issue #2: one-time display of the 5-word phrase that recovers the PIN. */
+    data class ShowPhrase(
+        val sessionToken: String,
+        val handle: String,
+        val phone: String,
+        val phrase: String,
+    ) : OnboardingState
 }
 
+/**
+ * [enroll] runs the recovery enrollment (engine `backupEnroll` + bundle
+ * upload) and returns the 5-word phrase. Null skips the PIN/phrase steps —
+ * only until #1's persistent engine lands in App.kt; they are mandatory
+ * once it does (issue #2 acceptance 1).
+ */
 @Composable
-fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, handle: String, phone: String) -> Unit) {
+fun OnboardingFlow(
+    client: DirectoryClient,
+    enroll: (suspend (pin: String) -> String)? = null,
+    onComplete: (sessionToken: String, handle: String, phone: String) -> Unit,
+) {
     val palette = LocalChatPalette.current
     var state by remember { mutableStateOf<OnboardingState>(OnboardingState.Welcome) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -114,13 +136,35 @@ fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, h
                     scope.launch {
                         try {
                             val handle = client.claimUsername(s.sessionToken, nickname)
-                            onComplete(s.sessionToken, handle, s.phone)
+                            if (enroll == null) {
+                                onComplete(s.sessionToken, handle, s.phone)
+                            } else {
+                                state = OnboardingState.SetPin(s.sessionToken, handle, s.phone)
+                            }
                         } catch (e: DirectoryException) {
                             error = e.message
                         } finally {
                             loading = false
                         }
                     }
+                }
+                is OnboardingState.SetPin -> PinSetStep(loading) { pin ->
+                    loading = true; error = null
+                    scope.launch {
+                        try {
+                            val phrase = checkNotNull(enroll)(pin)
+                            state = OnboardingState.ShowPhrase(s.sessionToken, s.handle, s.phone, phrase)
+                        } catch (e: Exception) {
+                            // DirectoryException or the engine's own error —
+                            // either way the step stays put and says why.
+                            error = e.message ?: "Couldn't set up recovery."
+                        } finally {
+                            loading = false
+                        }
+                    }
+                }
+                is OnboardingState.ShowPhrase -> RecoveryPhraseStep(s.phrase) {
+                    onComplete(s.sessionToken, s.handle, s.phone)
                 }
             }
         }
@@ -298,5 +342,118 @@ private fun UsernameStep(loading: Boolean, onSubmit: (nickname: String) -> Unit)
             enabled = !loading && nickname.isNotBlank(),
             loading = loading,
         )
+    }
+}
+
+private val PIN_RANGE = 4..6
+
+/**
+ * Issue #2: mandatory recovery PIN — enter then confirm, 4-6 digits, mono
+ * cells like the OTP (a crypto fact per DESIGN.md). The copy says what the
+ * PIN is FOR: account recovery, not an app lock.
+ */
+@Composable
+private fun PinSetStep(loading: Boolean, onSubmit: (pin: String) -> Unit) {
+    val palette = LocalChatPalette.current
+    var pin by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var confirming by remember { mutableStateOf(false) }
+    var mismatch by remember { mutableStateOf(false) }
+    val current = if (confirming) confirm else pin
+    Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(34.dp))
+        StepHeader(
+            headline = if (confirming) "Confirm your PIN" else "Set your PIN",
+            body = "4-6 digits. It's how you recover your account on a new phone — not an app lock.",
+        )
+        Spacer(Modifier.height(28.dp))
+        OtpCells(
+            code = current,
+            onChange = {
+                if (confirming) confirm = it else pin = it
+                mismatch = false
+            },
+        )
+        if (mismatch) {
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "PINs don't match — try again.",
+                color = palette.error,
+                style = MaterialTheme.typography.labelMedium,
+            )
+        }
+        Spacer(Modifier.weight(1f))
+        InstrumentButton(
+            text = when {
+                loading -> "Securing…"
+                confirming -> "Confirm PIN"
+                else -> "Continue"
+            },
+            onClick = {
+                when {
+                    !confirming -> confirming = true
+                    confirm == pin -> onSubmit(pin)
+                    else -> { mismatch = true; confirm = "" }
+                }
+            },
+            enabled = !loading && current.length in PIN_RANGE,
+            loading = loading,
+        )
+    }
+}
+
+/**
+ * Issue #2: the 5 words that recover the PIN, on a tap-to-reveal 16dp card
+ * (DESIGN.md), shown exactly once. A single checkbox gates the CTA — no
+ * forced re-entry.
+ */
+@Composable
+private fun RecoveryPhraseStep(phrase: String, onDone: () -> Unit) {
+    val palette = LocalChatPalette.current
+    var revealed by remember { mutableStateOf(false) }
+    var written by remember { mutableStateOf(false) }
+    Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(34.dp))
+        StepHeader(
+            headline = "Your recovery phrase",
+            body = "If you forget your PIN, these five words are the only way to get back in. Write them down.",
+        )
+        Spacer(Modifier.height(28.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .background(palette.surface)
+                .clickable(enabled = !revealed) { revealed = true }
+                .padding(vertical = 24.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (!revealed) {
+                Text("Tap to reveal", style = MaterialTheme.typography.labelLarge, color = palette.muted)
+            } else {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    phrase.split(" ").forEach { word ->
+                        Text(word, style = ChatMonoStyle.copy(fontSize = 20.sp), color = palette.ink)
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(20.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.clickable(enabled = revealed) { written = !written },
+        ) {
+            Checkbox(checked = written, onCheckedChange = { written = it }, enabled = revealed)
+            Text(
+                "I wrote them down",
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (revealed) palette.ink else palette.muted,
+            )
+        }
+        Spacer(Modifier.weight(1f))
+        InstrumentButton("Continue", onClick = onDone, enabled = written)
     }
 }

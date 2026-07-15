@@ -8,10 +8,12 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import chat.app.chatlist.ChatListScreen
 import chat.app.chatlist.ConversationScreen
+import chat.app.directory.BackupUploader
 import chat.app.directory.DirectoryClient
 import chat.app.directory.DirectoryException
 import chat.app.onboarding.OnboardingFlow
@@ -39,7 +41,10 @@ fun App() {
         val current = session
         val client = remember { DirectoryClient() }
         if (current == null) {
-            OnboardingFlow(client) { token, claimedHandle, phone ->
+            // ponytail: enroll = null until #1's persistent engine lands —
+            // then pass a lambda doing backupEnroll + putBackup and the PIN
+            // and phrase steps become mandatory (issue #2 acceptance 1).
+            OnboardingFlow(client, enroll = null) { token, claimedHandle, phone ->
                 val newSession = Session(token, claimedHandle, phone)
                 store.save(newSession)
                 session = newSession
@@ -60,6 +65,10 @@ private fun EngineScreen(client: DirectoryClient, session: Session) {
     val engine = remember { ChatEngine(session.handle) }
     var tab by remember { mutableStateOf(Tab.Chats) }
     var openConversation by remember { mutableStateOf<Conversation?>(null) }
+    val scope = rememberCoroutineScope()
+    // Issue #2: one debounced recovery-bundle re-upload per contact change.
+    // Inert until backupEnroll has run on a persistent engine.
+    val backupUploader = remember { BackupUploader(scope, engine, client, session.sessionToken) }
 
     // T25: best-effort — publish a fresh one-time pairing bootstrap so a
     // directory search hit can find and pair with this device. Silently
@@ -85,7 +94,13 @@ private fun EngineScreen(client: DirectoryClient, session: Session) {
         Column(modifier = Modifier.weight(1f)) {
             when (tab) {
                 Tab.Chats -> ChatListScreen(engine = engine, onOpenConversation = { openConversation = it })
-                Tab.FindPeople -> FindPeopleScreen(client, session, engine, onBack = { tab = Tab.Chats })
+                Tab.FindPeople -> FindPeopleScreen(
+                    client,
+                    session,
+                    engine,
+                    onBack = { tab = Tab.Chats },
+                    onContactAdded = { backupUploader.schedule() },
+                )
             }
         }
         InstrumentTabBar(

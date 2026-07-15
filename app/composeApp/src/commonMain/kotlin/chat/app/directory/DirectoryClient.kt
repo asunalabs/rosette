@@ -6,10 +6,12 @@ import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.ClientRequestException
 import io.ktor.client.plugins.ServerResponseException
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import chat.engine.BackupBundle
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
 import io.ktor.client.request.parameter
 import io.ktor.client.request.post
+import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.http.ContentType
@@ -57,6 +59,19 @@ private data class SearchResponse(val results: List<SearchResultDto>)
 
 @Serializable
 private data class SearchResultDto(val user_id: Long, val handle: String, val search_hash: String)
+
+@Serializable
+private data class BackupPutRequest(
+    val blob: String,
+    val w_pin: String,
+    val salt_p: String,
+    val w_phrase: String,
+    val salt_f: String,
+    val auth_pin: String,
+    val salt_a: String,
+    val auth_phrase: String,
+    val salt_pa: String,
+)
 
 @Serializable
 private data class PairingBootstrapRequest(val contact_link_b64: String)
@@ -146,6 +161,31 @@ class DirectoryClient(baseUrl: String = defaultDirectoryBaseUrl()) {
             parameter("prefix", prefix)
         } }.body()
         return res.results.map { SearchResult(it.user_id, it.handle, it.search_hash) }
+    }
+
+    /**
+     * PUT /v1/backup — upload the E2E-encrypted recovery bundle (issue #2).
+     * Every field is ciphertext, a salt, or an auth hash straight from the
+     * engine's `BackupBundle`; the server can never read the blob.
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    suspend fun putBackup(sessionToken: String, bundle: BackupBundle) {
+        val b64 = kotlin.io.encoding.Base64.Default
+        call { http.put("$baseUrl/v1/backup") {
+            bearerAuth(sessionToken)
+            contentType(ContentType.Application.Json)
+            setBody(BackupPutRequest(
+                blob = b64.encode(bundle.blob),
+                w_pin = b64.encode(bundle.wPin),
+                salt_p = b64.encode(bundle.saltP),
+                w_phrase = b64.encode(bundle.wPhrase),
+                salt_f = b64.encode(bundle.saltF),
+                auth_pin = b64.encode(bundle.authPin),
+                salt_a = b64.encode(bundle.saltA),
+                auth_phrase = b64.encode(bundle.authPhrase),
+                salt_pa = b64.encode(bundle.saltPa),
+            ))
+        } }
     }
 
     /** POST /pairing-bootstrap — publish (or replenish) this account's one-time contact link for search-initiated pairing. */
