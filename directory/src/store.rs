@@ -62,11 +62,15 @@ pub struct BackupRow {
 pub enum RestoreVerdict {
     Match(Box<BackupRow>),
     /// Wrong PIN; `remaining` counts attempts left before the next lockout.
-    WrongPin { remaining: i32 },
+    WrongPin {
+        remaining: i32,
+    },
     WrongPhrase,
     /// PIN path locked out until this unix time. The phrase path is never
     /// locked (64.6-bit space; the OTP gate rate-limits it).
-    Locked { until: i64 },
+    Locked {
+        until: i64,
+    },
 }
 
 /// Lockout schedule after every 10th wrong PIN: 1h, 4h, then 24h repeating.
@@ -758,10 +762,7 @@ mod tests {
             store.find_user_by_handle("carol", slot + 1).await.unwrap(),
             None
         );
-        assert_eq!(
-            store.find_user_by_handle("nobody", 1).await.unwrap(),
-            None
-        );
+        assert_eq!(store.find_user_by_handle("nobody", 1).await.unwrap(), None);
     }
 
     #[sqlx::test]
@@ -794,24 +795,25 @@ mod tests {
         store.upsert_backup(u, &backup_upload()).await.unwrap();
 
         // Simulate a lockout in progress; a fresh upload must clear it.
-        sqlx::query("UPDATE backups SET pin_attempts = 7, locked_until = 9999999999 WHERE user_id = $1")
-            .bind(u as i64)
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE backups SET pin_attempts = 7, locked_until = 9999999999 WHERE user_id = $1",
+        )
+        .bind(u as i64)
+        .execute(&store.pool)
+        .await
+        .unwrap();
         let replacement = BackupUpload {
             blob: vec![42],
             ..backup_upload()
         };
         store.upsert_backup(u, &replacement).await.unwrap();
 
-        let row = sqlx::query(
-            "SELECT blob, pin_attempts, locked_until FROM backups WHERE user_id = $1",
-        )
-        .bind(u as i64)
-        .fetch_one(&store.pool)
-        .await
-        .unwrap();
+        let row =
+            sqlx::query("SELECT blob, pin_attempts, locked_until FROM backups WHERE user_id = $1")
+                .bind(u as i64)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
         assert_eq!(row.get::<Vec<u8>, _>("blob"), vec![42]);
         assert_eq!(row.get::<i32, _>("pin_attempts"), 0);
         assert_eq!(row.get::<Option<i64>, _>("locked_until"), None);
@@ -836,7 +838,10 @@ mod tests {
             Some(RestoreVerdict::Locked { until }) => until,
             _ => panic!("10th wrong attempt must lock"),
         };
-        assert!(until > now_unix() + 3500 && until <= now_unix() + 3700, "first lockout is 1h");
+        assert!(
+            until > now_unix() + 3500 && until <= now_unix() + 3700,
+            "first lockout is 1h"
+        );
 
         // Even the RIGHT pin is refused while locked.
         assert!(matches!(
@@ -845,7 +850,10 @@ mod tests {
         ));
         // The phrase path is never locked, and success resets the counter.
         assert!(matches!(
-            store.verify_backup_auth(u, &right_phrase, false).await.unwrap(),
+            store
+                .verify_backup_auth(u, &right_phrase, false)
+                .await
+                .unwrap(),
             Some(RestoreVerdict::Match(_))
         ));
         assert!(matches!(
@@ -865,7 +873,11 @@ mod tests {
         assert_eq!(store.restore_token_user(&token), None, "single-use");
 
         let expired = store.create_restore_token(u, -1);
-        assert_eq!(store.restore_token_user(&expired), None, "expired tokens are dead");
+        assert_eq!(
+            store.restore_token_user(&expired),
+            None,
+            "expired tokens are dead"
+        );
     }
 
     #[sqlx::test]

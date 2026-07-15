@@ -347,10 +347,11 @@ impl ChatEngine {
         db_path: String,
         db_key: String,
     ) -> Result<Arc<Self>, EngineError> {
-        let disk =
-            DiskStore::open(Path::new(&db_path), &db_key).map_err(|e| EngineError::StorageFailed {
+        let disk = DiskStore::open(Path::new(&db_path), &db_key).map_err(|e| {
+            EngineError::StorageFailed {
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
         let map_err = |e: chatcore::StoreError| EngineError::StorageFailed {
             reason: e.to_string(),
         };
@@ -442,8 +443,7 @@ impl ChatEngine {
         }
         let ui_blob =
             bincode::serialize(&(&ui_state, 1u64)).expect("ui state is always serializable");
-        let bundle_bytes =
-            bincode::serialize(&core_bundle).expect("bundle is always serializable");
+        let bundle_bytes = bincode::serialize(&core_bundle).expect("bundle is always serializable");
 
         let mut kv: Vec<(&str, &[u8])> = vec![
             ("backup.bk", &bk[..]),
@@ -876,8 +876,8 @@ impl ChatEngine {
         else {
             return Ok(false);
         };
-        let bundle: chatcore::backup::BackupBundle = bincode::deserialize(&bundle_bytes)
-            .map_err(|e| EngineError::StorageFailed {
+        let bundle: chatcore::backup::BackupBundle =
+            bincode::deserialize(&bundle_bytes).map_err(|e| EngineError::StorageFailed {
                 reason: e.to_string(),
             })?;
         let ok = if chatcore::backup::validate_pin(&secret) {
@@ -1257,10 +1257,12 @@ mod tests {
         let bundle = engine.backup_bundle_current().unwrap().expect("enrolled");
         let bk = chatcore::backup::unwrap_bk("123456", &bundle.salt_p, &bundle.w_pin).unwrap();
         let payload: chatcore::backup::BackupPayload =
-            bincode::deserialize(&chatcore::backup::open_blob(&bk, &bundle.blob).unwrap())
-                .unwrap();
+            bincode::deserialize(&chatcore::backup::open_blob(&bk, &bundle.blob).unwrap()).unwrap();
         assert_eq!(payload.username.as_deref(), Some("bob#01"));
-        assert!(payload.identity.is_none(), "no session exists before first connect");
+        assert!(
+            payload.identity.is_none(),
+            "no session exists before first connect"
+        );
 
         // Phrase path recovers the same BK.
         assert_eq!(
@@ -1274,8 +1276,8 @@ mod tests {
     fn restore_roundtrips_and_wrong_secret_leaves_no_db() {
         let dir = tempfile::tempdir().unwrap();
         let path_a = dir.path().join("a.db").to_string_lossy().into_owned();
-        let a = ChatEngine::new_persistent("mira#04".to_string(), path_a, "ka".to_string())
-            .unwrap();
+        let a =
+            ChatEngine::new_persistent("mira#04".to_string(), path_a, "ka".to_string()).unwrap();
         let enrollment = a.backup_enroll("4321".to_string()).unwrap();
 
         // Wrong secret: typed error, no file left behind.
@@ -1344,12 +1346,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.db").to_string_lossy().into_owned();
         let e = ChatEngine::new_persistent("ann#09".to_string(), path, "k".to_string()).unwrap();
-        assert!(!e.backup_verify_secret("1234".to_string()).unwrap(), "not enrolled yet");
+        assert!(
+            !e.backup_verify_secret("1234".to_string()).unwrap(),
+            "not enrolled yet"
+        );
         let enrollment = e.backup_enroll("1234".to_string()).unwrap();
         assert!(e.backup_verify_secret("1234".to_string()).unwrap());
         assert!(!e.backup_verify_secret("1235".to_string()).unwrap());
-        assert!(e.backup_verify_secret(format!(" {} ", enrollment.phrase.to_uppercase())).unwrap());
-        assert!(!ChatEngine::new("x".to_string()).backup_verify_secret("1234".to_string()).unwrap());
+        assert!(e
+            .backup_verify_secret(format!(" {} ", enrollment.phrase.to_uppercase()))
+            .unwrap());
+        assert!(!ChatEngine::new("x".to_string())
+            .backup_verify_secret("1234".to_string())
+            .unwrap());
     }
 
     #[test]

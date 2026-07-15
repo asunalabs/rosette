@@ -41,7 +41,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/account", delete(delete_account))
         .route("/search", get(search))
         .route("/pairing-bootstrap", post(set_pairing_bootstrap))
-        .route("/pairing-bootstrap/request", post(request_pairing_bootstrap))
+        .route(
+            "/pairing-bootstrap/request",
+            post(request_pairing_bootstrap),
+        )
         .route("/v1/backup", put(put_backup))
         .route("/v1/backup/restore/begin", post(restore_begin))
         .route("/v1/backup/restore/complete", post(restore_complete))
@@ -84,9 +87,13 @@ enum ApiError {
     Internal,
     /// Issue #3: wrong restore secret. The message carries the remaining
     /// attempts (PIN path) so the client can show it verbatim.
-    WrongSecret { remaining: Option<i32> },
+    WrongSecret {
+        remaining: Option<i32>,
+    },
     /// Issue #3: PIN path locked out; the message names the wait verbatim.
-    Locked { seconds: i64 },
+    Locked {
+        seconds: i64,
+    },
 }
 
 impl IntoResponse for ApiError {
@@ -568,9 +575,14 @@ async fn put_backup(
         auth_phrase_hash: b64(&req.auth_phrase)?,
         salt_pa: b64(&req.salt_pa)?,
     };
-    if [&upload.salt_p, &upload.salt_f, &upload.salt_a, &upload.salt_pa]
-        .iter()
-        .any(|s| s.len() != 16)
+    if [
+        &upload.salt_p,
+        &upload.salt_f,
+        &upload.salt_a,
+        &upload.salt_pa,
+    ]
+    .iter()
+    .any(|s| s.len() != 16)
     {
         return Err(ApiError::BadRequest("salts must be 16 bytes"));
     }
@@ -762,8 +774,7 @@ mod tests {
     }
 
     fn backup_body() -> serde_json::Value {
-        let b64 =
-            |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
         serde_json::json!({
             "blob": b64(&[1, 2, 3]),
             "w_pin": b64(&[4; 56]),
@@ -793,7 +804,11 @@ mod tests {
     #[sqlx::test]
     async fn backup_put_upserts_own_row_and_rejects_malformed_fields(pool: PgPool) {
         let state = state_for(pool);
-        let u = state.store.create_pending_user("backup-hash").await.unwrap();
+        let u = state
+            .store
+            .create_pending_user("backup-hash")
+            .await
+            .unwrap();
         let token = state.store.create_session(u);
         let addr = spawn_for_tests(state).await.unwrap();
         let client = reqwest::Client::new();
@@ -880,14 +895,18 @@ mod tests {
         assert_eq!(begin.status(), reqwest::StatusCode::OK);
         let begin: serde_json::Value = begin.json().await.unwrap();
         let text = begin.to_string();
-        assert!(!text.contains("blob") && !text.contains("w_pin"),
-            "phone OTP alone must never expose bundle material: {text}");
+        assert!(
+            !text.contains("blob") && !text.contains("w_pin"),
+            "phone OTP alone must never expose bundle material: {text}"
+        );
         let token = begin["restore_token"].as_str().unwrap().to_string();
 
         // Wrong method string is a 400.
         let bad = client
             .post(format!("http://{addr}/v1/backup/restore/complete"))
-            .json(&serde_json::json!({ "restore_token": token, "method": "hunch", "auth": pin_auth }))
+            .json(
+                &serde_json::json!({ "restore_token": token, "method": "hunch", "auth": pin_auth }),
+            )
             .send()
             .await
             .unwrap();
@@ -897,7 +916,9 @@ mod tests {
         let wrong_auth = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
         let wrong = client
             .post(format!("http://{addr}/v1/backup/restore/complete"))
-            .json(&serde_json::json!({ "restore_token": token, "method": "pin", "auth": wrong_auth }))
+            .json(
+                &serde_json::json!({ "restore_token": token, "method": "pin", "auth": wrong_auth }),
+            )
             .send()
             .await
             .unwrap();
@@ -924,7 +945,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED, "token is single-use");
+        assert_eq!(
+            replay.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "token is single-use"
+        );
     }
 
     #[sqlx::test]
@@ -959,7 +984,10 @@ mod tests {
         }
         assert_eq!(last_status, reqwest::StatusCode::TOO_MANY_REQUESTS);
         assert!(
-            last_body["error"].as_str().unwrap().contains("try again in"),
+            last_body["error"]
+                .as_str()
+                .unwrap()
+                .contains("try again in"),
             "locked response must name the wait: {last_body}"
         );
 
@@ -1020,12 +1048,28 @@ mod tests {
     #[sqlx::test]
     async fn pairing_bootstrap_is_consumed_exactly_once(pool: PgPool) {
         let state = state_for(pool);
-        let target = state.store.create_pending_user("target-hash-0").await.unwrap();
-        state.store.claim_username(target, "pairtarget").await.unwrap();
-        state.store.set_searchable(target, true, Some(&"a".repeat(64))).await.unwrap();
+        let target = state
+            .store
+            .create_pending_user("target-hash-0")
+            .await
+            .unwrap();
+        state
+            .store
+            .claim_username(target, "pairtarget")
+            .await
+            .unwrap();
+        state
+            .store
+            .set_searchable(target, true, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
         let target_token = state.store.create_session(target);
 
-        let requester = state.store.create_pending_user("requester-hash-0").await.unwrap();
+        let requester = state
+            .store
+            .create_pending_user("requester-hash-0")
+            .await
+            .unwrap();
         let requester_token = state.store.create_session(requester);
 
         let addr = spawn_for_tests(state).await.unwrap();
@@ -1033,7 +1077,9 @@ mod tests {
 
         // No bootstrap uploaded yet: a request finds nothing.
         let miss = client
-            .post(format!("http://{addr}/pairing-bootstrap/request?user_id={target}"))
+            .post(format!(
+                "http://{addr}/pairing-bootstrap/request?user_id={target}"
+            ))
             .header("Authorization", format!("Bearer {requester_token}"))
             .send()
             .await
@@ -1052,7 +1098,9 @@ mod tests {
 
         // First request succeeds and returns exactly what was uploaded.
         let first = client
-            .post(format!("http://{addr}/pairing-bootstrap/request?user_id={target}"))
+            .post(format!(
+                "http://{addr}/pairing-bootstrap/request?user_id={target}"
+            ))
             .header("Authorization", format!("Bearer {requester_token}"))
             .send()
             .await
@@ -1063,7 +1111,9 @@ mod tests {
 
         // A second request for the same target finds nothing: one-time use.
         let second = client
-            .post(format!("http://{addr}/pairing-bootstrap/request?user_id={target}"))
+            .post(format!(
+                "http://{addr}/pairing-bootstrap/request?user_id={target}"
+            ))
             .header("Authorization", format!("Bearer {requester_token}"))
             .send()
             .await
@@ -1074,7 +1124,11 @@ mod tests {
     #[sqlx::test]
     async fn pairing_bootstrap_unreachable_for_a_non_searchable_target(pool: PgPool) {
         let state = state_for(pool);
-        let target = state.store.create_pending_user("target-hash-1").await.unwrap();
+        let target = state
+            .store
+            .create_pending_user("target-hash-1")
+            .await
+            .unwrap();
         // Never calls set_searchable(true) — stays private.
         state
             .store
@@ -1082,12 +1136,18 @@ mod tests {
             .await
             .unwrap();
 
-        let requester = state.store.create_pending_user("requester-hash-1").await.unwrap();
+        let requester = state
+            .store
+            .create_pending_user("requester-hash-1")
+            .await
+            .unwrap();
         let requester_token = state.store.create_session(requester);
 
         let addr = spawn_for_tests(state).await.unwrap();
         let resp = reqwest::Client::new()
-            .post(format!("http://{addr}/pairing-bootstrap/request?user_id={target}"))
+            .post(format!(
+                "http://{addr}/pairing-bootstrap/request?user_id={target}"
+            ))
             .header("Authorization", format!("Bearer {requester_token}"))
             .send()
             .await
@@ -1098,8 +1158,16 @@ mod tests {
     #[sqlx::test]
     async fn erasing_a_user_deletes_their_pairing_bootstrap(pool: PgPool) {
         let state = state_for(pool);
-        let target = state.store.create_pending_user("target-hash-2").await.unwrap();
-        state.store.set_searchable(target, true, Some(&"a".repeat(64))).await.unwrap();
+        let target = state
+            .store
+            .create_pending_user("target-hash-2")
+            .await
+            .unwrap();
+        state
+            .store
+            .set_searchable(target, true, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
         state
             .store
             .set_pairing_bootstrap(target, "opaque-link-bytes")
@@ -1264,9 +1332,21 @@ mod tests {
     #[sqlx::test]
     async fn username_lookup_finds_a_claimed_handle_and_404s_for_an_unknown_one(pool: PgPool) {
         let state = state_for(pool);
-        let target = state.store.create_pending_user("lookup-hash").await.unwrap();
-        let (slot, _width) = state.store.claim_username(target, "findbyname").await.unwrap();
-        let requester = state.store.create_pending_user("requester-hash").await.unwrap();
+        let target = state
+            .store
+            .create_pending_user("lookup-hash")
+            .await
+            .unwrap();
+        let (slot, _width) = state
+            .store
+            .claim_username(target, "findbyname")
+            .await
+            .unwrap();
+        let requester = state
+            .store
+            .create_pending_user("requester-hash")
+            .await
+            .unwrap();
         let token = state.store.create_session(requester);
 
         let addr = spawn_for_tests(state).await.unwrap();

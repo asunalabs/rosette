@@ -104,8 +104,14 @@ fn stripped_snapshot_restores_as_an_unpaired_session_with_a_working_identity() {
     alice.create_group().unwrap();
     let full = alice.snapshot().unwrap();
     let stripped = chatcore::strip_snapshot_to_identity(&full).unwrap();
-    assert!(stripped.len() < full.len(), "strip must actually drop state");
+    assert!(
+        stripped.len() < full.len(),
+        "strip must actually drop state"
+    );
     let restored = ChatSession::restore(&stripped).unwrap();
-    assert!(restored.epoch().is_err(), "group must not survive the strip");
+    assert!(
+        restored.epoch().is_err(),
+        "group must not survive the strip"
+    );
     restored.generate_key_package().unwrap();
 }

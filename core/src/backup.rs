@@ -96,8 +96,7 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 
 /// Argon2id, spec params: m=64MiB t=3 p=4, 32-byte output.
 fn derive(secret: &[u8], salt: &[u8]) -> [u8; BK_LEN] {
-    let params =
-        Params::new(64 * 1024, 3, 4, Some(BK_LEN)).expect("fixed Argon2 params are valid");
+    let params = Params::new(64 * 1024, 3, 4, Some(BK_LEN)).expect("fixed Argon2 params are valid");
     let mut out = [0u8; BK_LEN];
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
         .hash_password_into(secret, salt, &mut out)
@@ -191,8 +190,13 @@ mod tests {
 
     fn bundle() -> ([u8; BK_LEN], BackupBundle) {
         let bk = random_bytes::<BK_LEN>();
-        let b = build_bundle("1234", "correct horse battery staple extra", &bk, b"payload")
-            .unwrap();
+        let b = build_bundle(
+            "1234",
+            "correct horse battery staple extra",
+            &bk,
+            b"payload",
+        )
+        .unwrap();
         (bk, b)
     }
 
@@ -217,7 +221,11 @@ mod tests {
         for w in drawn {
             assert!(words.contains(w), "{w} is not on the wordlist");
         }
-        assert_ne!(generate_phrase(), generate_phrase(), "phrases must not repeat");
+        assert_ne!(
+            generate_phrase(),
+            generate_phrase(),
+            "phrases must not repeat"
+        );
     }
 
     #[test]
@@ -250,7 +258,10 @@ mod tests {
             "blob must be ciphertext, not plaintext"
         );
         let other = random_bytes::<BK_LEN>();
-        assert!(matches!(open_blob(&other, &b.blob), Err(BackupError::WrongSecret)));
+        assert!(matches!(
+            open_blob(&other, &b.blob),
+            Err(BackupError::WrongSecret)
+        ));
     }
 
     #[test]

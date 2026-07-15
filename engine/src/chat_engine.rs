@@ -168,9 +168,7 @@ impl ChatEngine {
         let seen = store
             .seen_ids()?
             .into_iter()
-            .map(|v| {
-                MessageId::try_from(v.as_slice()).map_err(|_| anyhow!("corrupt seen-id row"))
-            })
+            .map(|v| MessageId::try_from(v.as_slice()).map_err(|_| anyhow!("corrupt seen-id row")))
             .collect::<anyhow::Result<HashSet<_>>>()?;
         let relay = RelayClient::connect(&rec.relay_addr, rec.relay_fingerprint).await?;
         relay.subscribe(vec![rec.mailbox_qid]).await?;
