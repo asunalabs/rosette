@@ -80,8 +80,8 @@ fn persistent_engine_resumes_with_history_and_backlog() {
     let db_path = dir.path().join("bob.db").to_str().unwrap().to_string();
 
     // First life: pair and exchange a message.
-    let bob = ChatEngine::new_persistent("bob".to_string(), db_path.clone(), "bob's key".into())
-        .unwrap();
+    let bob =
+        ChatEngine::new_persistent("bob".to_string(), db_path.clone(), "bob's key".into()).unwrap();
     let bob_events: Arc<Mutex<Vec<EngineEvent>>> = Arc::default();
     bob.set_listener(Box::new(Collector {
         events: bob_events.clone(),
@@ -109,8 +109,8 @@ fn persistent_engine_resumes_with_history_and_backlog() {
 
     // Second life: resumed from disk. Conversation list and history are
     // available synchronously, before any network round-trip.
-    let bob = ChatEngine::new_persistent("bob".to_string(), db_path.clone(), "bob's key".into())
-        .unwrap();
+    let bob =
+        ChatEngine::new_persistent("bob".to_string(), db_path.clone(), "bob's key".into()).unwrap();
     let convs = bob.conversations();
     assert_eq!(convs.len(), 1, "resumed conversation list must be loaded");
     assert_eq!(convs[0].display_name, "alice");
@@ -135,7 +135,8 @@ fn persistent_engine_resumes_with_history_and_backlog() {
     alice.set_listener(Box::new(Collector {
         events: alice_events.clone(),
     }));
-    bob.send(bob_conv, "back from the dead".to_string()).unwrap();
+    bob.send(bob_conv, "back from the dead".to_string())
+        .unwrap();
     wait_for_message(&alice_events, "back from the dead");
 }
 
