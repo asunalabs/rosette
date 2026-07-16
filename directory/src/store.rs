@@ -523,10 +523,7 @@ mod tests {
             store.find_user_by_handle("carol", slot + 1).await.unwrap(),
             None
         );
-        assert_eq!(
-            store.find_user_by_handle("nobody", 1).await.unwrap(),
-            None
-        );
+        assert_eq!(store.find_user_by_handle("nobody", 1).await.unwrap(), None);
     }
 
     #[sqlx::test]

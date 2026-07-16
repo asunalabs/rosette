@@ -268,10 +268,11 @@ impl ChatEngine {
         db_path: String,
         db_key: String,
     ) -> Result<Arc<Self>, EngineError> {
-        let disk =
-            DiskStore::open(Path::new(&db_path), &db_key).map_err(|e| EngineError::StorageFailed {
+        let disk = DiskStore::open(Path::new(&db_path), &db_key).map_err(|e| {
+            EngineError::StorageFailed {
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
         let map_err = |e: chatcore::StoreError| EngineError::StorageFailed {
             reason: e.to_string(),
         };
