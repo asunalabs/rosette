@@ -214,6 +214,34 @@ async fn verify_handler(
         VerifyError::Hash(_) | VerifyError::Vendor(_) => ApiError::Internal,
     })?;
 
+    // ET14: `/verify` is the *second* endpoint that creates users, so it owes
+    // the same OQ5 cooldown check `/signup` does (`is_phone_in_cooldown` at the
+    // top of `signup`). Without it: sign up -> `DELETE /account` (cooldown
+    // starts, `users.phone_hash` is scrubbed but `phone_cooldown` keeps it) ->
+    // `POST /verify` with the still-valid code -> the find below misses the
+    // erased row -> `create_pending_user` mints a fresh *verified* account for
+    // a number that is supposed to be locked for 24h. Checked after
+    // `verify_phone` because the hash is what `phone_cooldown` is keyed on, and
+    // only an approved code gets us one.
+    // ET14: `/verify` is the *second* endpoint that creates users, so it owes
+    // the same OQ5 cooldown check `/signup` does (`is_phone_in_cooldown` at the
+    // top of `signup`). Without it: sign up -> `DELETE /account` (cooldown
+    // starts, `users.phone_hash` is scrubbed but `phone_cooldown` keeps it) ->
+    // `POST /verify` with the still-valid code -> the find below misses the
+    // erased row -> `create_pending_user` mints a fresh *verified* account for
+    // a number that is supposed to be locked for 24h. Checked after
+    // `verify_phone` because the hash is what `phone_cooldown` is keyed on, and
+    // only an approved code gets us one.
+    if state
+        .store
+        .is_phone_in_cooldown(&hash)
+        .await
+        .map_err(|_| ApiError::Internal)?
+    {
+        return Err(ApiError::BadRequest(
+            "phone number is in cooldown after a recent deletion",
+        ));
+    }
     let user_id = match state
         .store
         .find_user_by_phone_hash(&hash)

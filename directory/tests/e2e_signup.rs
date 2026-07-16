@@ -171,6 +171,66 @@ async fn vendor_outage_makes_signup_fail_closed_with_503(pool: PgPool) {
     );
 }
 
+/// ET14, the attacker's view: `/verify` is the second endpoint that creates
+/// users, and it never checked OQ5's post-deletion cooldown — only `/signup`
+/// did. So the 24h lock was one HTTP call wide: erase, then re-verify with the
+/// code you already hold. The erased row no longer matches the hash, so the
+/// find-or-create fell through to `create_pending_user` and minted a fresh
+/// *verified* account for a number that is supposed to be untouchable.
+#[sqlx::test]
+async fn an_erased_number_cannot_be_reclaimed_through_verify_during_cooldown(pool: PgPool) {
+    let state = state_with_vendor(pool, Arc::new(DevOtpVendor));
+    let addr = directory::spawn_for_tests(state).await.unwrap();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let phone = "+15559990004";
+    client
+        .post(format!("{base}/signup"))
+        .json(&serde_json::json!({ "phone": phone }))
+        .send()
+        .await
+        .unwrap();
+    let verify = client
+        .post(format!("{base}/verify"))
+        .json(&serde_json::json!({ "phone": phone, "code": DEV_OTP_CODE }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(verify.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = verify.json().await.unwrap();
+    let token = body["session_token"].as_str().unwrap().to_string();
+
+    // Erase: starts the cooldown and scrubs `users.phone_hash` — but
+    // `phone_cooldown` keeps the hash, which is what makes the lock checkable.
+    let erased = client
+        .delete(format!("{base}/account"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(erased.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // The attack. No new /signup — that endpoint would have refused. Straight
+    // to /verify with the code from before the erasure.
+    let reclaim = client
+        .post(format!("{base}/verify"))
+        .json(&serde_json::json!({ "phone": phone, "code": DEV_OTP_CODE }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        reclaim.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "an erased number is locked for 24h — /verify must not re-mint it"
+    );
+    let body: serde_json::Value = reclaim.json().await.unwrap();
+    assert!(
+        body.get("session_token").is_none(),
+        "a refused reclaim must carry no session material, got: {body}"
+    );
+}
+
 /// ARCH-5, the attacker's view: during a vendor outage, an unauthenticated
 /// POST /verify carrying a *victim's* number and an arbitrary code used to
 /// return a session token bound to that victim (account erasure and an MLS
