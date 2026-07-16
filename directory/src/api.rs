@@ -19,7 +19,7 @@ use crate::ratelimit::{RateLimiter, UNVERIFIED_SEARCH_PER_MINUTE, VERIFIED_SEARC
 use crate::search::{search_by_prefix, PREFIX_LEN_HEX};
 use crate::store::{ClaimError, DirectoryStore};
 use crate::username::format_handle;
-use crate::verify::{self, OtpVendor, Pepper, VerificationOutcome, VerifyError};
+use crate::verify::{self, OtpVendor, Pepper, VerifyError};
 
 pub struct AppState {
     pub store: Arc<DirectoryStore>,
@@ -75,6 +75,9 @@ enum ApiError {
     BadRequest(&'static str),
     Unauthorized,
     FeatureDisabled,
+    /// The OTP vendor didn't answer, so the code went unchecked. Distinct
+    /// from `Internal`: it's transient and the client should offer a retry.
+    VendorUnavailable,
     RateLimited,
     NotFound,
     Internal,
@@ -86,6 +89,10 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             ApiError::FeatureDisabled => (StatusCode::SERVICE_UNAVAILABLE, "feature disabled"),
+            ApiError::VendorUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "verification temporarily unavailable",
+            ),
             ApiError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate limited"),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found"),
             ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
@@ -183,7 +190,10 @@ async fn verify_handler(
     if !state.config.accounts_enabled {
         return Err(ApiError::FeatureDisabled);
     }
-    let (hash, outcome) = verify::verify_phone(
+    // `verify_phone` returning Ok IS the verification — a vendor timeout is a
+    // 503 here, never a session (ARCH-5). Everything below this line is
+    // reachable only for a code the vendor affirmatively approved.
+    let hash = verify::verify_phone(
         state.vendor.as_ref(),
         &req.phone,
         &req.code,
@@ -192,6 +202,7 @@ async fn verify_handler(
     .map_err(|e| match e {
         VerifyError::CodeRejected => ApiError::BadRequest("code rejected"),
         VerifyError::InvalidPhoneFormat => ApiError::BadRequest("invalid phone"),
+        VerifyError::VendorUnavailable => ApiError::VendorUnavailable,
         VerifyError::Hash(_) | VerifyError::Vendor(_) => ApiError::Internal,
     })?;
 
@@ -208,17 +219,19 @@ async fn verify_handler(
             .await
             .map_err(|_| ApiError::Internal)?,
     };
-    let verified = matches!(outcome, VerificationOutcome::Verified);
     state
         .store
-        .mark_verified(user_id, verified)
+        .mark_verified(user_id)
         .await
         .map_err(|_| ApiError::Internal)?;
     let session_token = state.store.create_session(user_id);
+    // Always true now that this is the only path that reaches `create_session`.
+    // Kept on the wire so the client's `nextAfterVerify` gate stays live as
+    // defense-in-depth against a future server regression (founder decision).
     Ok(Json(VerifyResponse {
         user_id,
         session_token,
-        verified,
+        verified: true,
     }))
 }
 

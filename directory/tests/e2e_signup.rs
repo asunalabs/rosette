@@ -1,7 +1,7 @@
 //! T13: signup -> OTP -> username claim -> findable-by-search, end to end
 //! over real HTTP against a real (ephemeral, per-test) Postgres DB. Also
-//! covers the T2 soft-gate path: a degraded (vendor-timeout) account must
-//! NOT become findable.
+//! covers ET6/ARCH-5: a vendor timeout must mint no session at all (it used
+//! to soft-gate into a "degraded" one, which was an auth bypass).
 
 use std::sync::Arc;
 
@@ -112,8 +112,13 @@ impl OtpVendor for AlwaysTimeoutVendor {
     }
 }
 
+/// ARCH-5, the attacker's view: during a vendor outage, an unauthenticated
+/// POST /verify carrying a *victim's* number and an arbitrary code used to
+/// return a session token bound to that victim (account erasure and an MLS
+/// pairing MITM follow). The vendor times out for the whole test, so the code
+/// below is never checked by anyone — and must therefore buy nothing.
 #[sqlx::test]
-async fn degraded_soft_gate_account_never_becomes_findable(pool: PgPool) {
+async fn vendor_timeout_mints_no_session_and_leaves_the_victim_unverified(pool: PgPool) {
     let state = state_with_vendor(pool, Arc::new(AlwaysTimeoutVendor));
     let store_ref = state.store.clone(); // kept for a direct DB check below
     let addr = directory::spawn_for_tests(state).await.unwrap();
@@ -130,44 +135,34 @@ async fn degraded_soft_gate_account_never_becomes_findable(pool: PgPool) {
 
     let verify = client
         .post(format!("{base}/verify"))
-        .json(&serde_json::json!({ "phone": phone, "code": "000000" }))
-        .send()
-        .await
-        .unwrap();
-    // Degraded signup still succeeds (T2) but comes back unverified.
-    assert_eq!(verify.status(), reqwest::StatusCode::OK);
-    let body: serde_json::Value = verify.json().await.unwrap();
-    assert_eq!(body["verified"], false);
-    let user_id = body["user_id"].as_u64().unwrap();
-    let token = body["session_token"].as_str().unwrap().to_string();
-
-    // Claiming a username and opting into search are both independent of
-    // verification status by design (T24's opt-in is a visibility toggle,
-    // not a re-verification) — but neither action should silently flip
-    // verified to true. Check the DB directly, not just another endpoint's
-    // response shape.
-    client
-        .post(format!("{base}/username"))
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&serde_json::json!({ "nickname": "degraded" }))
-        .send()
-        .await
-        .unwrap();
-    client
-        .post(format!("{base}/searchable"))
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&serde_json::json!({
-            "searchable": true,
-            "phone_search_hash": format!("degrade{}", "0".repeat(57)),
-        }))
+        .json(&serde_json::json!({ "phone": phone, "code": "not-the-code" }))
         .send()
         .await
         .unwrap();
 
-    let still_verified = store_ref.is_verified(user_id).await.unwrap();
     assert_eq!(
-        still_verified,
+        verify.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "an unchecked code must fail closed, not mint a degraded session"
+    );
+    let body: serde_json::Value = verify.json().await.unwrap();
+    assert!(
+        body.get("session_token").is_none() && body.get("user_id").is_none(),
+        "503 body must carry no session material, got: {body}"
+    );
+
+    // The pending row from /signup still exists — assert on the DB, not on
+    // another endpoint's response shape: the flag is what search reads.
+    let hash = directory::verify::phone_hash(phone, directory::verify::Pepper(b"e2e-test-pepper"))
+        .unwrap();
+    let user_id = store_ref
+        .find_user_by_phone_hash(&hash)
+        .await
+        .unwrap()
+        .expect("signup created a pending user");
+    assert_eq!(
+        store_ref.is_verified(user_id).await.unwrap(),
         Some(false),
-        "degraded account must not silently become verified"
+        "a timed-out verify must not flip the victim's verified flag"
     );
 }

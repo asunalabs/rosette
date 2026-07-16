@@ -72,9 +72,11 @@ impl DirectoryStore {
         Ok(row.get::<i64, _>("user_id") as u64)
     }
 
-    pub async fn mark_verified(&self, user_id: u64, verified: bool) -> sqlx::Result<()> {
-        sqlx::query("UPDATE users SET verified = $1 WHERE user_id = $2")
-            .bind(verified)
+    /// No `verified: bool` param — nothing un-verifies a user, because the
+    /// only caller (`/verify`) now reaches this line only on an approved code
+    /// (ARCH-5). Marking a user unverified is not a state this API can express.
+    pub async fn mark_verified(&self, user_id: u64) -> sqlx::Result<()> {
+        sqlx::query("UPDATE users SET verified = true WHERE user_id = $1")
             .bind(user_id as i64)
             .execute(&self.pool)
             .await?;

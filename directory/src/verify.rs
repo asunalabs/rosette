@@ -16,6 +16,10 @@ pub enum VerifyError {
     InvalidPhoneFormat,
     #[error("otp code rejected")]
     CodeRejected,
+    /// Vendor didn't answer in time, so the code was never checked. Fails
+    /// closed (503) — see `verify_phone`.
+    #[error("otp vendor unavailable")]
+    VendorUnavailable,
     #[error("argon2 error: {0}")]
     Hash(String),
     #[error("otp vendor error: {0}")]
@@ -59,7 +63,8 @@ pub fn phone_hash(e164: &str, pepper: Pepper) -> Result<String, VerifyError> {
 
 #[derive(Debug)]
 pub enum VendorError {
-    /// Vendor call didn't complete in time — soft-gate, don't hard-fail signup.
+    /// Vendor call didn't complete in time. The code is unchecked, so
+    /// `verify_phone` refuses — never a soft-gate (see ARCH-5).
     Timeout,
     Other(String),
 }
@@ -70,14 +75,6 @@ pub trait OtpVendor: Send + Sync {
     /// phone ever see it.
     fn send_code(&self, e164: &str) -> Result<(), VendorError>;
     fn verify(&self, e164: &str, code: &str) -> Result<bool, VendorError>;
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum VerificationOutcome {
-    Verified,
-    /// Vendor outage: account created, but unverified and excluded from
-    /// search until it can be re-verified.
-    Degraded,
 }
 
 /// No real SMS vendor is wired up yet — nothing in this project has a
@@ -229,21 +226,27 @@ pub fn vendor_from_env() -> anyhow::Result<std::sync::Arc<dyn OtpVendor>> {
     )
 }
 
+/// Returns the peppered `phone_hash` — and returns it *only* when the vendor
+/// affirmatively approved `code`. There is no outcome that means "couldn't
+/// check": a vendor timeout is `VendorUnavailable` (503 at the API layer), not
+/// a degraded pass. This function returning `Ok` is what "verified" means, so
+/// no caller can mistake an unchecked code for a checked one (ARCH-5).
 pub fn verify_phone(
     vendor: &dyn OtpVendor,
     raw_phone: &str,
     code: &str,
     pepper: Pepper,
-) -> Result<(String, VerificationOutcome), VerifyError> {
+) -> Result<String, VerifyError> {
     let e164 = normalize_e164(raw_phone)?;
-    let hash = phone_hash(&e164, pepper)?;
-    let outcome = match vendor.verify(&e164, code) {
-        Ok(true) => VerificationOutcome::Verified,
+    match vendor.verify(&e164, code) {
+        Ok(true) => {}
         Ok(false) => return Err(VerifyError::CodeRejected),
-        Err(VendorError::Timeout) => VerificationOutcome::Degraded,
+        Err(VendorError::Timeout) => return Err(VerifyError::VendorUnavailable),
         Err(VendorError::Other(msg)) => return Err(VerifyError::Vendor(msg)),
-    };
-    Ok((hash, outcome))
+    }
+    // Hashed only after approval: Argon2id is deliberately expensive, so an
+    // unauthenticated /verify flood shouldn't buy CPU on a rejected code.
+    phone_hash(&e164, pepper)
 }
 
 #[cfg(test)]
@@ -322,24 +325,42 @@ mod tests {
         }
     }
 
+    struct RejectVendor;
+    impl OtpVendor for RejectVendor {
+        fn send_code(&self, _e164: &str) -> Result<(), VendorError> {
+            Ok(())
+        }
+        fn verify(&self, _e164: &str, _code: &str) -> Result<bool, VendorError> {
+            Ok(false)
+        }
+    }
+
+    /// ARCH-5: a vendor timeout used to return `Degraded`, which the API
+    /// layer turned into a session. An unchecked code must fail closed.
     #[test]
-    fn vendor_timeout_degrades_instead_of_failing_signup() {
-        let (hash, outcome) = verify_phone(
+    fn vendor_timeout_refuses_instead_of_failing_open() {
+        let err = verify_phone(
             &TimeoutVendor,
             "+15551234567",
-            "000000",
+            "any-code-at-all",
             Pepper(b"test-pepper"),
         )
-        .expect("degraded signup should still succeed");
-        assert_eq!(outcome, VerificationOutcome::Degraded);
-        assert_eq!(hash.len(), 64);
+        .expect_err("an unchecked code must never succeed");
+        assert!(matches!(err, VerifyError::VendorUnavailable));
+    }
+
+    #[test]
+    fn wrong_code_is_rejected() {
+        let err = verify_phone(&RejectVendor, "+15551234567", "999999", Pepper(b"test-pepper"))
+            .expect_err("a rejected code must not yield a hash");
+        assert!(matches!(err, VerifyError::CodeRejected));
     }
 
     #[test]
     fn happy_path_verifies() {
-        let (_hash, outcome) =
+        let hash =
             verify_phone(&OkVendor, "+15551234567", "000000", Pepper(b"test-pepper")).unwrap();
-        assert_eq!(outcome, VerificationOutcome::Verified);
+        assert_eq!(hash.len(), 64);
     }
 
     #[test]

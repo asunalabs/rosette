@@ -18,5 +18,5 @@ pub use store::{ClaimError, DirectoryStore};
 pub use username::{format_handle, render_discriminator, validate_nickname, UsernameError};
 pub use verify::{
     normalize_e164, phone_hash, vendor_from_env, verify_phone, DevOtpVendor, OtpVendor, Pepper,
-    TwilioOtpVendor, VendorError, VerificationOutcome, VerifyError,
+    TwilioOtpVendor, VendorError, VerifyError,
 };
