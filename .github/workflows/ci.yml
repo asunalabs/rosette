@@ -33,6 +33,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same headroom problem as app-ffi-smoke: a full debug build of the
+      # workspace plus the restored cargo cache crowds a stock runner, and the
+      # Test step died mid-run with no step conclusion (the signature of a
+      # runner going down, not of a failing assertion).
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                      /usr/share/swift /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/powershell
+          df -h /
+
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt
 
@@ -46,6 +58,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # Runs before Test *in the same job*, so any drift makes Test SKIP rather
+      # than fail — master carried 19 hunks, so `cargo test --workspace` had not
+      # actually executed in CI for weeks while the job merely looked red.
       - name: Format check
         run: cargo fmt --all --check
 
@@ -68,6 +83,21 @@ jobs:
         working-directory: app
     steps:
       - uses: actions/checkout@v4
+
+      # `:composeApp:assembleDebug` cross-compiles the Rust core for every
+      # Android ABI and merges the .so's; that plus target/ and the gradle
+      # caches does not fit a stock runner's ~14GB, and the job died on
+      # `mergeDebugNativeLibs` with "No space left on device". Dropping
+      # toolchains this repo never uses buys ~10-25GB.
+      # NOT removed: /usr/local/lib/android — assembleDebug needs the SDK+NDK.
+      - name: Free runner disk space
+        working-directory: /
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                      /usr/share/swift /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/powershell
+          df -h /
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
