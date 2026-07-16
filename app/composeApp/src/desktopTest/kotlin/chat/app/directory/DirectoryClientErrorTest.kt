@@ -5,6 +5,8 @@ import java.net.InetSocketAddress
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.runBlocking
 
@@ -97,4 +99,50 @@ class DirectoryClientErrorTest {
             assertEquals("tok", res.sessionToken)
             assertTrue(res.verified)
         }
+
+    /**
+     * ET16: nobody answers at all — airplane mode, no signal, directory down.
+     *
+     * This used to escape as a raw engine exception (`ConnectException`), which is
+     * not a `DirectoryException` and so flew straight past `OnboardingFlow`'s
+     * `catch (e: DirectoryException)` and killed the coroutine. The most likely
+     * failure a phone has, and it crashed the app.
+     *
+     * Binds a real port, then closes it, so the port is genuinely dead rather than
+     * "probably unused" — a hardcoded port could be occupied and turn this green
+     * for the wrong reason.
+     */
+    private fun deadPort(): Int {
+        val s = java.net.ServerSocket(0)
+        val p = s.localPort
+        s.close()
+        return p
+    }
+
+    @Test
+    fun anUnreachableDirectorySurfacesAsAnErrorInsteadOfCrashing() {
+        val base = "http://127.0.0.1:${deadPort()}"
+
+        val e = assertFailsWith<DirectoryException> {
+            runBlocking { DirectoryClient(base).signup("+15551234567") }
+        }
+
+        assertNull(e.status, "nobody answered, so there is no status to report")
+        assertTrue(
+            e.message!!.contains("check your connection"),
+            "the message goes straight to the user; got: ${e.message}",
+        )
+    }
+
+    /** No response means no proof of anything — least of all that the user's code was fine (that claim needs a 503 from a server that actually answered). */
+    @Test
+    fun anUnreachableDirectoryIsNotTreatedAsAVendorOutage() {
+        val base = "http://127.0.0.1:${deadPort()}"
+
+        val e = assertFailsWith<DirectoryException> {
+            runBlocking { DirectoryClient(base).verify("+15551234567", "000000") }
+        }
+
+        assertNotEquals(503, e.status, "a transport failure must not impersonate the held path")
+    }
 }

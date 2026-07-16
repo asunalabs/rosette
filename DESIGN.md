@@ -104,10 +104,24 @@ The accent must be trivially replaceable. Rules:
 | `bubbleMine` | `#5B3A6C` | `#6B4183` | own bubbles — SOLID accent family |
 | `onBubbleMine` | `#FFFFFF` | `#FFFFFF` | text/time on own bubbles (time at 72% opacity) |
 | `bubbleTheirs` | `#F0EEF0` | `#242027` | incoming bubbles |
-| `error` | `#C62828` | `#E5484D` | real failures only |
+| `error` | `#C62828` | `#F16A6F` | real failures only |
 | `errorSoft` | `#FBE9E7` | `#35201B` | error fills |
-| `warning` | `#8F6400` | `#D4A945` | expiring links etc. |
+| `warning` | `#7A5500` | `#D4A945` | expiring links etc. |
 | `warningSoft` | `#F5ECD4` | `#322B18` | warning fills |
+
+Every `*Soft` fill is a text background, not decoration — `InstrumentStatusChip`
+renders `warning` **on** `warningSoft` — so each pair owes the 4.5:1 above, not
+3:1 (chip text is `labelMedium`, 13.5sp, which is not "large text"). Measured:
+
+| pair | light | dark |
+| --- | --- | --- |
+| `warning` on `warningSoft` | 5.70 | 6.40 |
+| `error` on `errorSoft` | 4.80 | 5.12 |
+
+The two that moved were introduced failing and fixed on 2026-07-16 (ET12), not
+re-tuned for taste: light `warning` was `#8F6400` (**4.47**, under this file's
+own bar) and dark `error` was `#E5484D` (**3.91**). Re-measure this table when
+any of the four change — the pair is the unit, not the token.
 | `info` | `#4C5A6B` | `#94A3B8` | connection banner text |
 | `onAccent` | `#FFFFFF` | `#121013` | text on `accent` fills |
 - **Success/verified = accent**, not green: trust wears the brand color.

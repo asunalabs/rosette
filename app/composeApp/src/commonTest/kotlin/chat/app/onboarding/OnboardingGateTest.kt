@@ -102,4 +102,47 @@ class OnboardingGateTest {
         assertIs<OnboardingState.AwaitingOtp>(next)
         assertTrue(next.held, "a 503 means nobody checked the code — hold, don't blame")
     }
+
+    // ET17: /signup calls the same vendor /verify does, so it owes the same rule.
+    // Before this, a vendor outage stopped the user at PhoneEntry with a bare
+    // "internal error" — one screen before the held UI ET8 built for that exact
+    // outage, which made the held screen nearly unreachable in production.
+
+    private val unavailable = DirectoryException("verification temporarily unavailable", status = 503)
+
+    @Test
+    fun a_signup_outage_holds_on_phone_entry() {
+        val next = nextAfterSendError(OnboardingState.PhoneEntry(), phone, unavailable)
+
+        assertIs<OnboardingState.PhoneEntry>(next)
+        assertTrue(next.held, "no code was sent and it wasn't the user's doing — hold here")
+    }
+
+    /** Resend stays live during a hold (ET13), so this is the path a user takes when their code expired mid-outage. */
+    @Test
+    fun a_failed_resend_holds_on_the_otp_step_rather_than_teleporting_back() {
+        val next = nextAfterSendError(OnboardingState.AwaitingOtp(phone, held = true), phone, unavailable)
+
+        assertIs<OnboardingState.AwaitingOtp>(next)
+        assertTrue(next.held)
+        assertEquals(phone, next.phone, "a failed resend must not lose the number they already typed")
+    }
+
+    @Test
+    fun a_real_signup_error_leaves_the_step_alone_and_uses_the_error_channel() {
+        val current = OnboardingState.PhoneEntry()
+
+        val next = nextAfterSendError(current, phone, DirectoryException("invalid phone", status = 400))
+
+        assertEquals(current, next, "a 400 is the user's to fix — the state is fine, the message explains it")
+    }
+
+    /** A number in post-deletion cooldown (ET14) is a 400: real, answerable, and not a vendor outage. */
+    @Test
+    fun a_cooldown_refusal_does_not_masquerade_as_an_outage() {
+        val e = DirectoryException("phone number is in cooldown after a recent deletion", status = 400)
+
+        assertFalse(isVerificationUnavailable(e))
+        assertEquals(OnboardingState.PhoneEntry(), nextAfterSendError(OnboardingState.PhoneEntry(), phone, e))
+    }
 }

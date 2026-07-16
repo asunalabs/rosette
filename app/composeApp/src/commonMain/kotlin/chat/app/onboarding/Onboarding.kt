@@ -59,7 +59,8 @@ import kotlinx.coroutines.launch
  */
 sealed interface OnboardingState {
     data object Welcome : OnboardingState
-    data object PhoneEntry : OnboardingState
+    /** [held] = `POST /signup` couldn't reach the OTP vendor (503), so no code was sent — same rule as [AwaitingOtp.held], one screen earlier (ET17). */
+    data class PhoneEntry(val held: Boolean = false) : OnboardingState
     /** [held] = the directory could not check the code at all (vendor outage, 503 — see [isVerificationUnavailable]); the code is unproven, not wrong. */
     data class AwaitingOtp(val phone: String, val held: Boolean = false) : OnboardingState
     data class ClaimUsername(val sessionToken: String, val phone: String) : OnboardingState
@@ -120,6 +121,29 @@ internal fun isVerificationUnavailable(e: DirectoryException): Boolean = e.statu
 internal fun nextAfterVerifyError(phone: String, e: DirectoryException): OnboardingState =
     OnboardingState.AwaitingOtp(phone, held = isVerificationUnavailable(e))
 
+/**
+ * ET17: where a failed `POST /signup` leaves the flow.
+ *
+ * `/signup` calls the same vendor `/verify` does, so it owes the same treatment:
+ * a 503 means we never reached verification and no code was sent — not the
+ * user's fault. Which screen holds depends on where they were, and both are
+ * reachable: from [OnboardingState.PhoneEntry] on first submit, and from
+ * [OnboardingState.AwaitingOtp] via Resend, which ET13 keeps live during a hold
+ * precisely so a user whose code expired mid-outage can ask for another.
+ *
+ * Any other failure returns [current] untouched — the state is fine, the error
+ * channel explains it.
+ */
+internal fun nextAfterSendError(
+    current: OnboardingState,
+    phone: String,
+    e: DirectoryException,
+): OnboardingState = when {
+    !isVerificationUnavailable(e) -> current
+    current is OnboardingState.AwaitingOtp -> OnboardingState.AwaitingOtp(phone, held = true)
+    else -> OnboardingState.PhoneEntry(held = true)
+}
+
 @Composable
 fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, handle: String, phone: String) -> Unit) {
     val palette = LocalChatPalette.current
@@ -141,9 +165,14 @@ fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, h
         scope.launch {
             try {
                 client.signup(phone)
+                // A code really was sent, so any prior hold is over.
                 state = OnboardingState.AwaitingOtp(phone)
             } catch (e: DirectoryException) {
-                error = e.message
+                // ET17: same rule as /verify — a 503 is our vendor failing, not the
+                // user, so the chip carries it and the error channel (which reads as
+                // blame) stays empty.
+                state = nextAfterSendError(state, phone, e)
+                error = if (isVerificationUnavailable(e)) null else e.message
             } finally {
                 loading = false
             }
@@ -154,11 +183,12 @@ fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, h
         Box(Modifier.weight(1f)) {
             when (val s = state) {
                 is OnboardingState.Welcome -> WelcomeStep(
-                    onContinue = { goTo(OnboardingState.PhoneEntry) },
+                    onContinue = { goTo(OnboardingState.PhoneEntry()) },
                     onRestore = { error = "Restore isn't available yet." },
                 )
                 is OnboardingState.PhoneEntry -> PhoneEntryStep(
                     loading = loading,
+                    held = s.held,
                     onBack = { goTo(OnboardingState.Welcome) },
                     onSubmit = ::sendCode,
                 )
@@ -166,7 +196,7 @@ fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, h
                     phone = s.phone,
                     loading = loading,
                     held = s.held,
-                    onBack = { goTo(OnboardingState.PhoneEntry) },
+                    onBack = { goTo(OnboardingState.PhoneEntry()) },
                     onResend = { sendCode(s.phone) },
                 ) { code ->
                     loading = true; error = null
@@ -255,7 +285,12 @@ private fun WelcomeStep(onContinue: () -> Unit, onRestore: () -> Unit) {
 }
 
 @Composable
-private fun PhoneEntryStep(loading: Boolean, onBack: () -> Unit, onSubmit: (phone: String) -> Unit) {
+private fun PhoneEntryStep(
+    loading: Boolean,
+    held: Boolean,
+    onBack: () -> Unit,
+    onSubmit: (phone: String) -> Unit,
+) {
     var countryCode by remember { mutableStateOf("") }
     var number by remember { mutableStateOf("") }
     Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -271,9 +306,20 @@ private fun PhoneEntryStep(loading: Boolean, onBack: () -> Unit, onSubmit: (phon
             number = number,
             onNumberChange = { number = it },
         )
+        if (held) {
+            Spacer(Modifier.height(20.dp))
+            // ET17: `/signup` couldn't reach the vendor, so no code was sent. Same
+            // treatment as the OTP step's hold, and for the same reason — it is our
+            // outage, not their mistake. Deliberately claims nothing about what was
+            // stored: `POST /signup` only reaches the vendor *after* it has written
+            // the peppered hash (api.rs), so "nothing was saved" would be false here
+            // exactly as it was on the OTP step (ET8). The number stays in the field
+            // so retrying costs one tap.
+            InstrumentStatusChip("Can't reach verification — try again in a moment", tone = StatusTone.Warning)
+        }
         Spacer(Modifier.weight(1f))
         InstrumentButton(
-            text = if (loading) "Sending…" else "Next",
+            text = if (loading) "Sending…" else if (held) "Try again" else "Next",
             onClick = { onSubmit((countryCode.ifBlank { "+420" }) + number) },
             enabled = !loading && number.isNotBlank(),
             loading = loading,
@@ -306,27 +352,32 @@ private fun OtpStep(
         OtpCells(code = code, onChange = { code = it }, dimmed = held)
         if (held) {
             Spacer(Modifier.height(20.dp))
-            // ET8 (founder decision, 2026-07-16): the chip carries this screen alone.
-            // The reassurance line that used to sit here ("Your number isn't
-            // registered until we confirm it, so nothing has been saved") was false
-            // on every count: `POST /signup` durably wrote a peppered Argon2id hash
-            // one screen ago (store.rs `create_pending_user`). The honest rewrite was
-            // rejected too, for two reasons: it cannot promise erasure (that needs a
-            // session, and ET6 deliberately mints none here), and it answers "should I
-            // hand over my number" one screen after the number was handed over. If
-            // that promise is worth making, it belongs on PhoneEntry, where the user
-            // can still act on it. Do not restore a claim here without tracing every
-            // clause to a line in directory/src/{api.rs,store.rs}.
+            // ET8 (founder decision, 2026-07-16): no reassurance claim here. The line
+            // that used to sit here ("Your number isn't registered until we confirm
+            // it, so nothing has been saved") was false on every count: `POST /signup`
+            // durably wrote a peppered Argon2id hash one screen ago (store.rs
+            // `create_pending_user`). The honest rewrite was rejected too, for two
+            // reasons: it cannot promise erasure (that needs a session, and ET6
+            // deliberately mints none here), and it answers "should I hand over my
+            // number" one screen after the number was handed over. If that promise is
+            // worth making, it belongs on PhoneEntry, where the user can still act on
+            // it. Do not restore a claim here without tracing every clause to a line
+            // in directory/src/{api.rs,store.rs}.
             InstrumentStatusChip("Can't reach verification — your code is fine", tone = StatusTone.Warning)
-        } else {
-            Spacer(Modifier.height(20.dp))
-            Text(
-                "Resend code",
-                style = MaterialTheme.typography.labelLarge,
-                color = palette.accent,
-                modifier = Modifier.clickable(enabled = !loading, onClick = onResend).padding(4.dp),
-            )
         }
+        // ET13 (founder decision, 2026-07-16): resend is an always-live link, so the
+        // chip sits *above* it rather than replacing it. The chip is a status line,
+        // not a control — swapping the two made a vendor outage hide the one action
+        // that helps, because OTP codes expire on the vendor's clock while we are
+        // down. "Try again" then resubmits a dying code and the only route to a fresh
+        // one was a button labelled "Use a different number".
+        Spacer(Modifier.height(if (held) 12.dp else 20.dp))
+        Text(
+            "Resend code",
+            style = MaterialTheme.typography.labelLarge,
+            color = palette.accent,
+            modifier = Modifier.clickable(enabled = !loading, onClick = onResend).padding(4.dp),
+        )
         Spacer(Modifier.weight(1f))
         InstrumentButton(
             text = if (loading) "Verifying…" else if (held) "Try again" else "Verify",

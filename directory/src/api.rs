@@ -140,7 +140,25 @@ async fn signup(
     }
     let e164 =
         verify::normalize_e164(&req.phone).map_err(|_| ApiError::BadRequest("invalid phone"))?;
-    let hash = verify::phone_hash(&e164, Pepper(&state.pepper)).map_err(|_| ApiError::Internal)?;
+    // ET19: Argon2id is deliberately expensive — 19 MiB and 2 passes — and this
+    // call is unauthenticated and unthrottled. Run directly, each one pins a
+    // tokio worker for the duration, so a /signup flood starves *every* endpoint
+    // rather than just this one. ET6 moved /verify's hash behind an approved code
+    // for the same reason; that mitigation stops at this endpoint, which is one
+    // over and wide open.
+    //
+    // `spawn_blocking`, not the `block_in_place` used for the vendor HTTP call in
+    // verify.rs: that one panics on a current-thread runtime, which is exactly
+    // what `#[sqlx::test]` gives the e2e tests. The clones are a pepper and a
+    // phone number — noise next to 19 MiB of hashing.
+    let hash = {
+        let pepper = state.pepper.clone();
+        let e164 = e164.clone();
+        tokio::task::spawn_blocking(move || verify::phone_hash(&e164, Pepper(&pepper)))
+            .await
+            .map_err(|_| ApiError::Internal)?
+            .map_err(|_| ApiError::Internal)?
+    };
     if state
         .store
         .is_phone_in_cooldown(&hash)
@@ -160,19 +178,15 @@ async fn signup(
         VendorError::Unavailable => ApiError::VendorUnavailable,
         VendorError::Other(_) => ApiError::Internal,
     })?;
-    if state
+    // ET15: one statement, not a check-then-act. This used to be a find followed
+    // by a create, which two concurrent signups for the same number could both
+    // pass — leaving a duplicate row that `erase_user` (single `user_id`) would
+    // not scrub.
+    state
         .store
-        .find_user_by_phone_hash(&hash)
+        .find_or_create_pending_user(&hash)
         .await
-        .map_err(|_| ApiError::Internal)?
-        .is_none()
-    {
-        state
-            .store
-            .create_pending_user(&hash)
-            .await
-            .map_err(|_| ApiError::Internal)?;
-    }
+        .map_err(|_| ApiError::Internal)?;
     Ok(Json(SignupResponse {
         status: "code_sent",
     }))
@@ -215,23 +229,17 @@ async fn verify_handler(
     })?;
 
     // ET14: `/verify` is the *second* endpoint that creates users, so it owes
-    // the same OQ5 cooldown check `/signup` does (`is_phone_in_cooldown` at the
-    // top of `signup`). Without it: sign up -> `DELETE /account` (cooldown
-    // starts, `users.phone_hash` is scrubbed but `phone_cooldown` keeps it) ->
-    // `POST /verify` with the still-valid code -> the find below misses the
-    // erased row -> `create_pending_user` mints a fresh *verified* account for
-    // a number that is supposed to be locked for 24h. Checked after
-    // `verify_phone` because the hash is what `phone_cooldown` is keyed on, and
-    // only an approved code gets us one.
-    // ET14: `/verify` is the *second* endpoint that creates users, so it owes
-    // the same OQ5 cooldown check `/signup` does (`is_phone_in_cooldown` at the
-    // top of `signup`). Without it: sign up -> `DELETE /account` (cooldown
-    // starts, `users.phone_hash` is scrubbed but `phone_cooldown` keeps it) ->
-    // `POST /verify` with the still-valid code -> the find below misses the
-    // erased row -> `create_pending_user` mints a fresh *verified* account for
-    // a number that is supposed to be locked for 24h. Checked after
-    // `verify_phone` because the hash is what `phone_cooldown` is keyed on, and
-    // only an approved code gets us one.
+    // the same OQ5 cooldown check `/signup` does. Without it: sign up ->
+    // `DELETE /account` (cooldown starts, `users.phone_hash` is scrubbed but
+    // `phone_cooldown` keeps it) -> `POST /verify` with the still-valid code ->
+    // no live row matches the hash -> a fresh *verified* account is minted for a
+    // number that is supposed to be locked for 24h.
+    //
+    // Checked after `verify_phone` because `phone_cooldown` is keyed on the
+    // hash, and only an approved code yields one. Still a call-site check, which
+    // is the shape of the original bug — ET15 collapsed the two find-or-creates
+    // into one statement, so this is now the only rule the two endpoints must
+    // remember in parallel. It belongs in the DB.
     if state
         .store
         .is_phone_in_cooldown(&hash)
@@ -242,19 +250,12 @@ async fn verify_handler(
             "phone number is in cooldown after a recent deletion",
         ));
     }
-    let user_id = match state
+    // ET15: the other half of the same check-then-act — see `signup`.
+    let user_id = state
         .store
-        .find_user_by_phone_hash(&hash)
+        .find_or_create_pending_user(&hash)
         .await
-        .map_err(|_| ApiError::Internal)?
-    {
-        Some(id) => id,
-        None => state
-            .store
-            .create_pending_user(&hash)
-            .await
-            .map_err(|_| ApiError::Internal)?,
-    };
+        .map_err(|_| ApiError::Internal)?;
     state
         .store
         .mark_verified(user_id)
@@ -563,7 +564,7 @@ mod tests {
         let state = state_for(pool);
         let target = state
             .store
-            .create_pending_user("target-hash-0")
+            .find_or_create_pending_user("target-hash-0")
             .await
             .unwrap();
         state
@@ -580,7 +581,7 @@ mod tests {
 
         let requester = state
             .store
-            .create_pending_user("requester-hash-0")
+            .find_or_create_pending_user("requester-hash-0")
             .await
             .unwrap();
         let requester_token = state.store.create_session(requester);
@@ -639,7 +640,7 @@ mod tests {
         let state = state_for(pool);
         let target = state
             .store
-            .create_pending_user("target-hash-1")
+            .find_or_create_pending_user("target-hash-1")
             .await
             .unwrap();
         // Never calls set_searchable(true) — stays private.
@@ -651,7 +652,7 @@ mod tests {
 
         let requester = state
             .store
-            .create_pending_user("requester-hash-1")
+            .find_or_create_pending_user("requester-hash-1")
             .await
             .unwrap();
         let requester_token = state.store.create_session(requester);
@@ -673,7 +674,7 @@ mod tests {
         let state = state_for(pool);
         let target = state
             .store
-            .create_pending_user("target-hash-2")
+            .find_or_create_pending_user("target-hash-2")
             .await
             .unwrap();
         state
@@ -762,7 +763,9 @@ mod tests {
         let state = state_for(pool);
         let user_id = state
             .store
-            .create_pending_user("erase-me-hash-000000000000000000000000000000000000000000000000")
+            .find_or_create_pending_user(
+                "erase-me-hash-000000000000000000000000000000000000000000000000",
+            )
             .await
             .unwrap();
         state.store.claim_username(user_id, "temp").await.unwrap();
@@ -798,7 +801,7 @@ mod tests {
     #[sqlx::test]
     async fn search_response_carries_the_search_hash_but_never_the_keyed_auth_one(pool: PgPool) {
         // T8, refined: the response type still has no field that could hold
-        // the KEYED auth phone_hash (`create_pending_user`'s argument below
+        // the KEYED auth phone_hash (`find_or_create_pending_user`'s argument below
         // never appears). It DOES now carry `search_hash` — the separate,
         // unkeyed value the client needs to do the final exact match
         // locally (HIBP-style); that's the endpoint's whole point, not a
@@ -806,7 +809,7 @@ mod tests {
         let state = state_for(pool);
         let user_id = state
             .store
-            .create_pending_user("aaaaaverysecretphonehash")
+            .find_or_create_pending_user("aaaaaverysecretphonehash")
             .await
             .unwrap();
         state
@@ -847,7 +850,7 @@ mod tests {
         let state = state_for(pool);
         let target = state
             .store
-            .create_pending_user("lookup-hash")
+            .find_or_create_pending_user("lookup-hash")
             .await
             .unwrap();
         let (slot, _width) = state
@@ -857,7 +860,7 @@ mod tests {
             .unwrap();
         let requester = state
             .store
-            .create_pending_user("requester-hash")
+            .find_or_create_pending_user("requester-hash")
             .await
             .unwrap();
         let token = state.store.create_session(requester);
@@ -892,7 +895,7 @@ mod tests {
     #[sqlx::test]
     async fn set_searchable_rejects_missing_or_malformed_hash(pool: PgPool) {
         let state = state_for(pool);
-        let user_id = state.store.create_pending_user("h").await.unwrap();
+        let user_id = state.store.find_or_create_pending_user("h").await.unwrap();
         let token = state.store.create_session(user_id);
         let addr = spawn_for_tests(state).await.unwrap();
         let client = reqwest::Client::new();

@@ -3,8 +3,7 @@ package chat.app.directory
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
-import io.ktor.client.plugins.ClientRequestException
-import io.ktor.client.plugins.ServerResponseException
+import io.ktor.client.plugins.ResponseException
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
@@ -16,6 +15,7 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
@@ -24,7 +24,12 @@ import kotlinx.serialization.json.Json
  * message and the HTTP status when present. [status] is what lets a caller
  * tell "your code was wrong" (400) from "we never checked your code" (503,
  * ET6) — a distinction the user is entitled to, since only one of them is
- * their fault. Null only if the failure had no response at all.
+ * their fault.
+ *
+ * [status] is null when the failure had no response at all — no network, DNS,
+ * TLS, connection refused, the directory being down. That is a real case, not a
+ * theoretical one (ET16), and it is deliberately NOT the held path: with no
+ * answer from anyone we cannot claim the user's code is fine.
  */
 class DirectoryException(message: String, val status: Int? = null) : Exception(message)
 
@@ -183,14 +188,16 @@ class DirectoryClient(baseUrl: String = defaultDirectoryBaseUrl()) {
         return res?.contact_link_b64
     }
 
-    /** Runs a Ktor request, mapping non-2xx statuses to a [DirectoryException] with the server's `error` message and status. */
+    /** Runs a Ktor request, mapping every failure to a [DirectoryException] — non-2xx with the server's `error` message and status, no-response with a null status. */
     private suspend fun call(request: suspend () -> HttpResponse): HttpResponse {
         try {
             return request()
-        } catch (e: ClientRequestException) {
+        } catch (e: ResponseException) {
             throw e.response.asDirectoryException()
-        } catch (e: ServerResponseException) {
-            throw e.response.asDirectoryException()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            throw e.asTransportException()
         }
     }
 
@@ -198,16 +205,39 @@ class DirectoryClient(baseUrl: String = defaultDirectoryBaseUrl()) {
     private suspend fun callOrNull(request: suspend () -> HttpResponse): HttpResponse? {
         try {
             return request()
-        } catch (e: ClientRequestException) {
+        } catch (e: ResponseException) {
             if (e.response.status == HttpStatusCode.NotFound) return null
             throw e.response.asDirectoryException()
-        } catch (e: ServerResponseException) {
-            throw e.response.asDirectoryException()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            throw e.asTransportException()
         }
     }
 
     private suspend fun HttpResponse.asDirectoryException(): DirectoryException =
         DirectoryException(errorMessage(), status.value)
+
+    /**
+     * ET16: a failure with no response — no network, DNS, TLS, connection
+     * refused, directory down.
+     *
+     * These used to escape: `call` caught only Ktor's response exceptions, so a
+     * connect failure flew past `OnboardingFlow`'s `catch (e: DirectoryException)`
+     * and died as an uncaught coroutine exception. ET7's commit message promised
+     * "surface directory errors instead of crashing" — this was the half that
+     * still crashed, on the most likely failure a phone has.
+     *
+     * The message is ours, not the platform's: `e.message` here is engine-specific
+     * ("Connection refused", "nodename nor servname provided") and this string is
+     * rendered straight to the user by the onboarding error channel.
+     *
+     * `CancellationException` is rethrown by both callers before reaching this —
+     * swallowing it would break structured concurrency and leave a cancelled
+     * screen's coroutine reporting a fake network error.
+     */
+    private fun Throwable.asTransportException(): DirectoryException =
+        DirectoryException("Can't reach the directory — check your connection.", null)
 
     private suspend fun HttpResponse.errorMessage(): String =
         try { body<ErrorBody>().error } catch (_: Exception) { "directory request failed" }

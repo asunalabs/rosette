@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 /// T20: accounts that signed up but never completed `/verify` get a
 /// measurably tighter limit than verified ones. (Not "degraded verification
-/// per T2" — ET6 deleted that path; `create_pending_user` is now the only
+/// per T2" — ET6 deleted that path; `find_or_create_pending_user` is now the only
 /// thing that writes `verified = false`.)
 pub const VERIFIED_SEARCH_PER_MINUTE: u32 = 30;
 pub const UNVERIFIED_SEARCH_PER_MINUTE: u32 = 5;

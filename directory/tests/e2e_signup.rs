@@ -175,7 +175,7 @@ async fn vendor_outage_makes_signup_fail_closed_with_503(pool: PgPool) {
 /// users, and it never checked OQ5's post-deletion cooldown — only `/signup`
 /// did. So the 24h lock was one HTTP call wide: erase, then re-verify with the
 /// code you already hold. The erased row no longer matches the hash, so the
-/// find-or-create fell through to `create_pending_user` and minted a fresh
+/// find-or-create fell through to a fresh INSERT and minted a fresh
 /// *verified* account for a number that is supposed to be untouchable.
 #[sqlx::test]
 async fn an_erased_number_cannot_be_reclaimed_through_verify_during_cooldown(pool: PgPool) {

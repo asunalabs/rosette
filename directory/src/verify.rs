@@ -96,6 +96,33 @@ fn classify_transport(e: reqwest::Error) -> VendorError {
     }
 }
 
+/// ET18: what a non-2xx from **VerificationCheck** means, in `verify`'s own
+/// `Result<bool, _>` shape. Split out for the same reason
+/// [`verification_approved`] was — the decision is unit-testable, the network
+/// call around it is not.
+///
+/// A 404 here is not an error: Twilio 404s a VerificationCheck whose
+/// verification no longer exists — **expired**, already approved, or never
+/// started. Every one of those means the code cannot be accepted, which is
+/// exactly what `Ok(false)` already says. It used to fall through to `Other` →
+/// `Internal` → 500, so "your code expired" — the single most likely `/verify`
+/// failure after an outage, since codes die on the vendor's clock while we are
+/// down — reached the user as *our* bug, and landed in neither bucket the UI
+/// promises (400 "your fault, fix it" / 503 "our fault, hold").
+///
+/// ponytail: the user is told "code rejected" for an expired code. True but
+/// coarse — they need a new code either way, and ET13 keeps Resend live for
+/// exactly that. Split the copy only if the two ever need different guidance.
+///
+/// The same 404 on **start-verification** stays an error: there it means a bad
+/// Service SID, which is config, not a user's expired code.
+fn classify_check_failure(status: reqwest::StatusCode) -> Result<bool, VendorError> {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    Err(classify_status(status, "verification-check"))
+}
+
 pub trait OtpVendor: Send + Sync {
     /// Triggers delivery of a one-time code to `e164` (SMS/call, vendor's
     /// concern). Doesn't return the code — only the vendor and the user's
@@ -201,7 +228,7 @@ impl OtpVendor for TwilioOtpVendor {
                 .send();
             let resp = match result {
                 Ok(resp) if resp.status().is_success() => resp,
-                Ok(resp) => return Err(classify_status(resp.status(), "verification-check")),
+                Ok(resp) => return classify_check_failure(resp.status()),
                 Err(e) => return Err(classify_transport(e)),
             };
             let body: serde_json::Value =
@@ -324,6 +351,71 @@ mod tests {
             vendor.is_ok(),
             "fully configured Twilio env must be picked up"
         );
+    }
+
+    /// ET6/ET18: these three functions decide whether a vendor failure reaches
+    /// the user as "your code is fine, we'll retry" (503), "your code is wrong"
+    /// (400), or "we broke" (500). ET6 shipped with only `is_timeout()` mapped
+    /// to the first, so every other real outage mode — Twilio's own 5xx, a 429,
+    /// a dropped connection — became a 500 and the held UI was near-dead in
+    /// production. Untested then; the whole classification is pinned here now.
+    mod classification {
+        use super::*;
+        use reqwest::StatusCode;
+
+        #[test]
+        fn a_vendor_outage_or_throttle_is_unavailable_so_the_client_can_hold() {
+            for s in [
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::BAD_GATEWAY,
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::GATEWAY_TIMEOUT,
+                StatusCode::TOO_MANY_REQUESTS,
+            ] {
+                assert!(
+                    matches!(classify_status(s, "check"), VendorError::Unavailable),
+                    "{s} is transient — it must reach the app as a 503, not a 500"
+                );
+            }
+        }
+
+        #[test]
+        fn a_definite_answer_from_the_vendor_stays_our_bug() {
+            // Bad credentials or a malformed request are config errors: retrying
+            // changes nothing, so they must NOT offer the user a "Try again".
+            for s in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+                assert!(
+                    matches!(classify_status(s, "check"), VendorError::Other(_)),
+                    "{s}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_expired_verification_is_a_rejected_code_not_an_incident() {
+            assert_eq!(
+                classify_check_failure(StatusCode::NOT_FOUND)
+                    .expect("404 is an answer, not a failure"),
+                false,
+                "an expired or already-used code is one the user can't use — same as a wrong one"
+            );
+        }
+
+        #[test]
+        fn the_check_path_still_holds_on_a_real_outage() {
+            assert!(matches!(
+                classify_check_failure(StatusCode::SERVICE_UNAVAILABLE),
+                Err(VendorError::Unavailable)
+            ));
+        }
+
+        #[test]
+        fn a_bad_service_sid_on_the_check_path_is_not_silently_a_rejection() {
+            assert!(matches!(
+                classify_check_failure(StatusCode::UNAUTHORIZED),
+                Err(VendorError::Other(_))
+            ));
+        }
     }
 
     struct UnavailableVendor;

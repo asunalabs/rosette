@@ -58,11 +58,29 @@ impl DirectoryStore {
         }
     }
 
-    pub async fn create_pending_user(&self, phone_hash: &str) -> sqlx::Result<u64> {
+    /// Find-or-create for a phone hash, as **one** statement (ET15).
+    ///
+    /// Renamed from `create_pending_user`: it no longer always creates, and a
+    /// caller who believes it does would write the check-then-act this replaces.
+    /// The two endpoints that create users each did that check-then-act
+    /// unsynchronized, so two concurrent requests for one number made two rows —
+    /// and `erase_user` only scrubs one of them.
+    ///
+    /// `ON CONFLICT` names 0004's partial index, so the conflict target is
+    /// exactly "a live row for this number". `DO UPDATE SET phone_hash =
+    /// EXCLUDED.phone_hash` is a deliberate no-op that writes the value already
+    /// there: `DO NOTHING` is the obvious choice and the wrong one, because it
+    /// returns no row on conflict and the id is the whole point. Only
+    /// `phone_hash` is in the SET, so an existing user's `verified` and
+    /// `created_at` survive — the `false` above applies to inserts only.
+    pub async fn find_or_create_pending_user(&self, phone_hash: &str) -> sqlx::Result<u64> {
         let prefix = crate::search::hash_prefix(phone_hash);
         let row = sqlx::query(
             "INSERT INTO users (phone_hash, phone_hash_prefix, verified, created_at)
-             VALUES ($1, $2, false, $3) RETURNING user_id",
+             VALUES ($1, $2, false, $3)
+             ON CONFLICT (phone_hash) WHERE deleted_at IS NULL
+             DO UPDATE SET phone_hash = EXCLUDED.phone_hash
+             RETURNING user_id",
         )
         .bind(phone_hash)
         .bind(prefix)
@@ -390,13 +408,109 @@ impl PrefixIndex for DirectoryStore {
 mod tests {
     use super::*;
 
+    /// ET15: the find-or-create used to be two statements, so two callers could
+    /// both see "no row" and both insert. `erase_user` takes a single `user_id`
+    /// and scrubs one, so the survivor kept the peppered hash — erasure silently
+    /// half-done. Concurrency is the point, so this races real connections rather
+    /// than calling twice in sequence.
+    #[sqlx::test]
+    async fn concurrent_signups_for_one_number_converge_on_a_single_row(pool: PgPool) {
+        let store = std::sync::Arc::new(DirectoryStore::from_pool(pool));
+
+        // Real tasks on real pool connections — calling twice in sequence would
+        // pass against the old code too and prove nothing.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .find_or_create_pending_user("same-number-hash")
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut ids = Vec::new();
+        for h in handles {
+            ids.push(h.await.unwrap());
+        }
+
+        let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            1,
+            "every caller must land on the same user, got {ids:?}"
+        );
+
+        let live: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM users WHERE phone_hash = $1 AND deleted_at IS NULL",
+        )
+        .bind("same-number-hash")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+        .get("n");
+        assert_eq!(
+            live, 1,
+            "a duplicate row is a hash that erase_user would miss"
+        );
+    }
+
+    /// The upsert must not reset an account that already exists — a second
+    /// `/signup` for a verified number is a normal thing (re-verify, new device),
+    /// and `INSERT ... VALUES (verified = false)` would un-verify them if the
+    /// `DO UPDATE` touched that column.
+    #[sqlx::test]
+    async fn find_or_create_is_not_a_reset(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let first = store
+            .find_or_create_pending_user("returning-hash")
+            .await
+            .unwrap();
+        store.mark_verified(first).await.unwrap();
+
+        let second = store
+            .find_or_create_pending_user("returning-hash")
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            store.is_verified(second).await.unwrap(),
+            Some(true),
+            "a repeat signup must not silently un-verify an existing account"
+        );
+    }
+
+    /// Erasure tombstones the row (`deleted_at` set, `phone_hash` blanked), and
+    /// the index is partial for exactly this reason: the number must be usable
+    /// again after the cooldown, and many tombstones share `phone_hash = ''`.
+    #[sqlx::test]
+    async fn a_tombstoned_row_does_not_block_the_number_forever(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let first = store
+            .find_or_create_pending_user("recycled-hash")
+            .await
+            .unwrap();
+        store.erase_user(first).await.unwrap();
+
+        let second = store
+            .find_or_create_pending_user("recycled-hash")
+            .await
+            .unwrap();
+
+        assert_ne!(
+            first, second,
+            "a fresh signup after erasure is a new account"
+        );
+    }
+
     #[sqlx::test]
     async fn unique_constraint_holds_even_on_a_direct_duplicate_insert(pool: PgPool) {
         // Defense-in-depth check of the raw schema constraint, independent
         // of claim_username's app-level slot-picking logic.
         let store = DirectoryStore::from_pool(pool);
-        let u1 = store.create_pending_user("hash-a").await.unwrap();
-        let u2 = store.create_pending_user("hash-b").await.unwrap();
+        let u1 = store.find_or_create_pending_user("hash-a").await.unwrap();
+        let u2 = store.find_or_create_pending_user("hash-b").await.unwrap();
         store.claim_username(u1, "alice").await.unwrap();
 
         let result = sqlx::query(
@@ -417,7 +531,7 @@ mod tests {
         let mut first_user_id = 0;
         for i in 0..99 {
             let u = store
-                .create_pending_user(&format!("hash-{i}"))
+                .find_or_create_pending_user(&format!("hash-{i}"))
                 .await
                 .unwrap();
             if i == 0 {
@@ -427,7 +541,7 @@ mod tests {
             assert_eq!(width, 2, "slot {i} should still fit at width 2");
             assert!(slot <= 99);
         }
-        let u100 = store.create_pending_user("hash-100").await.unwrap();
+        let u100 = store.find_or_create_pending_user("hash-100").await.unwrap();
         let (slot, width) = store.claim_username(u100, "popular").await.unwrap();
         assert_eq!(width, 3, "100th holder must widen to width 3");
         assert_eq!(slot, 100);
@@ -441,7 +555,7 @@ mod tests {
     async fn erase_scrubs_phone_hash_and_starts_cooldown(pool: PgPool) {
         let store = DirectoryStore::from_pool(pool);
         let u = store
-            .create_pending_user("secret-phone-hash")
+            .find_or_create_pending_user("secret-phone-hash")
             .await
             .unwrap();
         store.claim_username(u, "bob").await.unwrap();
@@ -472,12 +586,12 @@ mod tests {
     #[sqlx::test]
     async fn erased_user_excluded_from_search_even_if_searchable_flag_was_set(pool: PgPool) {
         let store = DirectoryStore::from_pool(pool);
-        // auth phone_hash (create_pending_user) and the search hash
+        // auth phone_hash (find_or_create_pending_user) and the search hash
         // (set_searchable) are deliberately independent columns now — this
         // one exercises the search hash the client would actually compute.
         let search_hash = format!("findme0{}", "0".repeat(57));
         let u = store
-            .create_pending_user("unrelated-auth-hash")
+            .find_or_create_pending_user("unrelated-auth-hash")
             .await
             .unwrap();
         store
@@ -495,7 +609,10 @@ mod tests {
     async fn opting_out_of_search_clears_the_search_hash(pool: PgPool) {
         let store = DirectoryStore::from_pool(pool);
         let search_hash = format!("optout0{}", "0".repeat(57));
-        let u = store.create_pending_user("auth-hash").await.unwrap();
+        let u = store
+            .find_or_create_pending_user("auth-hash")
+            .await
+            .unwrap();
         store
             .set_searchable(u, true, Some(&search_hash))
             .await
@@ -514,7 +631,7 @@ mod tests {
     #[sqlx::test]
     async fn find_user_by_handle_matches_claimed_username(pool: PgPool) {
         let store = DirectoryStore::from_pool(pool);
-        let u = store.create_pending_user("h").await.unwrap();
+        let u = store.find_or_create_pending_user("h").await.unwrap();
         let (slot, _width) = store.claim_username(u, "carol").await.unwrap();
 
         assert_eq!(
@@ -531,7 +648,7 @@ mod tests {
     #[sqlx::test]
     async fn session_roundtrip(pool: PgPool) {
         let store = DirectoryStore::from_pool(pool);
-        let u = store.create_pending_user("h").await.unwrap();
+        let u = store.find_or_create_pending_user("h").await.unwrap();
         let token = store.create_session(u);
         assert_eq!(store.session_user_id(&token), Some(u));
         assert_eq!(store.session_user_id("not-a-real-token"), None);
