@@ -19,7 +19,7 @@ use crate::ratelimit::{RateLimiter, UNVERIFIED_SEARCH_PER_MINUTE, VERIFIED_SEARC
 use crate::search::{search_by_prefix, PREFIX_LEN_HEX};
 use crate::store::{ClaimError, DirectoryStore};
 use crate::username::format_handle;
-use crate::verify::{self, OtpVendor, Pepper, VerifyError};
+use crate::verify::{self, OtpVendor, Pepper, VendorError, VerifyError};
 
 pub struct AppState {
     pub store: Arc<DirectoryStore>,
@@ -148,10 +148,15 @@ async fn signup(
             "phone number is in cooldown after a recent deletion",
         ));
     }
-    state
-        .vendor
-        .send_code(&e164)
-        .map_err(|_| ApiError::Internal)?;
+    // Classified exactly like `/verify`'s vendor failure (ET6), and for the
+    // same reason: a vendor outage stops the user *here*, one screen before
+    // the held screen ET8 built for it. Flattening this to 500 made that
+    // screen reachable only if the vendor was up for `send_code` and down for
+    // `verify` seconds later.
+    state.vendor.send_code(&e164).map_err(|e| match e {
+        VendorError::Unavailable => ApiError::VendorUnavailable,
+        VendorError::Other(_) => ApiError::Internal,
+    })?;
     if state
         .store
         .find_user_by_phone_hash(&hash)

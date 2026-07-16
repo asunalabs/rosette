@@ -78,4 +78,28 @@ class OnboardingGateTest {
     fun an_exception_with_no_status_does_not_hold() {
         assertFalse(isVerificationUnavailable(DirectoryException("connection refused")))
     }
+
+    /**
+     * The held chip says "your code is fine". A 400 says it isn't. The hold
+     * must not survive a response that actually checked the code, or the two
+     * render together — the exact false-copy ET8 deleted, re-introduced by a
+     * latch. Reachable in the obvious way: codes expire during an outage, so
+     * held -> "Try again" -> "code rejected" is the common exit from a hold.
+     */
+    @Test
+    fun a_checked_answer_retires_the_hold() {
+        val next = nextAfterVerifyError(phone, DirectoryException("code rejected", status = 400))
+
+        assertIs<OnboardingState.AwaitingOtp>(next)
+        assertFalse(next.held, "a 400 means the code WAS checked — the hold must clear")
+        assertEquals(phone, next.phone)
+    }
+
+    @Test
+    fun an_unchecked_code_holds() {
+        val next = nextAfterVerifyError(phone, DirectoryException("verification temporarily unavailable", status = 503))
+
+        assertIs<OnboardingState.AwaitingOtp>(next)
+        assertTrue(next.held, "a 503 means nobody checked the code — hold, don't blame")
+    }
 }

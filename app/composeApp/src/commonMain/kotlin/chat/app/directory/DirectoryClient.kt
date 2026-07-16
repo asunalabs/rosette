@@ -44,8 +44,12 @@ private data class SignupRequest(val phone: String)
 @Serializable
 private data class VerifyRequest(val phone: String, val code: String)
 
+// `verified` defaults so the server can retire the field (it is hardcoded
+// `true` post-ET6) without a MissingFieldException on clients built today.
+// `ignoreUnknownKeys` covers fields the server adds; only a default covers
+// fields it drops.
 @Serializable
-private data class VerifyResponse(val user_id: Long, val session_token: String, val verified: Boolean)
+private data class VerifyResponse(val user_id: Long, val session_token: String, val verified: Boolean = true)
 
 @Serializable
 private data class UsernameRequest(val nickname: String)

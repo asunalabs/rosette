@@ -102,6 +102,24 @@ internal fun nextAfterVerify(phone: String, result: VerifyResult): OnboardingSta
  */
 internal fun isVerificationUnavailable(e: DirectoryException): Boolean = e.status == 503
 
+/**
+ * ET6/ET8: where a failed `POST /verify` leaves the flow.
+ *
+ * [OnboardingState.AwaitingOtp.held] is true **iff** the directory never checked
+ * the code, so any response we *did* get retires the hold — the chip's "your code
+ * is fine" can never outlive the 503 that earned it. Without that, an outage
+ * followed by a rejected code (the likely pair: codes expire while the vendor is
+ * down) renders "your code is fine" directly above "code rejected", which is the
+ * false-copy class ET8 exists to delete.
+ *
+ * Extracted rather than inlined in the catch block so the *live* path is testable
+ * without a Compose harness. [nextAfterVerify]'s gate is defense-in-depth and is
+ * unreachable from a correct server, so leaving this inline meant the dead branch
+ * had tests and the reachable one had none.
+ */
+internal fun nextAfterVerifyError(phone: String, e: DirectoryException): OnboardingState =
+    OnboardingState.AwaitingOtp(phone, held = isVerificationUnavailable(e))
+
 @Composable
 fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, handle: String, phone: String) -> Unit) {
     val palette = LocalChatPalette.current
@@ -160,11 +178,10 @@ fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, h
                             // ET6/ET8: a vendor outage is a 503 and arrives here, not as
                             // `verified == false`. It is not the user's fault, so it holds
                             // rather than blaming them through the error channel.
-                            if (isVerificationUnavailable(e)) {
-                                state = OnboardingState.AwaitingOtp(s.phone, held = true)
-                            } else {
-                                error = e.message
-                            }
+                            state = nextAfterVerifyError(s.phone, e)
+                            // The held chip explains a 503 on its own; anything else is a
+                            // real answer the user needs to read.
+                            error = if (isVerificationUnavailable(e)) null else e.message
                         } finally {
                             loading = false
                         }

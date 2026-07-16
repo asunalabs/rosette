@@ -25,6 +25,7 @@ fn state_with_vendor(pool: PgPool, vendor: Arc<dyn OtpVendor>) -> Arc<AppState> 
 #[sqlx::test]
 async fn fresh_account_reaches_search_findable_state_end_to_end(pool: PgPool) {
     let state = state_with_vendor(pool, Arc::new(DevOtpVendor));
+    let store_ref = state.store.clone(); // kept for a direct DB check below
     let addr = directory::spawn_for_tests(state).await.unwrap();
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -50,6 +51,23 @@ async fn fresh_account_reaches_search_findable_state_end_to_end(pool: PgPool) {
     let verify_body: serde_json::Value = verify.json().await.unwrap();
     assert_eq!(verify_body["verified"], true);
     let token = verify_body["session_token"].as_str().unwrap().to_string();
+
+    // The response body's `verified` is a server-side constant (api.rs hardcodes
+    // it), so asserting on it proves nothing about the DB. The column is what
+    // `is_verified` reads to pick the search rate-limit tier — assert on that, or
+    // `mark_verified` could write `false` and the whole suite would still pass.
+    let hash = directory::verify::phone_hash(phone, directory::verify::Pepper(b"e2e-test-pepper"))
+        .unwrap();
+    let user_id = store_ref
+        .find_user_by_phone_hash(&hash)
+        .await
+        .unwrap()
+        .expect("verify created the user");
+    assert_eq!(
+        store_ref.is_verified(user_id).await.unwrap(),
+        Some(true),
+        "an approved code must flip the DB flag, not just the response body"
+    );
 
     // 3. username claim
     let username = client
@@ -102,14 +120,55 @@ async fn fresh_account_reaches_search_findable_state_end_to_end(pool: PgPool) {
     assert_eq!(results[0]["handle"], "e2ealice#01");
 }
 
-struct AlwaysTimeoutVendor;
-impl OtpVendor for AlwaysTimeoutVendor {
+/// Up for `send_code`, down for `verify` — deliberately, so the test below
+/// isolates `/verify`: the victim needs a real pending row from `/signup`
+/// before the attacker's `/verify` can be judged. Not a claim that outages
+/// look like this. `AlwaysUnavailableVendor` covers the realistic shape,
+/// where the vendor is down for both calls.
+struct VerifyUnavailableVendor;
+impl OtpVendor for VerifyUnavailableVendor {
     fn send_code(&self, _e164: &str) -> Result<(), VendorError> {
         Ok(())
     }
     fn verify(&self, _e164: &str, _code: &str) -> Result<bool, VendorError> {
-        Err(VendorError::Timeout)
+        Err(VendorError::Unavailable)
     }
+}
+
+/// A real outage: the vendor answers nothing, so `/signup` fails too.
+struct AlwaysUnavailableVendor;
+impl OtpVendor for AlwaysUnavailableVendor {
+    fn send_code(&self, _e164: &str) -> Result<(), VendorError> {
+        Err(VendorError::Unavailable)
+    }
+    fn verify(&self, _e164: &str, _code: &str) -> Result<bool, VendorError> {
+        Err(VendorError::Unavailable)
+    }
+}
+
+/// The held screen ET8 built lives one screen *past* `/signup`, so `/signup`
+/// must classify a vendor outage the same way `/verify` does. It used to
+/// flatten every vendor error to 500, which the client reads as a generic
+/// error — so during the outage the held screen was for, the user never
+/// reached it.
+#[sqlx::test]
+async fn vendor_outage_makes_signup_fail_closed_with_503(pool: PgPool) {
+    let state = state_with_vendor(pool, Arc::new(AlwaysUnavailableVendor));
+    let addr = directory::spawn_for_tests(state).await.unwrap();
+    let base = format!("http://{addr}");
+
+    let res = reqwest::Client::new()
+        .post(format!("{base}/signup"))
+        .json(&serde_json::json!({ "phone": "+15559990003" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "a vendor outage is transient and retryable — 503, not a 500 that reads as our bug"
+    );
 }
 
 /// ARCH-5, the attacker's view: during a vendor outage, an unauthenticated
@@ -119,7 +178,7 @@ impl OtpVendor for AlwaysTimeoutVendor {
 /// below is never checked by anyone — and must therefore buy nothing.
 #[sqlx::test]
 async fn vendor_timeout_mints_no_session_and_leaves_the_victim_unverified(pool: PgPool) {
-    let state = state_with_vendor(pool, Arc::new(AlwaysTimeoutVendor));
+    let state = state_with_vendor(pool, Arc::new(VerifyUnavailableVendor));
     let store_ref = state.store.clone(); // kept for a direct DB check below
     let addr = directory::spawn_for_tests(state).await.unwrap();
     let base = format!("http://{addr}");

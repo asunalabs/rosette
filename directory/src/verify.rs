@@ -63,10 +63,37 @@ pub fn phone_hash(e164: &str, pepper: Pepper) -> Result<String, VerifyError> {
 
 #[derive(Debug)]
 pub enum VendorError {
-    /// Vendor call didn't complete in time. The code is unchecked, so
-    /// `verify_phone` refuses — never a soft-gate (see ARCH-5).
-    Timeout,
+    /// The vendor gave us no usable answer and retrying might get one: a
+    /// timeout, the vendor's own 5xx, a 429, or a connect/DNS/TLS failure.
+    /// The code is unchecked either way, so `verify_phone` refuses — never a
+    /// soft-gate (see ARCH-5). Named for the *consequence*, not the cause:
+    /// it was `Timeout` while only reqwest timeouts landed here, which made
+    /// ET6's 503 cover the rarest outage mode and left every other one a 500.
+    Unavailable,
+    /// A definite answer we can't use — bad credentials, a malformed body, a
+    /// 4xx that retrying won't change. A bug on our side, not an outage.
     Other(String),
+}
+
+/// Non-2xx from the vendor: their outage (5xx) or throttling (429) means our
+/// code went unchecked and a retry can work; anything else is a definite
+/// answer and ours to fix.
+fn classify_status(status: reqwest::StatusCode, what: &str) -> VendorError {
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        VendorError::Unavailable
+    } else {
+        VendorError::Other(format!("twilio {what} failed: {status}"))
+    }
+}
+
+/// No response at all. A timeout or a failure to connect (TCP, DNS, TLS all
+/// surface as `is_connect`) is transient; anything else is ours.
+fn classify_transport(e: reqwest::Error) -> VendorError {
+    if e.is_timeout() || e.is_connect() {
+        VendorError::Unavailable
+    } else {
+        VendorError::Other(e.to_string())
+    }
 }
 
 pub trait OtpVendor: Send + Sync {
@@ -158,12 +185,8 @@ impl OtpVendor for TwilioOtpVendor {
                 .send();
             match result {
                 Ok(resp) if resp.status().is_success() => Ok(()),
-                Ok(resp) => Err(VendorError::Other(format!(
-                    "twilio start-verification failed: {}",
-                    resp.status()
-                ))),
-                Err(e) if e.is_timeout() => Err(VendorError::Timeout),
-                Err(e) => Err(VendorError::Other(e.to_string())),
+                Ok(resp) => Err(classify_status(resp.status(), "start-verification")),
+                Err(e) => Err(classify_transport(e)),
             }
         })
     }
@@ -178,14 +201,8 @@ impl OtpVendor for TwilioOtpVendor {
                 .send();
             let resp = match result {
                 Ok(resp) if resp.status().is_success() => resp,
-                Ok(resp) => {
-                    return Err(VendorError::Other(format!(
-                        "twilio verification-check failed: {}",
-                        resp.status()
-                    )))
-                }
-                Err(e) if e.is_timeout() => return Err(VendorError::Timeout),
-                Err(e) => return Err(VendorError::Other(e.to_string())),
+                Ok(resp) => return Err(classify_status(resp.status(), "verification-check")),
+                Err(e) => return Err(classify_transport(e)),
             };
             let body: serde_json::Value = resp
                 .json()
@@ -241,7 +258,7 @@ pub fn verify_phone(
     match vendor.verify(&e164, code) {
         Ok(true) => {}
         Ok(false) => return Err(VerifyError::CodeRejected),
-        Err(VendorError::Timeout) => return Err(VerifyError::VendorUnavailable),
+        Err(VendorError::Unavailable) => return Err(VerifyError::VendorUnavailable),
         Err(VendorError::Other(msg)) => return Err(VerifyError::Vendor(msg)),
     }
     // Hashed only after approval: Argon2id is deliberately expensive, so an
@@ -305,13 +322,13 @@ mod tests {
         assert!(vendor.is_ok(), "fully configured Twilio env must be picked up");
     }
 
-    struct TimeoutVendor;
-    impl OtpVendor for TimeoutVendor {
+    struct UnavailableVendor;
+    impl OtpVendor for UnavailableVendor {
         fn send_code(&self, _e164: &str) -> Result<(), VendorError> {
             Ok(())
         }
         fn verify(&self, _e164: &str, _code: &str) -> Result<bool, VendorError> {
-            Err(VendorError::Timeout)
+            Err(VendorError::Unavailable)
         }
     }
 
@@ -340,7 +357,7 @@ mod tests {
     #[test]
     fn vendor_timeout_refuses_instead_of_failing_open() {
         let err = verify_phone(
-            &TimeoutVendor,
+            &UnavailableVendor,
             "+15551234567",
             "any-code-at-all",
             Pepper(b"test-pepper"),
@@ -351,8 +368,13 @@ mod tests {
 
     #[test]
     fn wrong_code_is_rejected() {
-        let err = verify_phone(&RejectVendor, "+15551234567", "999999", Pepper(b"test-pepper"))
-            .expect_err("a rejected code must not yield a hash");
+        let err = verify_phone(
+            &RejectVendor,
+            "+15551234567",
+            "999999",
+            Pepper(b"test-pepper"),
+        )
+        .expect_err("a rejected code must not yield a hash");
         assert!(matches!(err, VerifyError::CodeRejected));
     }
 

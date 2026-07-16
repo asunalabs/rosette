@@ -92,5 +92,12 @@ jobs:
       - name: Desktop FFI smoke test (executes bindings)
         run: ./gradlew :engine-kt:desktopTest
 
+      # The app's own tests: the onboarding gate (commonTest) and DirectoryClient's
+      # error paths (desktopTest, stub JDK HttpServer). `assembleDebug` below only
+      # links, so without this line these never run in CI — and they are the gate
+      # that keeps an unverified user out of the app.
+      - name: App unit tests (onboarding gate + directory client)
+        run: ./gradlew :composeApp:desktopTest
+
       - name: Android FFI smoke (codegen + cross-compile + link)
         run: ./gradlew :composeApp:assembleDebug
