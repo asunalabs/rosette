@@ -17,9 +17,16 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 
-/** Thrown for any non-2xx directory response, carrying the server's `error` message when present. */
-class DirectoryException(message: String) : Exception(message)
+/**
+ * Thrown for any non-2xx directory response, carrying the server's `error`
+ * message and the HTTP status when present. [status] is what lets a caller
+ * tell "your code was wrong" (400) from "we never checked your code" (503,
+ * ET6) — a distinction the user is entitled to, since only one of them is
+ * their fault. Null only if the failure had no response at all.
+ */
+class DirectoryException(message: String, val status: Int? = null) : Exception(message)
 
 @Serializable
 data class VerifyResult(val userId: Long, val sessionToken: String, val verified: Boolean)
@@ -85,7 +92,13 @@ class DirectoryClient(baseUrl: String = defaultDirectoryBaseUrl()) {
     private val baseUrl = baseUrl.trimEnd('/')
 
     private val http = HttpClient(CIO) {
-        install(ContentNegotiation) { json() }
+        // Ktor defaults this to false: without it nothing is thrown on 4xx/5xx,
+        // `call`'s handlers below are dead code, and a wrong OTP reaches
+        // `.body()` as an error envelope and crashes on the missing fields.
+        expectSuccess = true
+        // A new field in a directory response must not brick installed clients
+        // (T27's own attestation-token work would add one).
+        install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
     }
 
     /** POST /signup — requests an OTP be sent to `phone`. */
@@ -166,14 +179,14 @@ class DirectoryClient(baseUrl: String = defaultDirectoryBaseUrl()) {
         return res?.contact_link_b64
     }
 
-    /** Runs a Ktor request, mapping non-2xx statuses to a [DirectoryException] with the server's `error` message. */
+    /** Runs a Ktor request, mapping non-2xx statuses to a [DirectoryException] with the server's `error` message and status. */
     private suspend fun call(request: suspend () -> HttpResponse): HttpResponse {
         try {
             return request()
         } catch (e: ClientRequestException) {
-            throw DirectoryException(e.response.errorMessage())
+            throw e.response.asDirectoryException()
         } catch (e: ServerResponseException) {
-            throw DirectoryException(e.response.errorMessage())
+            throw e.response.asDirectoryException()
         }
     }
 
@@ -183,11 +196,14 @@ class DirectoryClient(baseUrl: String = defaultDirectoryBaseUrl()) {
             return request()
         } catch (e: ClientRequestException) {
             if (e.response.status == HttpStatusCode.NotFound) return null
-            throw DirectoryException(e.response.errorMessage())
+            throw e.response.asDirectoryException()
         } catch (e: ServerResponseException) {
-            throw DirectoryException(e.response.errorMessage())
+            throw e.response.asDirectoryException()
         }
     }
+
+    private suspend fun HttpResponse.asDirectoryException(): DirectoryException =
+        DirectoryException(errorMessage(), status.value)
 
     private suspend fun HttpResponse.errorMessage(): String =
         try { body<ErrorBody>().error } catch (_: Exception) { "directory request failed" }

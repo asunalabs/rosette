@@ -172,9 +172,26 @@ implementation (JS/SVG v0): `docs/design/design-preview.html`.
 - **Breakpoint:** 700dp — desktop is icon rail (60dp) + chat list pane
   (290dp) + conversation pane. Device link is a centered card: QR on white
   tile + numbered steps.
-- **Bottom navigation (mobile):** floating pill tab bar (Chats / Calls /
-  Settings), selected tab = `surface2` pill.
-- **FAB:** 52dp accent circle, bottom-right above the tab bar.
+- **Bottom navigation (mobile):** floating pill tab bar (Chats / Calls),
+  selected tab = `surface2` pill. **Settings is NOT a tab** (amended
+  2026-07-16) — see "You menu" below.
+- **You menu (amended 2026-07-16):** the chat list's top-left is your own
+  Rosette (36dp). Tapping it expands a Signal-style dropdown carrying your
+  handle and a link to the Settings screen. Rationale: Settings is chrome,
+  not a destination — the tab bar is for places you go, and your identity
+  belongs where Signal's structural language puts it. The dropdown is the
+  ONLY route to Settings.
+- **Your handle is never hidden.** It appears in the You menu in Plex Mono
+  (`mira#07` is a crypto fact, per Typography) and is tap-to-copy. A user who
+  cannot recite their own handle cannot be found, which defeats the directory.
+- **FAB:** 52dp accent circle, bottom-right above the tab bar. Opens **Find
+  people** as a pushed screen (amended 2026-07-16 — Find people is a FAB
+  destination, not a tab; that's why it has a back affordance).
+- **Verification lives in the conversation (amended 2026-07-16):** the
+  conversation header's name is tappable → contact sheet (Rosette large,
+  handle in mono, "Verify safety number") → compare screen → on success,
+  the ceremony fires. "Is this really them?" is a question asked *inside a
+  conversation*, so it is answered there — never in Settings.
 
 ## Motion
 - **Approach:** minimal-functional; calm.
@@ -205,3 +222,8 @@ implementation (JS/SVG v0): `docs/design/design-preview.html`.
 | 2026-07-14 | Bubbles: solid-accent outgoing + white text, quiet-gray incoming, uniform 18dp, inline trailing timestamps | Old tinted `bubbleMine` read washed-out; timestamp-as-row wasted space; rounded beats rectangular next to pills + circles |
 | 2026-07-14 | Iconography = Lucide, strokes only | Founder rejected placeholder glyphs; Lucide is ISC, consistent, non-Material |
 | 2026-07-14 | Onboarding priority order; flag emoji in country-code segment; "Restore account" CTA copy | Founder: old onboarding screens were the weakest surface |
+| 2026-07-16 | **Settings moves out of the tab bar** into a top-left Rosette → Signal-style dropdown. Tab bar becomes Chats / Calls | /plan-design-review: Settings is chrome, not a destination; matches the Signal skeleton already adopted; frees the tab bar |
+| 2026-07-16 | **Find people is a FAB destination, not a tab** | Its back arrow proved it was never a tab; restores DESIGN.md's specced FAB and gives the chat list its missing compose affordance |
+| 2026-07-16 | **Verification = conversation header → contact sheet → safety numbers**, then the ceremony | The trust question is asked inside a conversation, so it's answered there. `markVerified` had zero call sites; the Rosette's verified band and "the one ceremony" were unreachable code |
+| 2026-07-16 | **`warning` token owns "we're waiting on our own infrastructure"; `error` stays quarantined to real user-facing failures** | A vendor outage is not the user's failure. Rendering it in `error` both spends the one token that means something and blames the wrong party (T27 held state) |
+| 2026-07-16 | **Onboarding steps get a back affordance; `error` clears on every transition** | A mistyped number was an unescapable dead end; `onRestore`'s message leaked across steps and glowed red under an unrelated CTA |

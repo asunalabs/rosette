@@ -38,6 +38,16 @@ kotlin {
             implementation(libs.ktor.serialization.kotlinx.json)
             implementation(libs.kotlinx.serialization.json)
         }
+        commonTest.dependencies {
+            implementation(kotlin("test"))
+        }
+        // DirectoryClient's error paths (ET7) are tested against a stub JDK
+        // HttpServer, which is JVM-only — hence desktopTest, not commonTest.
+        val desktopTest by getting {
+            dependencies {
+                implementation(kotlin("test"))
+            }
+        }
         androidMain.dependencies {
             implementation(libs.androidx.activity.compose)
         }

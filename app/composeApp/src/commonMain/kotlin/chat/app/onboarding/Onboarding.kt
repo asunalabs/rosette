@@ -37,13 +37,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.app.directory.DirectoryClient
 import chat.app.directory.DirectoryException
+import chat.app.directory.VerifyResult
 import chat.app.directory.normalizePhoneInput
 import chat.app.theme.ChatMonoStyle
 import chat.app.theme.InstrumentButton
 import chat.app.theme.InstrumentField
 import chat.app.theme.InstrumentPhoneField
+import chat.app.theme.InstrumentStatusChip
 import chat.app.theme.LocalChatPalette
 import chat.app.theme.Rosette
+import chat.app.theme.StatusTone
 import kotlinx.coroutines.launch
 
 /**
@@ -57,9 +60,47 @@ import kotlinx.coroutines.launch
 sealed interface OnboardingState {
     data object Welcome : OnboardingState
     data object PhoneEntry : OnboardingState
-    data class AwaitingOtp(val phone: String) : OnboardingState
+    /** [held] = the directory could not check the code at all (vendor outage, 503 — see [isVerificationUnavailable]); the code is unproven, not wrong. */
+    data class AwaitingOtp(val phone: String, val held: Boolean = false) : OnboardingState
     data class ClaimUsername(val sessionToken: String, val phone: String) : OnboardingState
 }
+
+/**
+ * T27's gate, extracted as one pure decision so it is testable without a UI.
+ *
+ * **Defense-in-depth as of ET6, not the gate.** The real gate is now server-side:
+ * `directory` mints a session only for a code the OTP vendor affirmatively
+ * approved, so `verified == false` should never reach this client. This check is
+ * deliberately kept (founder decision, 2026-07-16) so a future server regression
+ * cannot walk an unverified human into the app. It costs five lines.
+ *
+ * The `else` branch is therefore unreachable from a correct server. Do not
+ * delete it, and do not treat it as the vendor-outage path — that is
+ * [isVerificationUnavailable], driven off the 503.
+ */
+internal fun nextAfterVerify(phone: String, result: VerifyResult): OnboardingState =
+    if (result.verified) {
+        OnboardingState.ClaimUsername(result.sessionToken, phone)
+    } else {
+        OnboardingState.AwaitingOtp(phone, held = true)
+    }
+
+/**
+ * ET6/ET8: did the directory fail to *check* the code, as opposed to rejecting it?
+ *
+ * A 503 from `POST /verify` means the OTP vendor never answered, so the code was
+ * never checked and the user is not at fault: they get the held treatment (digits
+ * stay put, warning chip, "your code is fine"), not the error channel, which reads
+ * as blame. A 400 ("code rejected") is the user's to fix and stays an error.
+ *
+ * ponytail: `accounts_enabled = false` also returns 503 (`ApiError::FeatureDisabled`),
+ * so flipping that flag mid-flow would show "Try again" for something retrying can
+ * never fix. Not worth a wire-format change today: `/signup` checks the same flag one
+ * screen earlier, so a user can only reach here if the flag flipped between the two
+ * calls. If that stops being true, give the API a machine-readable error code and
+ * match on it here instead of on the status.
+ */
+internal fun isVerificationUnavailable(e: DirectoryException): Boolean = e.status == 503
 
 @Composable
 fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, handle: String, phone: String) -> Unit) {
@@ -68,6 +109,13 @@ fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, h
     var error by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+
+    // Every transition clears the error — otherwise a message about the step
+    // you left (e.g. Restore) keeps glowing under the step you're on.
+    fun goTo(next: OnboardingState) {
+        error = null
+        state = next
+    }
 
     fun sendCode(rawPhone: String) {
         loading = true; error = null
@@ -88,22 +136,35 @@ fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, h
         Box(Modifier.weight(1f)) {
             when (val s = state) {
                 is OnboardingState.Welcome -> WelcomeStep(
-                    onContinue = { state = OnboardingState.PhoneEntry },
+                    onContinue = { goTo(OnboardingState.PhoneEntry) },
                     onRestore = { error = "Restore isn't available yet." },
                 )
-                is OnboardingState.PhoneEntry -> PhoneEntryStep(loading, ::sendCode)
+                is OnboardingState.PhoneEntry -> PhoneEntryStep(
+                    loading = loading,
+                    onBack = { goTo(OnboardingState.Welcome) },
+                    onSubmit = ::sendCode,
+                )
                 is OnboardingState.AwaitingOtp -> OtpStep(
                     phone = s.phone,
                     loading = loading,
+                    held = s.held,
+                    onBack = { goTo(OnboardingState.PhoneEntry) },
                     onResend = { sendCode(s.phone) },
                 ) { code ->
                     loading = true; error = null
                     scope.launch {
                         try {
-                            val result = client.verify(s.phone, code)
-                            state = OnboardingState.ClaimUsername(result.sessionToken, s.phone)
+                            // T27: `verified`, not just `sessionToken` — see nextAfterVerify.
+                            state = nextAfterVerify(s.phone, client.verify(s.phone, code))
                         } catch (e: DirectoryException) {
-                            error = e.message
+                            // ET6/ET8: a vendor outage is a 503 and arrives here, not as
+                            // `verified == false`. It is not the user's fault, so it holds
+                            // rather than blaming them through the error channel.
+                            if (isVerificationUnavailable(e)) {
+                                state = OnboardingState.AwaitingOtp(s.phone, held = true)
+                            } else {
+                                error = e.message
+                            }
                         } finally {
                             loading = false
                         }
@@ -177,11 +238,11 @@ private fun WelcomeStep(onContinue: () -> Unit, onRestore: () -> Unit) {
 }
 
 @Composable
-private fun PhoneEntryStep(loading: Boolean, onSubmit: (phone: String) -> Unit) {
+private fun PhoneEntryStep(loading: Boolean, onBack: () -> Unit, onSubmit: (phone: String) -> Unit) {
     var countryCode by remember { mutableStateOf("") }
     var number by remember { mutableStateOf("") }
     Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(34.dp))
+        BackRow("Back", onBack)
         StepHeader(
             headline = "Your phone number",
             body = "Used once to prove you're a person, then hashed. It's hidden by default and never shown to anyone.",
@@ -206,30 +267,75 @@ private fun PhoneEntryStep(loading: Boolean, onSubmit: (phone: String) -> Unit) 
 private const val OTP_LENGTH = 6
 
 @Composable
-private fun OtpStep(phone: String, loading: Boolean, onResend: () -> Unit, onSubmit: (code: String) -> Unit) {
+private fun OtpStep(
+    phone: String,
+    loading: Boolean,
+    held: Boolean,
+    onBack: () -> Unit,
+    onResend: () -> Unit,
+    onSubmit: (code: String) -> Unit,
+) {
     val palette = LocalChatPalette.current
     var code by remember { mutableStateOf("") }
     Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(34.dp))
+        BackRow("Change number", onBack)
         StepHeader(
             headline = "Enter the code",
             body = "We sent a $OTP_LENGTH-digit code to $phone.",
         )
         Spacer(Modifier.height(28.dp))
-        OtpCells(code = code, onChange = { code = it })
-        Spacer(Modifier.height(20.dp))
-        Text(
-            "Resend code",
-            style = MaterialTheme.typography.labelLarge,
-            color = palette.accent,
-            modifier = Modifier.clickable(enabled = !loading, onClick = onResend).padding(4.dp),
-        )
+        // Held: the digits stay put and dim — they were accepted-looking, we
+        // just can't confirm them. Clearing them would imply they were wrong.
+        OtpCells(code = code, onChange = { code = it }, dimmed = held)
+        if (held) {
+            Spacer(Modifier.height(20.dp))
+            // ET8 (founder decision, 2026-07-16): the chip carries this screen alone.
+            // The reassurance line that used to sit here ("Your number isn't
+            // registered until we confirm it, so nothing has been saved") was false
+            // on every count: `POST /signup` durably wrote a peppered Argon2id hash
+            // one screen ago (store.rs `create_pending_user`). The honest rewrite was
+            // rejected too, for two reasons: it cannot promise erasure (that needs a
+            // session, and ET6 deliberately mints none here), and it answers "should I
+            // hand over my number" one screen after the number was handed over. If
+            // that promise is worth making, it belongs on PhoneEntry, where the user
+            // can still act on it. Do not restore a claim here without tracing every
+            // clause to a line in directory/src/{api.rs,store.rs}.
+            InstrumentStatusChip("Can't reach verification — your code is fine", tone = StatusTone.Warning)
+        } else {
+            Spacer(Modifier.height(20.dp))
+            Text(
+                "Resend code",
+                style = MaterialTheme.typography.labelLarge,
+                color = palette.accent,
+                modifier = Modifier.clickable(enabled = !loading, onClick = onResend).padding(4.dp),
+            )
+        }
         Spacer(Modifier.weight(1f))
         InstrumentButton(
-            text = if (loading) "Verifying…" else "Verify",
+            text = if (loading) "Verifying…" else if (held) "Try again" else "Verify",
             onClick = { onSubmit(code) },
             enabled = !loading && code.length == OTP_LENGTH,
             loading = loading,
+        )
+        if (held) {
+            Spacer(Modifier.height(12.dp))
+            InstrumentButton("Use a different number", onClick = onBack, primary = false)
+        }
+    }
+}
+
+/** Back affordance for every post-Welcome step — without it, a mistyped number is a dead end. */
+@Composable
+private fun BackRow(label: String, onBack: () -> Unit) {
+    val palette = LocalChatPalette.current
+    Row(modifier = Modifier.fillMaxWidth().height(34.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            // ponytail: text glyph matches the rest of the app's placeholder icons;
+            // swaps for Lucide chevron-left with the others (see TODO 13).
+            "‹  $label",
+            style = MaterialTheme.typography.labelMedium,
+            color = palette.muted,
+            modifier = Modifier.clickable(onClick = onBack).padding(vertical = 6.dp, horizontal = 4.dp),
         )
     }
 }
@@ -240,12 +346,12 @@ private fun OtpStep(phone: String, loading: Boolean, onResend: () -> Unit, onSub
  * overlays the row and owns focus/IME.
  */
 @Composable
-private fun OtpCells(code: String, onChange: (String) -> Unit) {
+private fun OtpCells(code: String, onChange: (String) -> Unit, dimmed: Boolean = false) {
     val palette = LocalChatPalette.current
     Box {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             repeat(OTP_LENGTH) { i ->
-                val active = i == code.length
+                val active = i == code.length && !dimmed
                 Box(
                     modifier = Modifier
                         .width(40.dp)
@@ -255,7 +361,11 @@ private fun OtpCells(code: String, onChange: (String) -> Unit) {
                         .then(if (active) Modifier.border(2.dp, palette.accent, RoundedCornerShape(12.dp)) else Modifier),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Text(code.getOrNull(i)?.toString() ?: "", style = ChatMonoStyle.copy(fontSize = 20.sp), color = palette.ink)
+                    Text(
+                        code.getOrNull(i)?.toString() ?: "",
+                        style = ChatMonoStyle.copy(fontSize = 20.sp),
+                        color = if (dimmed) palette.muted else palette.ink,
+                    )
                 }
             }
         }
