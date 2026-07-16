@@ -179,6 +179,15 @@ implementation (JS/SVG v0): `docs/design/design-preview.html`.
   then optional secondary pill 12dp below).
 
 ## Layout
+
+> **Read the SPECCED, NOT BUILT markers below before filing a QA bug.** CLAUDE.md
+> makes this file normative and tells QA to flag code that doesn't match it, so a
+> spec written in the present tense about something unbuilt manufactures a
+> permanent QA violation — the reviewer can only conclude the code is wrong.
+> Marked entries are the design we intend; the "Today:" line under each is what
+> the app actually renders. Added by ET9 (2026-07-16) after DOC-1 found three of
+> them; drop a marker only in the commit that makes its claim true.
+
 - **Approach:** standard messenger anatomy on purpose (familiarity is the
   wedge). Onboarding flow: welcome → phone verify (flag + country code in
   the input pill's leading segment) → OTP (mono cells) → username claim.
@@ -186,26 +195,41 @@ implementation (JS/SVG v0): `docs/design/design-preview.html`.
 - **Breakpoint:** 700dp — desktop is icon rail (60dp) + chat list pane
   (290dp) + conversation pane. Device link is a centered card: QR on white
   tile + numbered steps.
-- **Bottom navigation (mobile):** floating pill tab bar (Chats / Calls),
-  selected tab = `surface2` pill. **Settings is NOT a tab** (amended
-  2026-07-16) — see "You menu" below.
+- **Bottom navigation (mobile):** floating pill tab bar, selected tab =
+  `surface2` pill. **Settings is NOT a tab** (amended 2026-07-16) — see "You
+  menu" below.
+  - **SPECCED, NOT BUILT (DT9).** *Today:* `App.kt:92` renders
+    `listOf("Chats", "Find people")`. Neither the old spec (Chats / Calls) nor
+    the new one (Find people is a FAB destination, below) describes it — the tab
+    bar currently matches nothing, which is why this marker exists.
 - **You menu (amended 2026-07-16):** the chat list's top-left is your own
   Rosette (36dp). Tapping it expands a Signal-style dropdown carrying your
   handle and a link to the Settings screen. Rationale: Settings is chrome,
   not a destination — the tab bar is for places you go, and your identity
   belongs where Signal's structural language puts it. The dropdown is the
   ONLY route to Settings.
+  - **SPECCED, NOT BUILT (DT4).** *Today:* `ChatListScreen.kt` renders a plain
+    `Text("Chats")` top-left, no Rosette and no dropdown. **There is no Settings
+    screen at all**, so "the dropdown is the only route to Settings" is
+    currently true only in the vacuous sense.
 - **Your handle is never hidden.** It appears in the You menu in Plex Mono
   (`mira#07` is a crypto fact, per Typography) and is tap-to-copy. A user who
   cannot recite their own handle cannot be found, which defeats the directory.
+  - **SPECCED, NOT BUILT (DT4)** — depends on the You menu above.
 - **FAB:** 52dp accent circle, bottom-right above the tab bar. Opens **Find
   people** as a pushed screen (amended 2026-07-16 — Find people is a FAB
   destination, not a tab; that's why it has a back affordance).
+  - **SPECCED, NOT BUILT (DT9).** *Today:* no FAB exists anywhere, and Find
+    people is reached as a tab (`App.kt:92`) — the exact arrangement this entry
+    amends away from.
 - **Verification lives in the conversation (amended 2026-07-16):** the
   conversation header's name is tappable → contact sheet (Rosette large,
   handle in mono, "Verify safety number") → compare screen → on success,
   the ceremony fires. "Is this really them?" is a question asked *inside a
   conversation*, so it is answered there — never in Settings.
+  - **SPECCED, NOT BUILT (DT6).** *Today:* `ConversationScreen.kt` renders the
+    name as plain text with no `clickable`, there is no contact sheet or compare
+    screen, and `markVerified` has no call site in the app.
 
 ## Motion
 - **Approach:** minimal-functional; calm.

@@ -15,7 +15,10 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::config::DirectoryConfig;
-use crate::ratelimit::{RateLimiter, UNVERIFIED_SEARCH_PER_MINUTE, VERIFIED_SEARCH_PER_MINUTE};
+use crate::ratelimit::{
+    self, RateLimiter, UNVERIFIED_SEARCH_PER_MINUTE, VERIFIED_SEARCH_PER_MINUTE,
+    VERIFY_ATTEMPTS_PER_MINUTE,
+};
 use crate::search::{search_by_prefix, PREFIX_LEN_HEX};
 use crate::store::{ClaimError, DirectoryStore};
 use crate::username::format_handle;
@@ -211,6 +214,25 @@ async fn verify_handler(
 ) -> Result<Json<VerifyResponse>, ApiError> {
     if !state.config.accounts_enabled {
         return Err(ApiError::FeatureDisabled);
+    }
+    // ET1: throttle before the vendor call, not after. This endpoint is
+    // unauthenticated by construction — it is how a caller *gets* a session — so
+    // the key is the number being claimed, not a `user_id`. Guarding here is
+    // what makes it a guard at all: `verify_phone` is where the 6-digit guess is
+    // spent and where a worker gets pinned for the vendor round trip, so a check
+    // after it would count the damage rather than prevent it.
+    //
+    // Normalizing twice (here and inside `verify_phone`) is deliberate: it costs
+    // a string scan and keeps the guard readable at the top of the handler,
+    // rather than threading a pre-normalized number through `verify_phone`'s
+    // signature to save it.
+    let e164 =
+        verify::normalize_e164(&req.phone).map_err(|_| ApiError::BadRequest("invalid phone"))?;
+    if !state
+        .rate_limiter
+        .check_and_bump_phone(ratelimit::phone_rate_key(&e164), VERIFY_ATTEMPTS_PER_MINUTE)
+    {
+        return Err(ApiError::RateLimited);
     }
     // `verify_phone` returning Ok IS the verification — a vendor timeout is a
     // 503 here, never a session (ARCH-5). Everything below this line is
@@ -777,6 +799,7 @@ mod tests {
             .unwrap();
         let token = state.store.create_session(user_id);
 
+        let state_ref = state.clone(); // the store outlives the move into the server
         let addr = spawn_for_tests(state).await.unwrap();
         let client = reqwest::Client::new();
         let resp = client
@@ -787,13 +810,38 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
 
-        // Now findable-by-search must return nothing for that prefix.
-        let search = client
+        // ET2: the token that just erased the account must stop working. Until
+        // ET2 it kept authenticating against a dangling `user_id` — the rows were
+        // gone and the session was not, so an erased account's bearer token was
+        // still a valid caller.
+        let after_erase = client
             .get(format!("http://{addr}/search?prefix=erase"))
             .header("Authorization", format!("Bearer {token}"))
             .send()
             .await
             .unwrap();
+        assert_eq!(
+            after_erase.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "erasure must revoke the session, not just the rows"
+        );
+
+        // ...and the account is gone from search. Checked with a *different*,
+        // live caller: asserting this with the erased user's own token (as this
+        // test used to) now only proves the 401 above, not the removal.
+        let onlooker = state_ref
+            .store
+            .find_or_create_pending_user("onlooker-hash-000000000000000000000000000000000000000000")
+            .await
+            .unwrap();
+        let onlooker_token = state_ref.store.create_session(onlooker);
+        let search = client
+            .get(format!("http://{addr}/search?prefix=erase"))
+            .header("Authorization", format!("Bearer {onlooker_token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(search.status(), reqwest::StatusCode::OK);
         let body: serde_json::Value = search.json().await.unwrap();
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
     }

@@ -171,6 +171,67 @@ async fn vendor_outage_makes_signup_fail_closed_with_503(pool: PgPool) {
     );
 }
 
+/// ET1: `/verify` is unauthenticated by construction, so before this the only
+/// thing standing between an attacker and a victim's 6-digit code was whatever
+/// attempt cap the OTP vendor happened to enforce — a property of the vendor,
+/// not of us, and `OtpVendor` exists to make vendors swappable.
+#[sqlx::test]
+async fn brute_forcing_one_numbers_otp_hits_a_429(pool: PgPool) {
+    let state = state_with_vendor(pool, Arc::new(DevOtpVendor));
+    let addr = directory::spawn_for_tests(state).await.unwrap();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let phone = "+15559990005";
+    client
+        .post(format!("{base}/signup"))
+        .json(&serde_json::json!({ "phone": phone }))
+        .send()
+        .await
+        .unwrap();
+
+    // Guess wrong, repeatedly, exactly as a script would.
+    let mut statuses = Vec::new();
+    for i in 0..12 {
+        let res = client
+            .post(format!("{base}/verify"))
+            .json(&serde_json::json!({ "phone": phone, "code": format!("{i:06}") }))
+            .send()
+            .await
+            .unwrap();
+        statuses.push(res.status());
+    }
+
+    assert!(
+        statuses.contains(&reqwest::StatusCode::TOO_MANY_REQUESTS),
+        "a sustained guess flood must be throttled, got: {statuses:?}"
+    );
+    let allowed = statuses
+        .iter()
+        .filter(|s| **s != reqwest::StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert_eq!(
+        allowed, 5,
+        "only the window's worth of guesses may reach the vendor"
+    );
+
+    // The throttle must not become an oracle: a rejected guess and a throttled
+    // one already differ (400 vs 429), but neither may leak a session.
+    let last: serde_json::Value = client
+        .post(format!("{base}/verify"))
+        .json(&serde_json::json!({ "phone": phone, "code": DEV_OTP_CODE }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        last.get("session_token").is_none(),
+        "even the correct code must wait out the window, got: {last}"
+    );
+}
+
 /// ET14, the attacker's view: `/verify` is the second endpoint that creates
 /// users, and it never checked OQ5's post-deletion cooldown — only `/signup`
 /// did. So the 24h lock was one HTTP call wide: erase, then re-verify with the

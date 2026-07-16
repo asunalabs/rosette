@@ -6,6 +6,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 /**
@@ -88,19 +89,72 @@ class OnboardingGateTest {
      */
     @Test
     fun a_checked_answer_retires_the_hold() {
-        val next = nextAfterVerifyError(phone, DirectoryException("code rejected", status = 400))
+        val held = OnboardingState.AwaitingOtp(phone, held = true, attempts = 2)
+
+        val next = nextAfterVerifyError(held, phone, DirectoryException("code rejected", status = 400))
 
         assertIs<OnboardingState.AwaitingOtp>(next)
         assertFalse(next.held, "a 400 means the code WAS checked — the hold must clear")
+        assertEquals(0, next.attempts, "a checked answer ends the outage streak")
         assertEquals(phone, next.phone)
     }
 
     @Test
     fun an_unchecked_code_holds() {
-        val next = nextAfterVerifyError(phone, DirectoryException("verification temporarily unavailable", status = 503))
+        val next = nextAfterVerifyError(
+            OnboardingState.AwaitingOtp(phone),
+            phone,
+            DirectoryException("verification temporarily unavailable", status = 503),
+        )
 
         assertIs<OnboardingState.AwaitingOtp>(next)
         assertTrue(next.held, "a 503 means nobody checked the code — hold, don't blame")
+    }
+
+    // ET3: `held` alone is not a state machine. A repeated outage assigned an
+    // equal data-class value, and Compose skips recomposition on an equal value,
+    // so "Try again" into a continuing outage changed nothing on screen.
+
+    @Test
+    fun a_repeated_outage_produces_a_different_state_so_the_screen_can_react() {
+        val outage = DirectoryException("verification temporarily unavailable", status = 503)
+
+        val first = nextAfterVerifyError(OnboardingState.AwaitingOtp(phone), phone, outage)
+        val second = nextAfterVerifyError(first, phone, outage)
+
+        assertNotEquals(
+            first,
+            second,
+            "two identical holds must not be an equal value — Compose would skip the recomposition",
+        )
+        assertEquals(1, (first as OnboardingState.AwaitingOtp).attempts)
+        assertEquals(2, (second as OnboardingState.AwaitingOtp).attempts)
+    }
+
+    @Test
+    fun the_chip_escalates_once_retrying_is_clearly_not_working() {
+        assertEquals(heldChipText(1), heldChipText(2), "one hiccup is not a story")
+        assertTrue(
+            heldChipText(1).contains("your code is fine"),
+            "the first hold reassures: this isn't the user's doing",
+        )
+        assertTrue(
+            heldChipText(3).contains("3"),
+            "by the third the user needs a reason to stop, not the same calm sentence",
+        )
+        assertNotEquals(heldChipText(3), heldChipText(4), "the count keeps moving")
+    }
+
+    /** The streak counts outages, so an unrelated step must not inherit one. */
+    @Test
+    fun an_outage_streak_does_not_leak_in_from_another_step() {
+        val next = nextAfterVerifyError(
+            OnboardingState.PhoneEntry(held = true),
+            phone,
+            DirectoryException("verification temporarily unavailable", status = 503),
+        )
+
+        assertEquals(1, (next as OnboardingState.AwaitingOtp).attempts)
     }
 
     // ET17: /signup calls the same vendor /verify does, so it owes the same rule.

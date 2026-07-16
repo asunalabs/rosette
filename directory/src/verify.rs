@@ -164,13 +164,26 @@ pub struct TwilioOtpVendor {
     client: reqwest::blocking::Client,
 }
 
+/// ET1: `reqwest::blocking` defaults to 30s. That default is for a batch job,
+/// not for a human staring at an OTP screen — and every second of it pins a
+/// worker via `block_in_place`, which is the amplifier that made ARCH-5's bypass
+/// floodable. 10s is well past Twilio's normal latency; past that the user has
+/// given up anyway, and a slow answer is indistinguishable from no answer, which
+/// is `Unavailable` -> 503 -> the held screen, exactly where it should land.
+const VENDOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl TwilioOtpVendor {
     pub fn new(account_sid: String, auth_token: String, verify_service_sid: String) -> Self {
         Self {
             account_sid,
             auth_token,
             verify_service_sid,
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(VENDOR_TIMEOUT)
+                .build()
+                // Only fails if the TLS backend can't initialise, which is a
+                // broken build, not a runtime condition.
+                .expect("reqwest client with a timeout"),
         }
     }
 

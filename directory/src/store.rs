@@ -116,11 +116,17 @@ impl DirectoryStore {
         Ok(row.map(|r| r.get::<i64, _>("user_id") as u64))
     }
 
+    /// `AND deleted_at IS NULL` (ET2): this was the only lookup in the store
+    /// without it — `find_user_by_phone_hash`, `find_user_by_handle` and
+    /// `bucket` all carry it — so an erased user read as whatever `verified`
+    /// their tombstone still held. `None` now means "no live user", which is
+    /// what the search tier's `unwrap_or(false)` already assumed it meant.
     pub async fn is_verified(&self, user_id: u64) -> sqlx::Result<Option<bool>> {
-        let row = sqlx::query("SELECT verified FROM users WHERE user_id = $1")
-            .bind(user_id as i64)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row =
+            sqlx::query("SELECT verified FROM users WHERE user_id = $1 AND deleted_at IS NULL")
+                .bind(user_id as i64)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|r| r.get::<bool, _>("verified")))
     }
 
@@ -293,9 +299,15 @@ impl DirectoryStore {
                 .execute(&mut *tx)
                 .await?;
         }
+        // ET2: `verified = false` belongs here. Erasure is the one thing that
+        // *should* un-verify, and ET6 deliberately removed the API for it
+        // (`mark_verified` hardcodes true), so this is the statement that has to
+        // say it. Without it the tombstone stays `verified = true` forever, which
+        // is what a dangling token reads to pick the 30/min search tier.
         sqlx::query(
             "UPDATE users SET phone_hash = '', phone_hash_prefix = '', searchable = false,
-                phone_search_hash = '', phone_search_hash_prefix = '', deleted_at = $1
+                phone_search_hash = '', phone_search_hash_prefix = '', verified = false,
+                deleted_at = $1
              WHERE user_id = $2",
         )
         .bind(now_unix())
@@ -309,6 +321,21 @@ impl DirectoryStore {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        // ET2: after the rows are gone, drop the tokens. `authenticate` resolves
+        // callers *solely* through this map, so until now a bearer token issued
+        // before erasure kept working against a dangling `user_id` — the account
+        // was deleted and its session was not. Deliberately after `commit`: a
+        // revoked session with a rolled-back erasure would lock out a live user.
+        //
+        // ponytail: O(n) scan over live sessions, because the map has no
+        // user_id -> tokens direction. n is "sessions since the last restart" and
+        // erasure is rare. A reverse index if that stops being true — or,
+        // better, sessions in Postgres, which is the same change that would give
+        // them a TTL (the map only grows today) and let them survive a restart.
+        self.sessions
+            .lock()
+            .unwrap()
+            .retain(|_, uid| *uid != user_id);
         Ok(())
     }
 
@@ -407,6 +434,67 @@ impl PrefixIndex for DirectoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ET2: `authenticate` resolves every caller through the sessions map alone,
+    /// so a token that outlives its account is a live caller with a dangling
+    /// `user_id`. Erasure has to take the tokens with the rows.
+    #[sqlx::test]
+    async fn erasure_revokes_every_session_the_account_held(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let user = store
+            .find_or_create_pending_user("erase-sessions-hash")
+            .await
+            .unwrap();
+        // More than one, because erasure keys on the user and the map keys on
+        // the token: a fix that only dropped "the" token would pass with one.
+        let phone = store.create_session(user);
+        let laptop = store.create_session(user);
+        let bystander = store
+            .find_or_create_pending_user("bystander-hash")
+            .await
+            .unwrap();
+        let bystander_token = store.create_session(bystander);
+
+        store.erase_user(user).await.unwrap();
+
+        assert_eq!(
+            store.session_user_id(&phone),
+            None,
+            "erased account's token still authenticates"
+        );
+        assert_eq!(
+            store.session_user_id(&laptop),
+            None,
+            "every session, not just the last one"
+        );
+        assert_eq!(
+            store.session_user_id(&bystander_token),
+            Some(bystander),
+            "erasing one account must not sign everyone else out"
+        );
+    }
+
+    /// The tombstone must not keep reporting `verified = true`: `is_verified` is
+    /// what the search tier reads, so a stale `true` on an erased row hands a
+    /// dangling caller the 30/min tier instead of 5/min.
+    #[sqlx::test]
+    async fn erasure_un_verifies_and_is_verified_ignores_tombstones(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let user = store
+            .find_or_create_pending_user("unverify-hash")
+            .await
+            .unwrap();
+        store.mark_verified(user).await.unwrap();
+        assert_eq!(store.is_verified(user).await.unwrap(), Some(true));
+
+        store.erase_user(user).await.unwrap();
+
+        assert_eq!(
+            store.is_verified(user).await.unwrap(),
+            None,
+            "an erased user is not a live user — no verified state to report"
+        );
+    }
 
     /// ET15: the find-or-create used to be two statements, so two callers could
     /// both see "no row" and both insert. `erase_user` takes a single `user_id`
