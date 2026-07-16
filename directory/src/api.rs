@@ -40,7 +40,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/account", delete(delete_account))
         .route("/search", get(search))
         .route("/pairing-bootstrap", post(set_pairing_bootstrap))
-        .route("/pairing-bootstrap/request", post(request_pairing_bootstrap))
+        .route(
+            "/pairing-bootstrap/request",
+            post(request_pairing_bootstrap),
+        )
         .with_state(state)
         .layer(middleware::from_fn(no_store_middleware))
 }
@@ -530,12 +533,28 @@ mod tests {
     #[sqlx::test]
     async fn pairing_bootstrap_is_consumed_exactly_once(pool: PgPool) {
         let state = state_for(pool);
-        let target = state.store.create_pending_user("target-hash-0").await.unwrap();
-        state.store.claim_username(target, "pairtarget").await.unwrap();
-        state.store.set_searchable(target, true, Some(&"a".repeat(64))).await.unwrap();
+        let target = state
+            .store
+            .create_pending_user("target-hash-0")
+            .await
+            .unwrap();
+        state
+            .store
+            .claim_username(target, "pairtarget")
+            .await
+            .unwrap();
+        state
+            .store
+            .set_searchable(target, true, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
         let target_token = state.store.create_session(target);
 
-        let requester = state.store.create_pending_user("requester-hash-0").await.unwrap();
+        let requester = state
+            .store
+            .create_pending_user("requester-hash-0")
+            .await
+            .unwrap();
         let requester_token = state.store.create_session(requester);
 
         let addr = spawn_for_tests(state).await.unwrap();
@@ -543,7 +562,9 @@ mod tests {
 
         // No bootstrap uploaded yet: a request finds nothing.
         let miss = client
-            .post(format!("http://{addr}/pairing-bootstrap/request?user_id={target}"))
+            .post(format!(
+                "http://{addr}/pairing-bootstrap/request?user_id={target}"
+            ))
             .header("Authorization", format!("Bearer {requester_token}"))
             .send()
             .await
@@ -562,7 +583,9 @@ mod tests {
 
         // First request succeeds and returns exactly what was uploaded.
         let first = client
-            .post(format!("http://{addr}/pairing-bootstrap/request?user_id={target}"))
+            .post(format!(
+                "http://{addr}/pairing-bootstrap/request?user_id={target}"
+            ))
             .header("Authorization", format!("Bearer {requester_token}"))
             .send()
             .await
@@ -573,7 +596,9 @@ mod tests {
 
         // A second request for the same target finds nothing: one-time use.
         let second = client
-            .post(format!("http://{addr}/pairing-bootstrap/request?user_id={target}"))
+            .post(format!(
+                "http://{addr}/pairing-bootstrap/request?user_id={target}"
+            ))
             .header("Authorization", format!("Bearer {requester_token}"))
             .send()
             .await
@@ -584,7 +609,11 @@ mod tests {
     #[sqlx::test]
     async fn pairing_bootstrap_unreachable_for_a_non_searchable_target(pool: PgPool) {
         let state = state_for(pool);
-        let target = state.store.create_pending_user("target-hash-1").await.unwrap();
+        let target = state
+            .store
+            .create_pending_user("target-hash-1")
+            .await
+            .unwrap();
         // Never calls set_searchable(true) — stays private.
         state
             .store
@@ -592,12 +621,18 @@ mod tests {
             .await
             .unwrap();
 
-        let requester = state.store.create_pending_user("requester-hash-1").await.unwrap();
+        let requester = state
+            .store
+            .create_pending_user("requester-hash-1")
+            .await
+            .unwrap();
         let requester_token = state.store.create_session(requester);
 
         let addr = spawn_for_tests(state).await.unwrap();
         let resp = reqwest::Client::new()
-            .post(format!("http://{addr}/pairing-bootstrap/request?user_id={target}"))
+            .post(format!(
+                "http://{addr}/pairing-bootstrap/request?user_id={target}"
+            ))
             .header("Authorization", format!("Bearer {requester_token}"))
             .send()
             .await
@@ -608,8 +643,16 @@ mod tests {
     #[sqlx::test]
     async fn erasing_a_user_deletes_their_pairing_bootstrap(pool: PgPool) {
         let state = state_for(pool);
-        let target = state.store.create_pending_user("target-hash-2").await.unwrap();
-        state.store.set_searchable(target, true, Some(&"a".repeat(64))).await.unwrap();
+        let target = state
+            .store
+            .create_pending_user("target-hash-2")
+            .await
+            .unwrap();
+        state
+            .store
+            .set_searchable(target, true, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
         state
             .store
             .set_pairing_bootstrap(target, "opaque-link-bytes")
@@ -774,9 +817,21 @@ mod tests {
     #[sqlx::test]
     async fn username_lookup_finds_a_claimed_handle_and_404s_for_an_unknown_one(pool: PgPool) {
         let state = state_for(pool);
-        let target = state.store.create_pending_user("lookup-hash").await.unwrap();
-        let (slot, _width) = state.store.claim_username(target, "findbyname").await.unwrap();
-        let requester = state.store.create_pending_user("requester-hash").await.unwrap();
+        let target = state
+            .store
+            .create_pending_user("lookup-hash")
+            .await
+            .unwrap();
+        let (slot, _width) = state
+            .store
+            .claim_username(target, "findbyname")
+            .await
+            .unwrap();
+        let requester = state
+            .store
+            .create_pending_user("requester-hash")
+            .await
+            .unwrap();
         let token = state.store.create_session(requester);
 
         let addr = spawn_for_tests(state).await.unwrap();

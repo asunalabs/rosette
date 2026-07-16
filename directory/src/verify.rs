@@ -204,9 +204,8 @@ impl OtpVendor for TwilioOtpVendor {
                 Ok(resp) => return Err(classify_status(resp.status(), "verification-check")),
                 Err(e) => return Err(classify_transport(e)),
             };
-            let body: serde_json::Value = resp
-                .json()
-                .map_err(|e| VendorError::Other(e.to_string()))?;
+            let body: serde_json::Value =
+                resp.json().map_err(|e| VendorError::Other(e.to_string()))?;
             Ok(verification_approved(&body))
         })
     }
@@ -227,7 +226,9 @@ pub fn vendor_from_env() -> anyhow::Result<std::sync::Arc<dyn OtpVendor>> {
     let token = std::env::var("TWILIO_AUTH_TOKEN");
     let service = std::env::var("TWILIO_VERIFY_SERVICE_SID");
     if let (Ok(sid), Ok(token), Ok(service)) = (sid, token, service) {
-        return Ok(std::sync::Arc::new(TwilioOtpVendor::new(sid, token, service)));
+        return Ok(std::sync::Arc::new(TwilioOtpVendor::new(
+            sid, token, service,
+        )));
     }
     if std::env::var("DIRECTORY_ALLOW_DEV_OTP_VENDOR").is_ok() {
         tracing::warn!(
@@ -319,7 +320,10 @@ mod tests {
         std::env::remove_var("TWILIO_ACCOUNT_SID");
         std::env::remove_var("TWILIO_AUTH_TOKEN");
         std::env::remove_var("TWILIO_VERIFY_SERVICE_SID");
-        assert!(vendor.is_ok(), "fully configured Twilio env must be picked up");
+        assert!(
+            vendor.is_ok(),
+            "fully configured Twilio env must be picked up"
+        );
     }
 
     struct UnavailableVendor;
