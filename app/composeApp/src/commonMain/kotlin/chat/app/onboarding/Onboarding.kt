@@ -21,6 +21,7 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -56,6 +57,7 @@ import chat.engine.BackupBundle
 import chat.engine.backupAuthProof
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -679,6 +681,10 @@ private fun PhoneEntryStep(
 
 private const val OTP_LENGTH = 6
 
+/** DT8: seconds a resend stays dimmed after a tap. Comfortably longer than any
+ *  reasonable per-phone signup window, so tapping can't reach the directory's 429. */
+private const val RESEND_COOLDOWN_SECONDS = 30
+
 @Composable
 private fun OtpStep(
     phone: String,
@@ -731,11 +737,28 @@ private fun OtpStep(
         // down. "Try again" then resubmits a dying code and the only route to a fresh
         // one was a button labelled "Use a different number".
         Spacer(Modifier.height(if (held) 12.dp else 20.dp))
+        // DT8: a tap starts a cooldown so four taps can't reach the directory's
+        // 429 blind, and the label doubles as the "code sent" confirmation. The
+        // cooldown starts on the TAP, never on arrival, so a held vendor outage
+        // (no code sent) leaves resend immediately live — ET13's rule.
+        var cooldown by rememberSaveable { mutableStateOf(0) }
+        LaunchedEffect(cooldown) {
+            if (cooldown > 0) {
+                delay(1_000)
+                cooldown--
+            }
+        }
+        val canResend = !loading && cooldown == 0
         Text(
-            "Resend code",
+            text = if (cooldown > 0) "Code sent · resend in ${cooldown}s" else "Resend code",
             style = MaterialTheme.typography.labelLarge,
-            color = palette.accent,
-            modifier = Modifier.clickable(enabled = !loading, onClick = onResend).padding(4.dp),
+            color = if (canResend) palette.accent else palette.muted,
+            modifier = Modifier
+                .clickable(enabled = canResend) {
+                    onResend()
+                    cooldown = RESEND_COOLDOWN_SECONDS
+                }
+                .padding(4.dp),
         )
         Spacer(Modifier.weight(1f))
         InstrumentButton(
