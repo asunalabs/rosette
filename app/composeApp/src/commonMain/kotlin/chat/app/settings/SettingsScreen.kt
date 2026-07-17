@@ -19,7 +19,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import chat.app.session.Session
+import chat.app.theme.ChatMonoStyle
 import chat.app.theme.HairlineDivider
 import chat.app.theme.LocalChatPalette
 import chat.app.theme.Rosette
@@ -57,7 +59,9 @@ fun SettingsScreen(session: Session, onBack: () -> Unit, onChangePin: () -> Unit
                 Rosette(seed = session.handle, size = 44.dp)
                 Spacer(Modifier.width(16.dp))
                 Column {
-                    Text(session.handle, style = MaterialTheme.typography.bodyLarge, color = palette.ink)
+                    // DT4/D2: the handle is a crypto fact, shown in mono like the
+                    // You-menu that now owns tap-to-copy (DESIGN.md Typography).
+                    Text(session.handle, style = ChatMonoStyle.copy(fontSize = 18.sp), color = palette.ink)
                     Text("Account", style = MaterialTheme.typography.labelMedium, color = palette.muted)
                 }
             }
