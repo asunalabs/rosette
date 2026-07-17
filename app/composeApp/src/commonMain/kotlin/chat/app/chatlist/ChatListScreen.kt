@@ -2,6 +2,7 @@ package chat.app.chatlist
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -37,6 +38,7 @@ import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import chat.app.theme.ChatListRow
 import chat.app.theme.ChatMonoStyle
+import chat.app.theme.InstrumentButton
 import chat.app.theme.HairlineDivider
 import chat.app.theme.LocalChatPalette
 import chat.app.theme.Rosette
@@ -56,6 +58,8 @@ fun ChatListScreen(
     modifier: Modifier = Modifier,
     /** D2: the ONLY route to Settings — the You-menu dropdown, not a tab. */
     onOpenSettings: () -> Unit = {},
+    /** DT9/DT14: the empty-state primary action opens Find people (the FAB destination). */
+    onFindPeople: () -> Unit = {},
 ) {
     val palette = LocalChatPalette.current
     val conversations = remember(revision) { engine.conversations() }
@@ -74,13 +78,28 @@ fun ChatListScreen(
             )
         }
         if (conversations.isEmpty()) {
-            Box(Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) {
+            // DT14: statement type + one primary action, per DESIGN.md:47-48 —
+            // not a dead muted one-liner (wireframe-v1 bans "no chats yet" text).
+            Column(
+                modifier = Modifier.fillMaxSize().padding(32.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
                 Text(
-                    "No conversations yet — find people to start one.",
+                    "Nobody here yet",
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = palette.ink,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Find someone by their handle or number, and your first conversation starts here.",
                     style = MaterialTheme.typography.bodyLarge,
                     color = palette.muted,
                     textAlign = TextAlign.Center,
                 )
+                Spacer(Modifier.height(24.dp))
+                InstrumentButton("Find people", onClick = onFindPeople)
             }
         } else {
             LazyColumn(modifier = Modifier.fillMaxSize()) {

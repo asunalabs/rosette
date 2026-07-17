@@ -1,12 +1,16 @@
 package chat.app
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -19,6 +23,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import chat.app.chatlist.ChatListScreen
 import chat.app.chatlist.ConversationScreen
@@ -37,7 +42,6 @@ import chat.app.storage.deleteDbFile
 import chat.app.storage.rememberDbConfig
 import chat.app.theme.ChatTheme
 import chat.app.theme.InstrumentButton
-import chat.app.theme.InstrumentTabBar
 import chat.app.theme.LocalChatPalette
 import chat.engine.ChatEngine
 import chat.engine.Conversation
@@ -129,9 +133,7 @@ fun App() {
     }
 }
 
-private enum class Tab { Chats, FindPeople }
-
-/** Issue #4: full-screen surfaces above the tab bar. */
+/** Issue #4: full-screen surfaces above the root. */
 private enum class Screen { Main, Settings, ChangePin }
 
 /**
@@ -198,7 +200,9 @@ private fun EngineScreen(
         return
     }
     val revision = rememberEngineRevision(engine)
-    var tab by remember { mutableStateOf(Tab.Chats) }
+    // DT9: Find people is a pushed destination reached from the FAB / empty
+    // state, not a tab. Chats is the root.
+    var showFindPeople by remember { mutableStateOf(false) }
     var openConversation by remember { mutableStateOf<Conversation?>(null) }
     val scope = rememberCoroutineScope()
     var screen by remember { mutableStateOf(Screen.Main) }
@@ -259,31 +263,41 @@ private fun EngineScreen(
         Screen.Main -> {}
     }
 
-    Column(modifier = Modifier.fillMaxSize().background(palette.bg)) {
-        Column(modifier = Modifier.weight(1f)) {
-            when (tab) {
-                Tab.Chats -> ChatListScreen(
-                    engine = engine,
-                    handle = session.handle,
-                    revision = revision,
-                    onOpenConversation = { openConversation = it },
-                    onOpenSettings = { screen = Screen.Settings },
-                )
-                Tab.FindPeople -> FindPeopleScreen(
-                    client = client,
-                    session = session,
-                    engine = engine,
-                    onBack = { tab = Tab.Chats },
-                    onContactAdded = { backupUploader.schedule() },
-                    onSessionExpired = onSessionExpired,
-                )
-            }
-        }
-        InstrumentTabBar(
-            tabs = listOf("Chats", "Find people"),
-            selected = tab.ordinal,
-            onSelect = { tab = Tab.entries[it] },
+    if (showFindPeople) {
+        FindPeopleScreen(
+            client = client,
+            session = session,
+            engine = engine,
+            onBack = { showFindPeople = false },
+            onContactAdded = { backupUploader.schedule() },
+            onSessionExpired = onSessionExpired,
         )
+        return
+    }
+
+    // DT9: Chats is the root, no tab bar (the only other tab, Calls, is unbuilt —
+    // a one-tab bar is noise). The FAB is the compose affordance the list lacked.
+    Box(modifier = Modifier.fillMaxSize().background(palette.bg)) {
+        ChatListScreen(
+            engine = engine,
+            handle = session.handle,
+            revision = revision,
+            onOpenConversation = { openConversation = it },
+            onOpenSettings = { screen = Screen.Settings },
+            onFindPeople = { showFindPeople = true },
+        )
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(20.dp)
+                .size(52.dp)
+                .clip(CircleShape)
+                .background(palette.accent)
+                .clickable { showFindPeople = true },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("+", style = MaterialTheme.typography.headlineSmall, color = palette.onAccent)
+        }
     }
 }
 
