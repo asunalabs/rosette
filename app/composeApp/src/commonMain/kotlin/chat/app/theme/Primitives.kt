@@ -222,15 +222,23 @@ fun InstrumentStatusChip(text: String, tone: StatusTone, modifier: Modifier = Mo
 }
 
 @Composable
-fun InstrumentToggle(checked: Boolean, onCheckedChange: (Boolean) -> Unit, modifier: Modifier = Modifier) {
+fun InstrumentToggle(
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+    /** DT5: false while the real state is still unknown — dimmed and inert, so
+     *  it never reads as a confident OFF the user didn't choose. */
+    enabled: Boolean = true,
+) {
     val palette = LocalChatPalette.current
     Box(
         modifier = modifier
             .width(48.dp)
             .height(28.dp)
+            .then(if (enabled) Modifier else Modifier.alpha(0.5f))
             .clip(RoundedCornerShape(50))
             .background(if (checked) palette.accent else palette.surface2)
-            .clickable { onCheckedChange(!checked) }
+            .clickable(enabled = enabled) { onCheckedChange(!checked) }
             .padding(3.dp),
         contentAlignment = if (checked) Alignment.CenterEnd else Alignment.CenterStart,
     ) {

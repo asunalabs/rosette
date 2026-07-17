@@ -220,6 +220,17 @@ impl DirectoryStore {
         Ok(row.map(|r| r.get::<bool, _>("verified")))
     }
 
+    /// DT5: the current phone-search opt-in, so the client renders the real
+    /// state instead of guessing OFF. `None` = no live row (deleted/unknown).
+    pub async fn is_searchable(&self, user_id: u64) -> sqlx::Result<Option<bool>> {
+        let row =
+            sqlx::query("SELECT searchable FROM users WHERE user_id = $1 AND deleted_at IS NULL")
+                .bind(user_id as i64)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.get::<bool, _>("searchable")))
+    }
+
     pub async fn is_phone_in_cooldown(&self, phone_hash: &str) -> sqlx::Result<bool> {
         let cutoff = now_unix() - PHONE_COOLDOWN_HOURS * 3600;
         let row = sqlx::query(
