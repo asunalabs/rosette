@@ -409,12 +409,19 @@ mod safety_number_tests {
         let (alice, _bob) = paired();
         let mut alice2 = ChatSession::new("alice");
         let mut mallory = ChatSession::new("bob"); // same name, fresh (different) keys
-        let m_kp = mallory.generate_key_package().unwrap().key_package().clone();
+        let m_kp = mallory
+            .generate_key_package()
+            .unwrap()
+            .key_package()
+            .clone();
         alice2.create_group().unwrap();
         let welcome = alice2.add_members(&[m_kp]).unwrap();
         let tree = alice2.export_ratchet_tree().unwrap();
         mallory.join_from_welcome(&welcome, &tree).unwrap();
-        assert_ne!(alice.safety_number().unwrap(), alice2.safety_number().unwrap());
+        assert_ne!(
+            alice.safety_number().unwrap(),
+            alice2.safety_number().unwrap()
+        );
     }
 
     #[test]

@@ -798,9 +798,11 @@ impl ChatEngine {
             .map_err(|_| EngineError::SendFailed {
                 reason: "engine stopped".to_string(),
             })?;
-        reply_rx.blocking_recv().map_err(|_| EngineError::SendFailed {
-            reason: "engine stopped".to_string(),
-        })?
+        reply_rx
+            .blocking_recv()
+            .map_err(|_| EngineError::SendFailed {
+                reason: "engine stopped".to_string(),
+            })?
     }
 
     /// Mark a conversation verified after the user confirms the safety-number
