@@ -7,7 +7,7 @@
         android:label="chat"
         android:allowBackup="false"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:theme="@style/Theme.Chat">
         <activity
             android:name=".MainActivity"
             android:exported="true">
