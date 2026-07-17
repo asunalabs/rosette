@@ -253,6 +253,40 @@ impl ChatSession {
             .collect())
     }
 
+    /// DT6: the safety number for the verify-contact ceremony. Derived from
+    /// every member's MLS signature public key — both sides **sort** the keys,
+    /// so both compute the identical value, and an active MITM (whose injected
+    /// keys differ from the real peer's) produces a *different* number, which is
+    /// exactly what the ceremony asks the two humans to compare. Never trust the
+    /// display name (`member_names`); trust this.
+    ///
+    /// Rendered as space-separated 5-digit groups (Signal-style) from the
+    /// SHA-256 of the length-prefixed sorted keys.
+    pub fn safety_number(&self) -> Result<String, SessionError> {
+        let group = self.group.as_ref().ok_or(SessionError::NoGroup)?;
+        let mut keys: Vec<Vec<u8>> = group
+            .members()
+            .map(|m| m.signature_key.as_slice().to_vec())
+            .collect();
+        keys.sort();
+        let mut hasher = Sha256::new();
+        for k in &keys {
+            // Length-prefix so distinct key boundaries can't be forged by
+            // concatenation (a || bc vs ab || c must not collide).
+            hasher.update((k.len() as u32).to_be_bytes());
+            hasher.update(k);
+        }
+        let digest = hasher.finalize();
+        let grouped: Vec<String> = digest
+            .chunks(4)
+            .map(|c| {
+                let n = c.iter().fold(0u32, |acc, &b| (acc << 8) | b as u32);
+                format!("{:05}", n % 100_000)
+            })
+            .collect();
+        Ok(grouped.join(" "))
+    }
+
     pub fn epoch(&self) -> Result<u64, SessionError> {
         Ok(self
             .group
@@ -338,5 +372,53 @@ impl ChatSession {
             }
             _ => Err(SessionError::NotAProtocolMessage),
         }
+    }
+}
+
+#[cfg(test)]
+mod safety_number_tests {
+    use super::*;
+
+    /// Alice founds a group and invites Bob; both end up in the same 2-member
+    /// group, which is what a paired 1:1 chat is.
+    fn paired() -> (ChatSession, ChatSession) {
+        let mut alice = ChatSession::new("alice");
+        let mut bob = ChatSession::new("bob");
+        let bob_kp = bob.generate_key_package().unwrap().key_package().clone();
+        alice.create_group().unwrap();
+        let welcome = alice.add_members(&[bob_kp]).unwrap();
+        let tree = alice.export_ratchet_tree().unwrap();
+        bob.join_from_welcome(&welcome, &tree).unwrap();
+        (alice, bob)
+    }
+
+    #[test]
+    fn both_sides_derive_the_same_safety_number() {
+        let (alice, bob) = paired();
+        let a = alice.safety_number().unwrap();
+        assert_eq!(a, bob.safety_number().unwrap());
+        // Human-comparable form: grouped 5-digit blocks, not empty.
+        assert!(a.contains(' '), "expected grouped digits, got {a:?}");
+        assert!(a.chars().all(|c| c.is_ascii_digit() || c == ' '));
+    }
+
+    #[test]
+    fn a_different_peer_key_yields_a_different_number() {
+        // The number must be bound to the actual keys, not the display names,
+        // or an active MITM impersonating "bob" would show the same digits.
+        let (alice, _bob) = paired();
+        let mut alice2 = ChatSession::new("alice");
+        let mut mallory = ChatSession::new("bob"); // same name, fresh (different) keys
+        let m_kp = mallory.generate_key_package().unwrap().key_package().clone();
+        alice2.create_group().unwrap();
+        let welcome = alice2.add_members(&[m_kp]).unwrap();
+        let tree = alice2.export_ratchet_tree().unwrap();
+        mallory.join_from_welcome(&welcome, &tree).unwrap();
+        assert_ne!(alice.safety_number().unwrap(), alice2.safety_number().unwrap());
+    }
+
+    #[test]
+    fn no_group_is_an_error_not_a_panic() {
+        assert!(ChatSession::new("solo").safety_number().is_err());
     }
 }

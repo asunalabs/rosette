@@ -308,6 +308,10 @@ enum Command {
         body: String,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
+    /// DT6: the verify-ceremony safety number, read from the live session.
+    SafetyNumber {
+        reply: oneshot::Sender<Result<String, EngineError>>,
+    },
 }
 
 /// The one object the UI holds. Created once at app start.
@@ -775,6 +779,30 @@ impl ChatEngine {
             })?
     }
 
+    /// DT6: the safety number the two peers read aloud and compare in the
+    /// verify ceremony. Bound to both MLS signature keys, so an active MITM
+    /// produces different digits on each side. Blocks on the engine actor
+    /// (like `send`); errors until paired. `conversation` is accepted for API
+    /// symmetry — v0.1 has a single group, which is the one queried.
+    pub fn security_code(&self, conversation: String) -> Result<String, EngineError> {
+        let _ = conversation;
+        let cmd_tx = self
+            .backend
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(EngineError::UnknownConversation)?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .blocking_send(Command::SafetyNumber { reply: reply_tx })
+            .map_err(|_| EngineError::SendFailed {
+                reason: "engine stopped".to_string(),
+            })?;
+        reply_rx.blocking_recv().map_err(|_| EngineError::SendFailed {
+            reason: "engine stopped".to_string(),
+        })?
+    }
+
     /// Mark a conversation verified after the user confirms the safety-number
     /// words. Idempotent.
     pub fn mark_verified(&self, conversation: String) -> Result<(), EngineError> {
@@ -1009,6 +1037,11 @@ fn reject_offline(cmd: Command) {
                 reason: "still reconnecting to the relay".to_string(),
             }));
         }
+        Command::SafetyNumber { reply } => {
+            // The number itself is a pure function of local group state, but
+            // this path has no `core` handle; the UI retries once connected.
+            let _ = reply.send(Err(EngineError::UnknownConversation));
+        }
     }
 }
 
@@ -1109,6 +1142,14 @@ async fn handle_command(cmd: Command, core: &mut CoreEngine, shared: &Shared, co
     match cmd {
         Command::CreateLink { reply } => {
             let _ = reply.send(core.contact_link());
+        }
+        Command::SafetyNumber { reply } => {
+            // Errors (no group) until paired — the UI only asks for a real
+            // conversation, so that maps to UnknownConversation.
+            let _ = reply.send(
+                core.safety_number()
+                    .map_err(|_| EngineError::UnknownConversation),
+            );
         }
         Command::Send { body, reply } => {
             if !core.is_paired() {
