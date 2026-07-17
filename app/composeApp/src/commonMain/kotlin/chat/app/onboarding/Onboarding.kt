@@ -643,7 +643,9 @@ private fun PhoneEntryStep(
     onSubmit: (phone: String) -> Unit,
 ) {
     // ET11: rotation must not empty the field the user is typing into.
-    var countryCode by rememberSaveable { mutableStateOf("") }
+    // DT7: seed the dial code from the user's own locale, not a founder-country
+    // default. rememberSaveable calls this once, then restores any edit.
+    var countryCode by rememberSaveable { mutableStateOf(defaultDialCode()) }
     var number by rememberSaveable { mutableStateOf("") }
     Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
         BackRow("Back", onBack)
@@ -672,8 +674,11 @@ private fun PhoneEntryStep(
         Spacer(Modifier.weight(1f))
         InstrumentButton(
             text = if (loading) "Sending…" else if (held) "Try again" else "Next",
-            onClick = { onSubmit((countryCode.ifBlank { "+420" }) + number) },
-            enabled = !loading && number.isNotBlank(),
+            // DT7: no `+420` fallback — submit the code the user actually has, and
+            // require one (an unlisted region starts blank, so the user fills it
+            // rather than us shipping a wrong country on their behalf).
+            onClick = { onSubmit(countryCode + number) },
+            enabled = !loading && countryCode.isNotBlank() && number.isNotBlank(),
             loading = loading,
         )
     }

@@ -176,11 +176,16 @@ fun InstrumentPhoneField(
             .padding(horizontal = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(flagFor(countryCode.ifBlank { "+420" }), style = fieldStyle)
+        // DT7: the flag follows whatever code is actually there (🌐 when blank),
+        // never a hardcoded founder-country default.
+        Text(flagFor(countryCode), style = fieldStyle)
         Spacer(Modifier.width(8.dp))
         Box(modifier = Modifier.width(52.dp)) {
             if (countryCode.isEmpty()) {
-                Text("+420", style = fieldStyle.copy(color = palette.muted))
+                // Neutral prompt, not a specific country: the real default comes
+                // from the caller's locale (defaultDialCode); this only shows if
+                // the user clears the field or their region is unlisted.
+                Text("+__", style = fieldStyle.copy(color = palette.muted))
             }
             BasicTextField(
                 value = countryCode,
