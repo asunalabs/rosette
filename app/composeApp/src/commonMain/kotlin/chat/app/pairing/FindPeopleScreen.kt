@@ -35,13 +35,26 @@ import chat.app.theme.HairlineDivider
 import chat.app.theme.InstrumentButton
 import chat.app.theme.InstrumentField
 import chat.app.theme.InstrumentSegments
+import chat.app.theme.InstrumentStatusChip
 import chat.app.theme.InstrumentToggle
 import chat.app.theme.LocalChatPalette
+import chat.app.theme.StatusTone
 import chat.engine.ChatEngine
 import chat.engine.EngineException
 import kotlinx.coroutines.launch
 
 private enum class LookupMode { Username, Phone }
+
+/**
+ * DT10: a lookup outcome carries its tone, so "Paired with mira#07." (accent)
+ * never renders identically to "Pairing failed:" (error). The three outcomes —
+ * success, couldn't-find, and real failure — are visually distinct at a glance.
+ */
+private data class LookupStatus(val text: String, val tone: StatusTone)
+
+private fun ok(text: String) = LookupStatus(text, StatusTone.Positive)
+private fun warn(text: String) = LookupStatus(text, StatusTone.Warning)
+private fun err(text: String?) = LookupStatus(text ?: "Something went wrong.", StatusTone.Error)
 
 /**
  * T25's client half: username lookup (OQ10's default) or opt-in phone
@@ -60,7 +73,7 @@ fun FindPeopleScreen(
 ) {
     val palette = LocalChatPalette.current
     var mode by remember { mutableStateOf(LookupMode.Username) }
-    var status by remember { mutableStateOf<String?>(null) }
+    var status by remember { mutableStateOf<LookupStatus?>(null) }
     var loading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
@@ -70,18 +83,18 @@ fun FindPeopleScreen(
             try {
                 val link = client.requestPairingBootstrap(session.sessionToken, userId)
                 if (link == null) {
-                    status = "$label hasn't published a pairing link right now — ask them to open the app."
+                    status = warn("$label hasn't published a pairing link right now — ask them to open the app.")
                 } else {
                     engine.pairWithLink(link)
-                    status = "Paired with $label."
+                    status = ok("Paired with $label.")
                     onContactAdded()
                 }
             } catch (e: DirectoryException) {
                 // A dead token is not a status line — it needs onboarding, not
                 // a message the user can only stare at.
-                if (e.isSessionExpired()) onSessionExpired() else status = e.message
+                if (e.isSessionExpired()) onSessionExpired() else status = err(e.message)
             } catch (e: EngineException) {
-                status = "Pairing failed: ${e.message}"
+                status = err("Pairing failed: ${e.message}")
             } finally {
                 loading = false
             }
@@ -114,10 +127,10 @@ fun FindPeopleScreen(
                     scope.launch {
                         try {
                             val userId = client.lookupUsername(session.sessionToken, nickname, discriminator)
-                            status = if (userId == null) "No one has that handle." else null
+                            status = if (userId == null) warn("No one has that handle.") else null
                             userId?.let { pairWith(it, "$nickname#$discriminator") }
                         } catch (e: DirectoryException) {
-                            if (e.isSessionExpired()) onSessionExpired() else status = e.message
+                            if (e.isSessionExpired()) onSessionExpired() else status = err(e.message)
                         } finally {
                             loading = false
                         }
@@ -135,7 +148,7 @@ fun FindPeopleScreen(
             }
             status?.let {
                 Spacer(Modifier.height(16.dp))
-                Text(it, style = MaterialTheme.typography.labelMedium, color = palette.muted)
+                InstrumentStatusChip(it.text, it.tone)
             }
         }
     }
@@ -167,7 +180,7 @@ private fun PhoneLookup(
     session: Session,
     loading: Boolean,
     setLoading: (Boolean) -> Unit,
-    setStatus: (String?) -> Unit,
+    setStatus: (LookupStatus?) -> Unit,
     onSessionExpired: () -> Unit,
     onFound: (Long, String) -> Unit,
 ) {
@@ -205,7 +218,7 @@ private fun PhoneLookup(
                         client.setSearchable(session.sessionToken, on, hash)
                         searchable = on
                     } catch (e: DirectoryException) {
-                        if (e.isSessionExpired()) onSessionExpired() else setStatus(e.message)
+                        if (e.isSessionExpired()) onSessionExpired() else setStatus(err(e.message))
                     }
                 }
             },
@@ -229,12 +242,12 @@ private fun PhoneLookup(
                     val bucket = client.search(session.sessionToken, hashPrefix(targetHash))
                     val match: SearchResult? = bucket.firstOrNull { it.searchHash == targetHash }
                     if (match == null) {
-                        setStatus("Not found — they may not be registered, or haven't opted in to phone search.")
+                        setStatus(warn("Not found — they may not be registered, or haven't opted in to phone search."))
                     } else {
                         onFound(match.userId, match.handle)
                     }
                 } catch (e: DirectoryException) {
-                    if (e.isSessionExpired()) onSessionExpired() else setStatus(e.message)
+                    if (e.isSessionExpired()) onSessionExpired() else setStatus(err(e.message))
                 } finally {
                     setLoading(false)
                 }
