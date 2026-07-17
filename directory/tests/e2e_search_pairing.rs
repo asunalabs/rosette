@@ -45,7 +45,11 @@ async fn search_hit_carries_the_identity_info_a_future_pairing_handoff_would_nee
         directory::Pepper(b"e2e-test-pepper"),
     )
     .unwrap();
-    let user_id = state.store.create_pending_user(&auth_hash).await.unwrap();
+    let user_id = state
+        .store
+        .find_or_create_pending_user(&auth_hash)
+        .await
+        .unwrap();
     state.store.claim_username(user_id, "findme").await.unwrap();
     // The search hash is a SEPARATE, unkeyed value a real client computes
     // locally (SHA-256 of the normalized number, no server secret) — not
@@ -56,7 +60,7 @@ async fn search_hit_carries_the_identity_info_a_future_pairing_handoff_would_nee
         .set_searchable(user_id, true, Some(&search_hash))
         .await
         .unwrap();
-    let token = state.store.create_session(user_id);
+    let token = state.store.create_session(user_id).await.unwrap();
 
     let addr = directory::spawn_for_tests(state).await.unwrap();
     let prefix = directory::hash_prefix(&search_hash);

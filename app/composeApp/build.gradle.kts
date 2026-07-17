@@ -38,6 +38,24 @@ kotlin {
             implementation(libs.ktor.serialization.kotlinx.json)
             implementation(libs.kotlinx.serialization.json)
         }
+        commonTest.dependencies {
+            implementation(kotlin("test"))
+        }
+        // DirectoryClient's error paths (ET7) are tested against a stub JDK
+        // HttpServer, which is JVM-only — hence desktopTest, not commonTest.
+        //
+        // ET4 adds the Compose harness here for the same reason: `runComposeUiTest`
+        // needs a real toolkit, and the stub server that drives these flows is the
+        // JVM one already in use. The bugs this catches (CQ-1, ET8's catch block)
+        // live in composable wiring that no unit test can reach.
+        val desktopTest by getting {
+            dependencies {
+                implementation(kotlin("test"))
+                @OptIn(org.jetbrains.compose.ExperimentalComposeLibrary::class)
+                implementation(compose.uiTest)
+                implementation(compose.desktop.currentOs)
+            }
+        }
         androidMain.dependencies {
             implementation(libs.androidx.activity.compose)
         }
@@ -46,11 +64,6 @@ kotlin {
                 implementation(compose.desktop.currentOs)
                 implementation(libs.kotlinx.coroutines.swing)
                 implementation(libs.java.keyring)
-            }
-        }
-        val desktopTest by getting {
-            dependencies {
-                implementation(kotlin("test"))
             }
         }
     }

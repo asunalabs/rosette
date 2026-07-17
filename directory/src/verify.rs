@@ -16,6 +16,10 @@ pub enum VerifyError {
     InvalidPhoneFormat,
     #[error("otp code rejected")]
     CodeRejected,
+    /// Vendor didn't answer in time, so the code was never checked. Fails
+    /// closed (503) — see `verify_phone`.
+    #[error("otp vendor unavailable")]
+    VendorUnavailable,
     #[error("argon2 error: {0}")]
     Hash(String),
     #[error("otp vendor error: {0}")]
@@ -59,9 +63,64 @@ pub fn phone_hash(e164: &str, pepper: Pepper) -> Result<String, VerifyError> {
 
 #[derive(Debug)]
 pub enum VendorError {
-    /// Vendor call didn't complete in time — soft-gate, don't hard-fail signup.
-    Timeout,
+    /// The vendor gave us no usable answer and retrying might get one: a
+    /// timeout, the vendor's own 5xx, a 429, or a connect/DNS/TLS failure.
+    /// The code is unchecked either way, so `verify_phone` refuses — never a
+    /// soft-gate (see ARCH-5). Named for the *consequence*, not the cause:
+    /// it was `Timeout` while only reqwest timeouts landed here, which made
+    /// ET6's 503 cover the rarest outage mode and left every other one a 500.
+    Unavailable,
+    /// A definite answer we can't use — bad credentials, a malformed body, a
+    /// 4xx that retrying won't change. A bug on our side, not an outage.
     Other(String),
+}
+
+/// Non-2xx from the vendor: their outage (5xx) or throttling (429) means our
+/// code went unchecked and a retry can work; anything else is a definite
+/// answer and ours to fix.
+fn classify_status(status: reqwest::StatusCode, what: &str) -> VendorError {
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        VendorError::Unavailable
+    } else {
+        VendorError::Other(format!("twilio {what} failed: {status}"))
+    }
+}
+
+/// No response at all. A timeout or a failure to connect (TCP, DNS, TLS all
+/// surface as `is_connect`) is transient; anything else is ours.
+fn classify_transport(e: reqwest::Error) -> VendorError {
+    if e.is_timeout() || e.is_connect() {
+        VendorError::Unavailable
+    } else {
+        VendorError::Other(e.to_string())
+    }
+}
+
+/// ET18: what a non-2xx from **VerificationCheck** means, in `verify`'s own
+/// `Result<bool, _>` shape. Split out for the same reason
+/// [`verification_approved`] was — the decision is unit-testable, the network
+/// call around it is not.
+///
+/// A 404 here is not an error: Twilio 404s a VerificationCheck whose
+/// verification no longer exists — **expired**, already approved, or never
+/// started. Every one of those means the code cannot be accepted, which is
+/// exactly what `Ok(false)` already says. It used to fall through to `Other` →
+/// `Internal` → 500, so "your code expired" — the single most likely `/verify`
+/// failure after an outage, since codes die on the vendor's clock while we are
+/// down — reached the user as *our* bug, and landed in neither bucket the UI
+/// promises (400 "your fault, fix it" / 503 "our fault, hold").
+///
+/// ponytail: the user is told "code rejected" for an expired code. True but
+/// coarse — they need a new code either way, and ET13 keeps Resend live for
+/// exactly that. Split the copy only if the two ever need different guidance.
+///
+/// The same 404 on **start-verification** stays an error: there it means a bad
+/// Service SID, which is config, not a user's expired code.
+fn classify_check_failure(status: reqwest::StatusCode) -> Result<bool, VendorError> {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    Err(classify_status(status, "verification-check"))
 }
 
 pub trait OtpVendor: Send + Sync {
@@ -70,14 +129,6 @@ pub trait OtpVendor: Send + Sync {
     /// phone ever see it.
     fn send_code(&self, e164: &str) -> Result<(), VendorError>;
     fn verify(&self, e164: &str, code: &str) -> Result<bool, VendorError>;
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum VerificationOutcome {
-    Verified,
-    /// Vendor outage: account created, but unverified and excluded from
-    /// search until it can be re-verified.
-    Degraded,
 }
 
 /// No real SMS vendor is wired up yet — nothing in this project has a
@@ -113,13 +164,26 @@ pub struct TwilioOtpVendor {
     client: reqwest::blocking::Client,
 }
 
+/// ET1: `reqwest::blocking` defaults to 30s. That default is for a batch job,
+/// not for a human staring at an OTP screen — and every second of it pins a
+/// worker via `block_in_place`, which is the amplifier that made ARCH-5's bypass
+/// floodable. 10s is well past Twilio's normal latency; past that the user has
+/// given up anyway, and a slow answer is indistinguishable from no answer, which
+/// is `Unavailable` -> 503 -> the held screen, exactly where it should land.
+const VENDOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl TwilioOtpVendor {
     pub fn new(account_sid: String, auth_token: String, verify_service_sid: String) -> Self {
         Self {
             account_sid,
             auth_token,
             verify_service_sid,
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(VENDOR_TIMEOUT)
+                .build()
+                // Only fails if the TLS backend can't initialise, which is a
+                // broken build, not a runtime condition.
+                .expect("reqwest client with a timeout"),
         }
     }
 
@@ -161,12 +225,8 @@ impl OtpVendor for TwilioOtpVendor {
                 .send();
             match result {
                 Ok(resp) if resp.status().is_success() => Ok(()),
-                Ok(resp) => Err(VendorError::Other(format!(
-                    "twilio start-verification failed: {}",
-                    resp.status()
-                ))),
-                Err(e) if e.is_timeout() => Err(VendorError::Timeout),
-                Err(e) => Err(VendorError::Other(e.to_string())),
+                Ok(resp) => Err(classify_status(resp.status(), "start-verification")),
+                Err(e) => Err(classify_transport(e)),
             }
         })
     }
@@ -181,14 +241,8 @@ impl OtpVendor for TwilioOtpVendor {
                 .send();
             let resp = match result {
                 Ok(resp) if resp.status().is_success() => resp,
-                Ok(resp) => {
-                    return Err(VendorError::Other(format!(
-                        "twilio verification-check failed: {}",
-                        resp.status()
-                    )))
-                }
-                Err(e) if e.is_timeout() => return Err(VendorError::Timeout),
-                Err(e) => return Err(VendorError::Other(e.to_string())),
+                Ok(resp) => return classify_check_failure(resp.status()),
+                Err(e) => return Err(classify_transport(e)),
             };
             let body: serde_json::Value =
                 resp.json().map_err(|e| VendorError::Other(e.to_string()))?;
@@ -230,21 +284,27 @@ pub fn vendor_from_env() -> anyhow::Result<std::sync::Arc<dyn OtpVendor>> {
     )
 }
 
+/// Returns the peppered `phone_hash` — and returns it *only* when the vendor
+/// affirmatively approved `code`. There is no outcome that means "couldn't
+/// check": a vendor timeout is `VendorUnavailable` (503 at the API layer), not
+/// a degraded pass. This function returning `Ok` is what "verified" means, so
+/// no caller can mistake an unchecked code for a checked one (ARCH-5).
 pub fn verify_phone(
     vendor: &dyn OtpVendor,
     raw_phone: &str,
     code: &str,
     pepper: Pepper,
-) -> Result<(String, VerificationOutcome), VerifyError> {
+) -> Result<String, VerifyError> {
     let e164 = normalize_e164(raw_phone)?;
-    let hash = phone_hash(&e164, pepper)?;
-    let outcome = match vendor.verify(&e164, code) {
-        Ok(true) => VerificationOutcome::Verified,
+    match vendor.verify(&e164, code) {
+        Ok(true) => {}
         Ok(false) => return Err(VerifyError::CodeRejected),
-        Err(VendorError::Timeout) => VerificationOutcome::Degraded,
+        Err(VendorError::Unavailable) => return Err(VerifyError::VendorUnavailable),
         Err(VendorError::Other(msg)) => return Err(VerifyError::Vendor(msg)),
-    };
-    Ok((hash, outcome))
+    }
+    // Hashed only after approval: Argon2id is deliberately expensive, so an
+    // unauthenticated /verify flood shouldn't buy CPU on a rejected code.
+    phone_hash(&e164, pepper)
 }
 
 #[cfg(test)]
@@ -306,13 +366,78 @@ mod tests {
         );
     }
 
-    struct TimeoutVendor;
-    impl OtpVendor for TimeoutVendor {
+    /// ET6/ET18: these three functions decide whether a vendor failure reaches
+    /// the user as "your code is fine, we'll retry" (503), "your code is wrong"
+    /// (400), or "we broke" (500). ET6 shipped with only `is_timeout()` mapped
+    /// to the first, so every other real outage mode — Twilio's own 5xx, a 429,
+    /// a dropped connection — became a 500 and the held UI was near-dead in
+    /// production. Untested then; the whole classification is pinned here now.
+    mod classification {
+        use super::*;
+        use reqwest::StatusCode;
+
+        #[test]
+        fn a_vendor_outage_or_throttle_is_unavailable_so_the_client_can_hold() {
+            for s in [
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::BAD_GATEWAY,
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::GATEWAY_TIMEOUT,
+                StatusCode::TOO_MANY_REQUESTS,
+            ] {
+                assert!(
+                    matches!(classify_status(s, "check"), VendorError::Unavailable),
+                    "{s} is transient — it must reach the app as a 503, not a 500"
+                );
+            }
+        }
+
+        #[test]
+        fn a_definite_answer_from_the_vendor_stays_our_bug() {
+            // Bad credentials or a malformed request are config errors: retrying
+            // changes nothing, so they must NOT offer the user a "Try again".
+            for s in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+                assert!(
+                    matches!(classify_status(s, "check"), VendorError::Other(_)),
+                    "{s}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_expired_verification_is_a_rejected_code_not_an_incident() {
+            assert_eq!(
+                classify_check_failure(StatusCode::NOT_FOUND)
+                    .expect("404 is an answer, not a failure"),
+                false,
+                "an expired or already-used code is one the user can't use — same as a wrong one"
+            );
+        }
+
+        #[test]
+        fn the_check_path_still_holds_on_a_real_outage() {
+            assert!(matches!(
+                classify_check_failure(StatusCode::SERVICE_UNAVAILABLE),
+                Err(VendorError::Unavailable)
+            ));
+        }
+
+        #[test]
+        fn a_bad_service_sid_on_the_check_path_is_not_silently_a_rejection() {
+            assert!(matches!(
+                classify_check_failure(StatusCode::UNAUTHORIZED),
+                Err(VendorError::Other(_))
+            ));
+        }
+    }
+
+    struct UnavailableVendor;
+    impl OtpVendor for UnavailableVendor {
         fn send_code(&self, _e164: &str) -> Result<(), VendorError> {
             Ok(())
         }
         fn verify(&self, _e164: &str, _code: &str) -> Result<bool, VendorError> {
-            Err(VendorError::Timeout)
+            Err(VendorError::Unavailable)
         }
     }
 
@@ -326,24 +451,47 @@ mod tests {
         }
     }
 
+    struct RejectVendor;
+    impl OtpVendor for RejectVendor {
+        fn send_code(&self, _e164: &str) -> Result<(), VendorError> {
+            Ok(())
+        }
+        fn verify(&self, _e164: &str, _code: &str) -> Result<bool, VendorError> {
+            Ok(false)
+        }
+    }
+
+    /// ARCH-5: a vendor timeout used to return `Degraded`, which the API
+    /// layer turned into a session. An unchecked code must fail closed.
     #[test]
-    fn vendor_timeout_degrades_instead_of_failing_signup() {
-        let (hash, outcome) = verify_phone(
-            &TimeoutVendor,
+    fn vendor_timeout_refuses_instead_of_failing_open() {
+        let err = verify_phone(
+            &UnavailableVendor,
             "+15551234567",
-            "000000",
+            "any-code-at-all",
             Pepper(b"test-pepper"),
         )
-        .expect("degraded signup should still succeed");
-        assert_eq!(outcome, VerificationOutcome::Degraded);
-        assert_eq!(hash.len(), 64);
+        .expect_err("an unchecked code must never succeed");
+        assert!(matches!(err, VerifyError::VendorUnavailable));
+    }
+
+    #[test]
+    fn wrong_code_is_rejected() {
+        let err = verify_phone(
+            &RejectVendor,
+            "+15551234567",
+            "999999",
+            Pepper(b"test-pepper"),
+        )
+        .expect_err("a rejected code must not yield a hash");
+        assert!(matches!(err, VerifyError::CodeRejected));
     }
 
     #[test]
     fn happy_path_verifies() {
-        let (_hash, outcome) =
+        let hash =
             verify_phone(&OkVendor, "+15551234567", "000000", Pepper(b"test-pepper")).unwrap();
-        assert_eq!(outcome, VerificationOutcome::Verified);
+        assert_eq!(hash.len(), 64);
     }
 
     #[test]

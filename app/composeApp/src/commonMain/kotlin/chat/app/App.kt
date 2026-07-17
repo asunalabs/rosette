@@ -24,6 +24,7 @@ import chat.app.chatlist.ConversationScreen
 import chat.app.directory.BackupUploader
 import chat.app.directory.DirectoryClient
 import chat.app.directory.DirectoryException
+import chat.app.directory.isSessionExpired
 import chat.app.onboarding.OnboardingFlow
 import chat.app.session.Session
 import chat.app.session.rememberSessionStore
@@ -105,7 +106,22 @@ fun App() {
                 session = newSession
             }
         } else {
-            EngineScreen(client = client, session = current, db = db, initial = pendingEngine)
+            EngineScreen(
+                client = client,
+                session = current,
+                db = db,
+                initial = pendingEngine,
+                // The only path back to onboarding once a session exists. Without
+                // it a 401 is terminal: the branch above keys on `current == null`,
+                // so a token the directory has forgotten is never replaced and
+                // search/pairing fail for good. `clear()` had no call site at all
+                // until this — the recovery existed on the interface and nowhere
+                // else.
+                onSessionExpired = {
+                    store.clear()
+                    session = null
+                },
+            )
         }
     }
 }
@@ -116,7 +132,13 @@ private enum class Tab { Chats, FindPeople }
 private enum class Screen { Main, Settings, ChangePin }
 
 @Composable
-private fun EngineScreen(client: DirectoryClient, session: Session, db: DbConfig, initial: ChatEngine?) {
+private fun EngineScreen(
+    client: DirectoryClient,
+    session: Session,
+    db: DbConfig,
+    initial: ChatEngine?,
+    onSessionExpired: () -> Unit,
+) {
     val palette = LocalChatPalette.current
     // Issue #1: SQLCipher-persistent engine — identity, pairing, and history
     // survive restarts. remember {} — one engine per composition, as the
@@ -154,8 +176,14 @@ private fun EngineScreen(client: DirectoryClient, session: Session, db: DbConfig
         if (link.isNotEmpty()) {
             try {
                 client.publishPairingBootstrap(session.sessionToken, link)
-            } catch (_: DirectoryException) {
-                // best-effort; the user can still pair via QR/link directly.
+            } catch (e: DirectoryException) {
+                // Best-effort, with one exception: a 401 is not a failure to
+                // shrug off. This runs on every launch, so it is usually the
+                // first request a returning user makes — and therefore the first
+                // chance to notice the token is dead, before they hit a search
+                // that mysteriously returns nothing.
+                if (e.isSessionExpired()) onSessionExpired()
+                // otherwise the user can still pair via QR/link directly.
             }
         }
     }
@@ -197,11 +225,12 @@ private fun EngineScreen(client: DirectoryClient, session: Session, db: DbConfig
                     onOpenSettings = { screen = Screen.Settings },
                 )
                 Tab.FindPeople -> FindPeopleScreen(
-                    client,
-                    session,
-                    engine,
+                    client = client,
+                    session = session,
+                    engine = engine,
                     onBack = { tab = Tab.Chats },
                     onContactAdded = { backupUploader.schedule() },
+                    onSessionExpired = onSessionExpired,
                 )
             }
         }

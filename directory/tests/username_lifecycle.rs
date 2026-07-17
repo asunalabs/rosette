@@ -12,7 +12,7 @@ async fn deleted_accounts_handle_cannot_be_reclaimed_by_a_new_signup(pool: PgPoo
     let store = DirectoryStore::from_pool(pool);
 
     let original = store
-        .create_pending_user("original-owner-hash")
+        .find_or_create_pending_user("original-owner-hash")
         .await
         .unwrap();
     let (slot, width) = store
@@ -25,7 +25,10 @@ async fn deleted_accounts_handle_cannot_be_reclaimed_by_a_new_signup(pool: PgPoo
 
     // A different account trying to claim the exact same nickname must
     // land on a *different* discriminator, not reclaim slot 1.
-    let newcomer = store.create_pending_user("newcomer-hash").await.unwrap();
+    let newcomer = store
+        .find_or_create_pending_user("newcomer-hash")
+        .await
+        .unwrap();
     let (new_slot, _new_width) = store
         .claim_username(newcomer, "reserved_name")
         .await

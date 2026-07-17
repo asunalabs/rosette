@@ -3,8 +3,7 @@ package chat.app.directory
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
-import io.ktor.client.plugins.ClientRequestException
-import io.ktor.client.plugins.ServerResponseException
+import io.ktor.client.plugins.ResponseException
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import chat.engine.BackupBundle
 import io.ktor.client.request.bearerAuth
@@ -18,10 +17,39 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 
-/** Thrown for any non-2xx directory response, carrying the server's `error` message when present. */
-class DirectoryException(message: String) : Exception(message)
+/**
+ * Thrown for any non-2xx directory response, carrying the server's `error`
+ * message and the HTTP status when present. [status] is what lets a caller
+ * tell "your code was wrong" (400) from "we never checked your code" (503,
+ * ET6) — a distinction the user is entitled to, since only one of them is
+ * their fault.
+ *
+ * [status] is null when the failure had no response at all — no network, DNS,
+ * TLS, connection refused, the directory being down. That is a real case, not a
+ * theoretical one (ET16), and it is deliberately NOT the held path: with no
+ * answer from anyone we cannot claim the user's code is fine.
+ */
+class DirectoryException(message: String, val status: Int? = null) : Exception(message)
+
+/**
+ * The directory does not recognise this token.
+ *
+ * Sessions live in Postgres now, so the routine cause — a restart wiping an
+ * in-memory map — is gone. Three remain: the 90-day TTL lapsed, the account was
+ * erased (ET2 revokes its sessions with the rows), or the database was restored
+ * from before the token was issued.
+ *
+ * Rare is not the same as handled. The app persists the token and `App.kt` shows
+ * onboarding only when there isn't one, so **any** unhandled 401 is a permanent
+ * dead end: search and pairing fail forever and the only fix is wiping app data.
+ * That is exactly what the restart bug was, and moving sessions to a table made
+ * it rarer without making it recoverable. This is what makes it recoverable.
+ */
+fun DirectoryException.isSessionExpired(): Boolean = status == 401
 
 @Serializable
 data class VerifyResult(val userId: Long, val sessionToken: String, val verified: Boolean)
@@ -39,8 +67,12 @@ private data class SignupRequest(val phone: String)
 @Serializable
 private data class VerifyRequest(val phone: String, val code: String)
 
+// `verified` defaults so the server can retire the field (it is hardcoded
+// `true` post-ET6) without a MissingFieldException on clients built today.
+// `ignoreUnknownKeys` covers fields the server adds; only a default covers
+// fields it drops.
 @Serializable
-private data class VerifyResponse(val user_id: Long, val session_token: String, val verified: Boolean)
+private data class VerifyResponse(val user_id: Long, val session_token: String, val verified: Boolean = true)
 
 @Serializable
 private data class UsernameRequest(val nickname: String)
@@ -139,7 +171,13 @@ class DirectoryClient(baseUrl: String = defaultDirectoryBaseUrl()) {
     private val baseUrl = baseUrl.trimEnd('/')
 
     private val http = HttpClient(CIO) {
-        install(ContentNegotiation) { json() }
+        // Ktor defaults this to false: without it nothing is thrown on 4xx/5xx,
+        // `call`'s handlers below are dead code, and a wrong OTP reaches
+        // `.body()` as an error envelope and crashes on the missing fields.
+        expectSuccess = true
+        // A new field in a directory response must not brick installed clients
+        // (T27's own attestation-token work would add one).
+        install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
     }
 
     /** POST /signup — requests an OTP be sent to `phone`. */
@@ -291,14 +329,16 @@ class DirectoryClient(baseUrl: String = defaultDirectoryBaseUrl()) {
         return res?.contact_link_b64
     }
 
-    /** Runs a Ktor request, mapping non-2xx statuses to a [DirectoryException] with the server's `error` message. */
+    /** Runs a Ktor request, mapping every failure to a [DirectoryException] — non-2xx with the server's `error` message and status, no-response with a null status. */
     private suspend fun call(request: suspend () -> HttpResponse): HttpResponse {
         try {
             return request()
-        } catch (e: ClientRequestException) {
-            throw DirectoryException(e.response.errorMessage())
-        } catch (e: ServerResponseException) {
-            throw DirectoryException(e.response.errorMessage())
+        } catch (e: ResponseException) {
+            throw e.response.asDirectoryException()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            throw e.asTransportException()
         }
     }
 
@@ -306,13 +346,39 @@ class DirectoryClient(baseUrl: String = defaultDirectoryBaseUrl()) {
     private suspend fun callOrNull(request: suspend () -> HttpResponse): HttpResponse? {
         try {
             return request()
-        } catch (e: ClientRequestException) {
+        } catch (e: ResponseException) {
             if (e.response.status == HttpStatusCode.NotFound) return null
-            throw DirectoryException(e.response.errorMessage())
-        } catch (e: ServerResponseException) {
-            throw DirectoryException(e.response.errorMessage())
+            throw e.response.asDirectoryException()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            throw e.asTransportException()
         }
     }
+
+    private suspend fun HttpResponse.asDirectoryException(): DirectoryException =
+        DirectoryException(errorMessage(), status.value)
+
+    /**
+     * ET16: a failure with no response — no network, DNS, TLS, connection
+     * refused, directory down.
+     *
+     * These used to escape: `call` caught only Ktor's response exceptions, so a
+     * connect failure flew past `OnboardingFlow`'s `catch (e: DirectoryException)`
+     * and died as an uncaught coroutine exception. ET7's commit message promised
+     * "surface directory errors instead of crashing" — this was the half that
+     * still crashed, on the most likely failure a phone has.
+     *
+     * The message is ours, not the platform's: `e.message` here is engine-specific
+     * ("Connection refused", "nodename nor servname provided") and this string is
+     * rendered straight to the user by the onboarding error channel.
+     *
+     * `CancellationException` is rethrown by both callers before reaching this —
+     * swallowing it would break structured concurrency and leave a cancelled
+     * screen's coroutine reporting a fake network error.
+     */
+    private fun Throwable.asTransportException(): DirectoryException =
+        DirectoryException("Can't reach the directory — check your connection.", null)
 
     private suspend fun HttpResponse.errorMessage(): String =
         try { body<ErrorBody>().error } catch (_: Exception) { "directory request failed" }
