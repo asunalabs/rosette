@@ -153,8 +153,13 @@ impl RelayClient {
     }
 
     pub async fn create_mailbox(&self) -> anyhow::Result<(QueueId, [u8; 32])> {
-        self.create_queue_with_pow(|solution| ClientMessage::CreateMailbox { solution })
-            .await
+        // T27: `attestation: None` until the client wires token spending (the
+        // relay accepts None unless configured with a directory key).
+        self.create_queue_with_pow(|solution| ClientMessage::CreateMailbox {
+            solution,
+            attestation: None,
+        })
+        .await
     }
 
     pub async fn create_group_inbox(
@@ -166,6 +171,7 @@ impl RelayClient {
             solution,
             initial_epoch,
             fan_out_to,
+            attestation: None,
         })
         .await
     }

@@ -16,7 +16,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use ed25519_dalek::VerifyingKey;
+use proto::attestation::AttestationToken;
 
 use proto::{
     limits, AuthTag, ClientMessage, Envelope, GroupSendKind, MessageId, PowChallenge, PowSolution,
@@ -79,6 +82,21 @@ struct Inner {
     storage_bytes_used: u64,
     /// Write-through persistence (T9). None = memory-only (tests).
     db: Option<Connection>,
+    /// T27: the directory's public key, baked in at deploy time. `None` = the
+    /// attestation gate is off (queue creation needs only PoW), so an
+    /// un-configured relay behaves exactly as before T27.
+    attestation_key: Option<VerifyingKey>,
+    /// T27: spent token nonces → their expiry (unix secs). Replay protection.
+    /// Pruned by EXPIRY, never by count: a count-evicted-but-unexpired nonce
+    /// would be replayable, so eviction must key on the token's own lifetime.
+    spent_tokens: HashMap<[u8; 16], i64>,
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 pub struct RelayState {
@@ -240,6 +258,39 @@ impl RelayState {
         challenge
     }
 
+    /// T27: bake in the directory's public key (from relay config). Once set,
+    /// queue creation requires a valid attestation token.
+    pub fn set_attestation_key(&self, key: Option<VerifyingKey>) {
+        self.inner.lock().unwrap().attestation_key = key;
+    }
+
+    /// T27: enforce the attestation gate. Off (Ok) when no key is configured.
+    /// When on, the token must be present, correctly signed, unexpired, and
+    /// unspent; a valid token's nonce is then recorded as spent (single-use).
+    /// Purely local — no directory call — so T21's crash-isolation holds.
+    fn consume_attestation(
+        &self,
+        inner: &mut Inner,
+        token: Option<&AttestationToken>,
+    ) -> Result<(), RejectionCode> {
+        let Some(key) = inner.attestation_key else {
+            return Ok(()); // gate off
+        };
+        let token = token.ok_or(RejectionCode::InvalidAttestation)?;
+        let now = now_unix();
+        if token.is_expired(now) || !token.signature_valid(&key) {
+            return Err(RejectionCode::InvalidAttestation);
+        }
+        // Prune expired nonces before checking/inserting, so the set stays
+        // bounded by the number of live (unexpired) tokens.
+        inner.spent_tokens.retain(|_, &mut exp| exp > now);
+        if inner.spent_tokens.contains_key(&token.nonce) {
+            return Err(RejectionCode::InvalidAttestation); // replay
+        }
+        inner.spent_tokens.insert(token.nonce, token.expires_at);
+        Ok(())
+    }
+
     fn consume_pow(&self, inner: &mut Inner, solution: &PowSolution) -> Result<(), RejectionCode> {
         let difficulty = inner
             .outstanding_challenges
@@ -269,8 +320,10 @@ impl RelayState {
     pub fn create_mailbox(
         &self,
         solution: PowSolution,
+        attestation: Option<AttestationToken>,
     ) -> Result<(QueueId, [u8; 32]), RejectionCode> {
         let mut inner = self.inner.lock().unwrap();
+        self.consume_attestation(&mut inner, attestation.as_ref())?;
         self.consume_pow(&mut inner, &solution)?;
         let queue_id = Self::fresh_queue_id(&inner);
         let mut send_key = [0u8; 32];
@@ -301,8 +354,10 @@ impl RelayState {
         solution: PowSolution,
         initial_epoch: u64,
         fan_out_to: Vec<QueueId>,
+        attestation: Option<AttestationToken>,
     ) -> Result<(QueueId, [u8; 32]), RejectionCode> {
         let mut inner = self.inner.lock().unwrap();
+        self.consume_attestation(&mut inner, attestation.as_ref())?;
         self.consume_pow(&mut inner, &solution)?;
         let queue_id = Self::fresh_queue_id(&inner);
         let mut send_key = [0u8; 32];
@@ -610,7 +665,10 @@ impl RelayState {
             ClientMessage::RequestPowChallenge => {
                 ServerMessage::PowChallenge(self.issue_pow_challenge())
             }
-            ClientMessage::CreateMailbox { solution } => match self.create_mailbox(solution) {
+            ClientMessage::CreateMailbox {
+                solution,
+                attestation,
+            } => match self.create_mailbox(solution, attestation) {
                 Ok((queue_id, send_key)) => ServerMessage::QueueCreated { queue_id, send_key },
                 Err(e) => ServerMessage::Error(e),
             },
@@ -618,7 +676,8 @@ impl RelayState {
                 solution,
                 initial_epoch,
                 fan_out_to,
-            } => match self.create_group_inbox(solution, initial_epoch, fan_out_to) {
+                attestation,
+            } => match self.create_group_inbox(solution, initial_epoch, fan_out_to, attestation) {
                 Ok((queue_id, send_key)) => ServerMessage::QueueCreated { queue_id, send_key },
                 Err(e) => ServerMessage::Error(e),
             },
@@ -665,6 +724,72 @@ mod tests {
         state.issue_pow_challenge().solve()
     }
 
+    #[test]
+    fn no_attestation_key_means_the_gate_is_off() {
+        // The default relay has no key, so a `None` token still creates a
+        // mailbox — exactly the pre-T27 behavior. An un-configured deploy is
+        // unaffected by the whole feature.
+        let state = RelayState::new();
+        assert!(state.create_mailbox(solved_pow(&state), None).is_ok());
+    }
+
+    #[test]
+    fn attestation_gate_requires_a_valid_unspent_unexpired_token() {
+        use proto::attestation::{signing_key_from_seed, AttestationToken};
+        let state = RelayState::new();
+        let sk = signing_key_from_seed(&[11u8; 32]);
+        state.set_attestation_key(Some(sk.verifying_key()));
+        let now = now_unix();
+
+        // No token at all → rejected.
+        assert_eq!(
+            state.create_mailbox(solved_pow(&state), None).unwrap_err(),
+            RejectionCode::InvalidAttestation
+        );
+
+        // A valid token → accepted, exactly once.
+        let good = AttestationToken::sign(&sk, [1u8; 16], now + 3600);
+        assert!(state
+            .create_mailbox(solved_pow(&state), Some(good.clone()))
+            .is_ok());
+
+        // Replaying the same token → rejected (single-use).
+        assert_eq!(
+            state
+                .create_mailbox(solved_pow(&state), Some(good))
+                .unwrap_err(),
+            RejectionCode::InvalidAttestation
+        );
+
+        // An expired token → rejected.
+        let expired = AttestationToken::sign(&sk, [2u8; 16], now - 1);
+        assert_eq!(
+            state
+                .create_mailbox(solved_pow(&state), Some(expired))
+                .unwrap_err(),
+            RejectionCode::InvalidAttestation
+        );
+
+        // A token signed by a DIFFERENT key (a forgery) → rejected. This is the
+        // property that stops a custom client from minting its own tokens.
+        let forged =
+            AttestationToken::sign(&signing_key_from_seed(&[99u8; 32]), [3u8; 16], now + 3600);
+        assert_eq!(
+            state
+                .create_mailbox(solved_pow(&state), Some(forged))
+                .unwrap_err(),
+            RejectionCode::InvalidAttestation
+        );
+
+        // A group inbox is gated the same way.
+        assert_eq!(
+            state
+                .create_group_inbox(solved_pow(&state), 1, vec![], None)
+                .unwrap_err(),
+            RejectionCode::InvalidAttestation
+        );
+    }
+
     fn env(id: u8) -> Envelope {
         Envelope::new([id; 16], DeliveryMode::RelayFanout, vec![0u8; 8])
     }
@@ -672,7 +797,7 @@ mod tests {
     #[test]
     fn mailbox_create_and_send_roundtrip() {
         let state = RelayState::new();
-        let (qid, key) = state.create_mailbox(solved_pow(&state)).unwrap();
+        let (qid, key) = state.create_mailbox(solved_pow(&state), None).unwrap();
         let e = env(1);
         let tag = proto::compute_tag(&key, &qid, &e);
         state.send_to_mailbox(qid, tag, e).unwrap();
@@ -681,7 +806,7 @@ mod tests {
     #[test]
     fn mailbox_send_rejects_bad_auth() {
         let state = RelayState::new();
-        let (qid, _key) = state.create_mailbox(solved_pow(&state)).unwrap();
+        let (qid, _key) = state.create_mailbox(solved_pow(&state), None).unwrap();
         let e = env(1);
         let bad_tag = [0u8; 32];
         assert_eq!(
@@ -705,9 +830,9 @@ mod tests {
     fn reused_pow_solution_rejected() {
         let state = RelayState::new();
         let solution = solved_pow(&state);
-        state.create_mailbox(solution).unwrap();
+        state.create_mailbox(solution, None).unwrap();
         assert_eq!(
-            state.create_mailbox(solution).unwrap_err(),
+            state.create_mailbox(solution, None).unwrap_err(),
             RejectionCode::InvalidProofOfWork
         );
     }
@@ -718,10 +843,10 @@ mod tests {
         // the same epoch never both win, and the winner deterministically
         // advances the epoch by exactly one.
         let state = RelayState::new();
-        let member_a = state.create_mailbox(solved_pow(&state)).unwrap().0;
-        let member_b = state.create_mailbox(solved_pow(&state)).unwrap().0;
+        let member_a = state.create_mailbox(solved_pow(&state), None).unwrap().0;
+        let member_b = state.create_mailbox(solved_pow(&state), None).unwrap().0;
         let (inbox, key) = state
-            .create_group_inbox(solved_pow(&state), 1, vec![member_a, member_b])
+            .create_group_inbox(solved_pow(&state), 1, vec![member_a, member_b], None)
             .unwrap();
 
         let commit_a = env(0xA);
@@ -754,9 +879,9 @@ mod tests {
     #[test]
     fn group_inbox_application_messages_never_conflict() {
         let state = RelayState::new();
-        let member = state.create_mailbox(solved_pow(&state)).unwrap().0;
+        let member = state.create_mailbox(solved_pow(&state), None).unwrap().0;
         let (inbox, key) = state
-            .create_group_inbox(solved_pow(&state), 1, vec![member])
+            .create_group_inbox(solved_pow(&state), 1, vec![member], None)
             .unwrap();
         for i in 0..5u8 {
             let e = env(i);
@@ -770,10 +895,10 @@ mod tests {
     #[test]
     fn group_inbox_fans_out_to_all_members() {
         let state = RelayState::new();
-        let (member_a, _) = state.create_mailbox(solved_pow(&state)).unwrap();
-        let (member_b, _) = state.create_mailbox(solved_pow(&state)).unwrap();
+        let (member_a, _) = state.create_mailbox(solved_pow(&state), None).unwrap();
+        let (member_b, _) = state.create_mailbox(solved_pow(&state), None).unwrap();
         let (inbox, key) = state
-            .create_group_inbox(solved_pow(&state), 1, vec![member_a, member_b])
+            .create_group_inbox(solved_pow(&state), 1, vec![member_a, member_b], None)
             .unwrap();
 
         let (tx_a, mut rx_a) = mpsc::unbounded_channel();
@@ -802,7 +927,7 @@ mod tests {
     #[test]
     fn storage_bound_rejects_and_ack_frees_it_again() {
         let state = RelayState::new();
-        let (qid, key) = state.create_mailbox(solved_pow(&state)).unwrap();
+        let (qid, key) = state.create_mailbox(solved_pow(&state), None).unwrap();
         {
             let mut inner = state.inner.lock().unwrap();
             // Leave room for exactly one more max-size message.
@@ -838,9 +963,9 @@ mod tests {
         // that re-sent its Subscribe (the documented "full current set" flow)
         // got registered twice and received every push twice.
         let state = RelayState::new();
-        let (member, _) = state.create_mailbox(solved_pow(&state)).unwrap();
+        let (member, _) = state.create_mailbox(solved_pow(&state), None).unwrap();
         let (inbox, key) = state
-            .create_group_inbox(solved_pow(&state), 1, vec![member])
+            .create_group_inbox(solved_pow(&state), 1, vec![member], None)
             .unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -866,9 +991,9 @@ mod tests {
         // registered forever. After the receiver is dropped, the next send must
         // remove it so the subscriber list doesn't grow without bound.
         let state = RelayState::new();
-        let (member, _) = state.create_mailbox(solved_pow(&state)).unwrap();
+        let (member, _) = state.create_mailbox(solved_pow(&state), None).unwrap();
         let (inbox, key) = state
-            .create_group_inbox(solved_pow(&state), 1, vec![member])
+            .create_group_inbox(solved_pow(&state), 1, vec![member], None)
             .unwrap();
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -895,7 +1020,7 @@ mod tests {
         // receive the backlog, ack, storage freed — and a later subscriber
         // no longer sees the acked messages.
         let state = RelayState::new();
-        let (qid, key) = state.create_mailbox(solved_pow(&state)).unwrap();
+        let (qid, key) = state.create_mailbox(solved_pow(&state), None).unwrap();
 
         // Two messages land while nobody is subscribed.
         let first = env(1);
@@ -940,7 +1065,7 @@ mod tests {
         // subscribe. The duplicate is the contract — engine dedup (OV5)
         // absorbs it client-side.
         let state = RelayState::new();
-        let (qid, key) = state.create_mailbox(solved_pow(&state)).unwrap();
+        let (qid, key) = state.create_mailbox(solved_pow(&state), None).unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         state.subscribe(&[qid], tx.clone());
@@ -968,9 +1093,9 @@ mod tests {
 
         let (member, inbox, inbox_key, app_env, commit_env, used_before) = {
             let state = RelayState::open(&path).unwrap();
-            let (member, _member_key) = state.create_mailbox(solved_pow(&state)).unwrap();
+            let (member, _member_key) = state.create_mailbox(solved_pow(&state), None).unwrap();
             let (inbox, inbox_key) = state
-                .create_group_inbox(solved_pow(&state), 1, vec![member])
+                .create_group_inbox(solved_pow(&state), 1, vec![member], None)
                 .unwrap();
 
             // One application message and one epoch-advancing commit land

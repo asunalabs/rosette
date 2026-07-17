@@ -19,6 +19,7 @@ fn state_with_vendor(pool: PgPool, vendor: Arc<dyn OtpVendor>) -> Arc<AppState> 
             search_enabled: true,
         },
         rate_limiter: RateLimiter::new(),
+        attestation_key: None,
     })
 }
 

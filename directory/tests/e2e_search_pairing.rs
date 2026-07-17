@@ -38,6 +38,7 @@ async fn search_hit_carries_the_identity_info_a_future_pairing_handoff_would_nee
             search_enabled: true,
         },
         rate_limiter: RateLimiter::new(),
+        attestation_key: None,
     });
     let phone = "+15559990099";
     let auth_hash = directory::phone_hash(

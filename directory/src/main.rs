@@ -30,12 +30,25 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(DirectoryStore::connect(&database_url).await?);
     let vendor = vendor_from_env()?;
+    // T27: the attestation signing key (off unless configured). Log the PUBLIC
+    // key at startup so ops can paste it into the relay's config — the relay
+    // verifies tokens offline against it, never calling the directory.
+    let attestation_key = directory::attestation::signing_key_from_env()?;
+    if let Some(key) = &attestation_key {
+        use base64::Engine as _;
+        let pubkey =
+            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
+        tracing::info!("attestation enabled — relay public key (base64): {pubkey}");
+    } else {
+        tracing::info!("attestation disabled — no DIRECTORY_ATTESTATION_SIGNING_KEY set");
+    }
     let state = Arc::new(AppState {
         store,
         vendor,
         pepper,
         config: DirectoryConfig::from_env(),
         rate_limiter: RateLimiter::new(),
+        attestation_key,
     });
 
     directory::bind_and_serve(&addr, state).await

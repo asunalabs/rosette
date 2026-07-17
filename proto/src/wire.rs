@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::attestation::AttestationToken;
 use crate::envelope::{Envelope, MessageId};
 use crate::error::RejectionCode;
 use crate::link::QueueId;
@@ -99,8 +100,13 @@ pub enum ClientMessage {
     },
     /// Ask the relay to mint a challenge before creating a queue (A18).
     RequestPowChallenge,
-    /// Create a plain mailbox queue.
-    CreateMailbox { solution: PowSolution },
+    /// Create a plain mailbox queue. `attestation` (T27) is a directory-issued
+    /// single-use token proving the caller is phone-verified; required only when
+    /// the relay is configured with a directory public key, `None` otherwise.
+    CreateMailbox {
+        solution: PowSolution,
+        attestation: Option<AttestationToken>,
+    },
     /// Create a group inbox queue starting at epoch 1 (the epoch right after
     /// the founding Add commit, which never touches the relay — see A1 test
     /// design) with a fixed initial fan-out roster.
@@ -108,6 +114,7 @@ pub enum ClientMessage {
         solution: PowSolution,
         initial_epoch: u64,
         fan_out_to: Vec<QueueId>,
+        attestation: Option<AttestationToken>,
     },
 }
 

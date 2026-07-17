@@ -26,5 +26,27 @@ async fn main() -> anyhow::Result<()> {
     println!("relay TLS fingerprint: {}", identity.fingerprint_hex());
 
     let state = Arc::new(RelayState::open(&state_path)?);
+
+    // T27: enable the attestation gate iff the directory's public key is
+    // configured. `RELAY_ATTESTATION_PUBKEY` is the base64 the directory logs
+    // at startup. No var → gate stays off (PoW-only), same as before T27.
+    match std::env::var("RELAY_ATTESTATION_PUBKEY") {
+        Ok(b64) => {
+            use base64::Engine as _;
+            let bytes: [u8; 32] = base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("RELAY_ATTESTATION_PUBKEY must be base64 of a 32-byte key")
+                })?;
+            let key = proto::attestation::verifying_key_from_bytes(&bytes)
+                .ok_or_else(|| anyhow::anyhow!("RELAY_ATTESTATION_PUBKEY is not a valid key"))?;
+            state.set_attestation_key(Some(key));
+            println!("attestation gate ENABLED (queue creation requires a directory token)");
+        }
+        Err(_) => println!("attestation gate off (RELAY_ATTESTATION_PUBKEY unset)"),
+    }
+
     relay::net::serve(&addr, state, &identity).await
 }

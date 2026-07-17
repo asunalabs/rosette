@@ -3,6 +3,7 @@
 //! the directory process stays crash-isolated from the relay/client path.
 
 pub mod api;
+pub mod attestation;
 pub mod config;
 pub mod ratelimit;
 pub mod search;
