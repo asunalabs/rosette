@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -63,6 +64,27 @@ fun ConversationScreen(
     var draft by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
 
+    // DT6: re-read the conversation from the store on every event so the header
+    // ✓ reflects a mark-verified done on the verify screen (the `conversation`
+    // arg is a snapshot from the list, frozen at open time).
+    val live = remember(conversation.id, revision) {
+        engine.conversations().firstOrNull { it.id == conversation.id } ?: conversation
+    }
+    var showVerify by remember(conversation.id) { mutableStateOf(false) }
+    if (showVerify) {
+        VerifyContactScreen(
+            engine = engine,
+            conversation = live,
+            verified = live.verified,
+            onBack = { showVerify = false },
+            onMarkVerified = {
+                engine.markVerified(conversation.id)
+                showVerify = false
+            },
+        )
+        return
+    }
+
     // DT3: the engine records a sent message only AFTER the relay round-trip
     // (as Sent or Failed) — there's no optimistic write on its side. So we hold
     // the in-flight message here to draw the Pending bubble, and drop it once
@@ -102,9 +124,20 @@ fun ConversationScreen(
                 Text("←", style = MaterialTheme.typography.headlineSmall, color = palette.ink)
             }
             Spacer(Modifier.width(4.dp))
-            Rosette(seed = conversation.id, verified = conversation.verified, size = 32.dp)
-            Spacer(Modifier.width(8.dp))
-            Text(conversation.displayName, style = MaterialTheme.typography.labelLarge, color = palette.ink)
+            // DT6: the header opens the verify ceremony. The Rosette's verified
+            // band + the accent ✓ are the only trust signals in the thread.
+            Row(
+                modifier = Modifier.clickable { showVerify = true }.padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Rosette(seed = conversation.id, verified = live.verified, size = 32.dp)
+                Spacer(Modifier.width(8.dp))
+                Text(live.displayName, style = MaterialTheme.typography.labelLarge, color = palette.ink)
+                if (live.verified) {
+                    Spacer(Modifier.width(6.dp))
+                    Text("✓", style = MaterialTheme.typography.labelLarge, color = palette.accent)
+                }
+            }
         }
         HairlineDivider()
 
@@ -115,15 +148,22 @@ fun ConversationScreen(
             // reverseLayout draws the first item at the bottom, so declare the
             // in-flight sends first (newest, belong below every stored message).
             items(pending.asReversed(), key = { it.id }) { p ->
-                Box(Modifier.padding(vertical = 4.dp)) {
+                Box(Modifier.padding(top = 5.dp)) {
                     MessageBubble(body = p.body, mine = true, pending = true)
                 }
             }
-            items(messages.reversed(), key = { it.id }) { m ->
-                Box(Modifier.padding(vertical = 4.dp)) {
+            // DT11: newest-first for the reverseLayout. `top` padding sits above
+            // each bubble (toward its older neighbor): 5dp within a run of the
+            // same sender, 13dp where the sender changes (DESIGN.md:161 grouping).
+            val newestFirst = messages.asReversed()
+            itemsIndexed(newestFirst, key = { _, m -> m.id }) { i, m ->
+                val olderNeighbor = newestFirst.getOrNull(i + 1)
+                val gapTop = if (olderNeighbor != null && olderNeighbor.mine == m.mine) 5.dp else 13.dp
+                Box(Modifier.padding(top = gapTop)) {
                     MessageBubble(
                         body = m.body,
                         mine = m.mine,
+                        time = formatClockTime(m.timestampMs),
                         failed = m.delivery == DeliveryState.FAILED,
                         onRetry = if (m.delivery == DeliveryState.FAILED) {
                             { send(m.body) }

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- DT16: the window background shown during cold launch, before Compose
+         draws. Matches ChatTheme's light `bg` (#FFFFFF); the -night variant
+         matches the dark `bg` (#0B090C), so a dark-mode launch no longer flashes
+         white. Keep in sync with ChatTheme.kt's palette `bg`. -->
+    <color name="window_bg">#FFFFFF</color>
+</resources>

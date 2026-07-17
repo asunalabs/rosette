@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
@@ -70,6 +71,9 @@ fun App() {
         // EngineScreen picks it up instead of reopening the same SQLCipher
         // file it already holds.
         var pendingEngine by remember { mutableStateOf<ChatEngine?>(null) }
+        // DT16: inset content past the system bars and lift it above the keyboard
+        // under edge-to-edge (enableEdgeToEdge in MainActivity). No-op off Android.
+        Box(Modifier.fillMaxSize().safeDrawingPadding()) {
         if (current == null) {
             OnboardingFlow(
                 client = client,
@@ -129,6 +133,7 @@ fun App() {
                     session = null
                 },
             )
+        }
         }
     }
 }
@@ -213,7 +218,14 @@ private fun EngineScreen(
     // T25: best-effort — publish a fresh one-time pairing bootstrap so a
     // directory search hit can find and pair with this device. Silently
     // skipped offline/on failure: nothing here blocks the chat UI on it.
-    LaunchedEffect(session.sessionToken) {
+    //
+    // DT18: the bootstrap is one-shot — a searcher CONSUMES it — so a single
+    // publish per session left the *second* person to find you with "hasn't
+    // published a pairing link". Re-key on the pairing count: each time a new
+    // conversation appears (someone consumed the last bootstrap and paired),
+    // republish a fresh one so the next searcher isn't stranded.
+    val pairCount = remember(revision) { engine.conversations().size }
+    LaunchedEffect(session.sessionToken, pairCount) {
         val link = engine.createContactLink()
         if (link.isNotEmpty()) {
             try {
@@ -228,6 +240,9 @@ private fun EngineScreen(
                 // otherwise the user can still pair via QR/link directly.
             }
         }
+        // ponytail: createContactLink() is "" while offline; this retries on the
+        // next pairing but not on a bare reconnect. A connectivity-driven retry
+        // is the remaining edge for a user who onboarded fully offline.
     }
 
     val conversation = openConversation
