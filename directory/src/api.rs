@@ -3,10 +3,10 @@
 //! for self-hosted operators, so the ops vocabulary here (health endpoint,
 //! Cache-Control) is the standard HTTP-microservice one.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::{Query, Request, State};
+use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -15,11 +15,14 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::config::DirectoryConfig;
-use crate::ratelimit::{RateLimiter, UNVERIFIED_SEARCH_PER_MINUTE, VERIFIED_SEARCH_PER_MINUTE};
+use crate::ratelimit::{
+    self, RateLimiter, UNAUTH_REQUESTS_PER_MINUTE_PER_IP, UNVERIFIED_SEARCH_PER_MINUTE,
+    VERIFIED_SEARCH_PER_MINUTE, VERIFY_ATTEMPTS_PER_MINUTE,
+};
 use crate::search::{search_by_prefix, PREFIX_LEN_HEX};
 use crate::store::{ClaimError, DirectoryStore};
 use crate::username::format_handle;
-use crate::verify::{self, OtpVendor, Pepper, VerificationOutcome, VerifyError};
+use crate::verify::{self, OtpVendor, Pepper, VendorError, VerifyError};
 
 pub struct AppState {
     pub store: Arc<DirectoryStore>,
@@ -48,10 +51,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn(no_store_middleware))
 }
 
+/// `into_make_service_with_connect_info` (ET1): without it `ConnectInfo` is not
+/// in the request extensions and the per-IP limit's extractor rejects every
+/// request. Both entry points need it, and the tests go through the same one
+/// the server does — an unthrottled test harness would be a harness for
+/// different code.
 pub async fn bind_and_serve(addr: &str, state: Arc<AppState>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("directory listening on {}", listener.local_addr()?);
-    axum::serve(listener, router(state)).await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -61,7 +73,11 @@ pub async fn spawn_for_tests(state: Arc<AppState>) -> anyhow::Result<SocketAddr>
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router(state)).await;
+        let _ = axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     });
     Ok(addr)
 }
@@ -78,6 +94,9 @@ enum ApiError {
     BadRequest(&'static str),
     Unauthorized,
     FeatureDisabled,
+    /// The OTP vendor didn't answer, so the code went unchecked. Distinct
+    /// from `Internal`: it's transient and the client should offer a retry.
+    VendorUnavailable,
     RateLimited,
     NotFound,
     Internal,
@@ -89,6 +108,10 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             ApiError::FeatureDisabled => (StatusCode::SERVICE_UNAVAILABLE, "feature disabled"),
+            ApiError::VendorUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "verification temporarily unavailable",
+            ),
             ApiError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate limited"),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found"),
             ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
@@ -97,9 +120,41 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// ET1: the address Caddy actually saw, for the endpoints with no caller to key
+/// a limit on.
+///
+/// **Why `X-Forwarded-For` is trustworthy here, when in general it is not.**
+/// `directory` is not reachable directly: `deploy/docker-compose.yml` publishes
+/// no port for it (only Caddy's 80/443), so the sole path in is Caddy's
+/// `reverse_proxy directory:7444` — one hop, same box, same compose network.
+/// There is no second proxy and no direct route to forge around.
+///
+/// **The rightmost entry, not the leftmost.** Caddy *appends* the peer it saw,
+/// so a client who sends `X-Forwarded-For: 1.2.3.4` produces `1.2.3.4, <real>`.
+/// The last entry is the one Caddy wrote; everything left of it is
+/// attacker-controlled. The usual "client IP = first entry" idiom would hand an
+/// attacker a forged key, letting them throttle *someone else* — worse than not
+/// limiting at all, which is exactly why this was deferred until the deployment
+/// was known rather than guessed.
+///
+/// Falls back to the socket peer when the header is absent: that is the local
+/// path (`cargo run`, the e2e tests), where there is no proxy and the peer is
+/// the client. **If a second hop is ever put in front of Caddy, revisit this** —
+/// the rightmost entry would then be Caddy's own address and every caller would
+/// share one bucket.
+fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
+        .map(str::trim)
+        .and_then(|s| s.parse::<IpAddr>().ok())
+        .unwrap_or_else(|| peer.ip())
+}
+
 /// T4: every search caller must be authenticated. Used by /username and
 /// /searchable too, since those are also account-scoped actions.
-fn authenticate(headers: &HeaderMap, store: &DirectoryStore) -> Result<u64, ApiError> {
+async fn authenticate(headers: &HeaderMap, store: &DirectoryStore) -> Result<u64, ApiError> {
     let value = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -107,7 +162,11 @@ fn authenticate(headers: &HeaderMap, store: &DirectoryStore) -> Result<u64, ApiE
     let token = value
         .strip_prefix("Bearer ")
         .ok_or(ApiError::Unauthorized)?;
-    store.session_user_id(token).ok_or(ApiError::Unauthorized)
+    store
+        .session_user_id(token)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::Unauthorized)
 }
 
 async fn health() -> &'static str {
@@ -126,14 +185,45 @@ struct SignupResponse {
 
 async fn signup(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<SignupRequest>,
 ) -> Result<Json<SignupResponse>, ApiError> {
     if !state.config.accounts_enabled {
         return Err(ApiError::FeatureDisabled);
     }
+    // ET1: before the Argon2id below, which is the whole cost of this endpoint.
+    // ET19 moved that hash off the executor so a flood cannot stall other
+    // endpoints; it still burns 19 MiB and two passes per call, and nothing
+    // authenticates here. The per-number limit does not help — a flood uses a
+    // different number every time.
+    if !state
+        .rate_limiter
+        .check_and_bump_ip(client_ip(&headers, peer), UNAUTH_REQUESTS_PER_MINUTE_PER_IP)
+    {
+        return Err(ApiError::RateLimited);
+    }
     let e164 =
         verify::normalize_e164(&req.phone).map_err(|_| ApiError::BadRequest("invalid phone"))?;
-    let hash = verify::phone_hash(&e164, Pepper(&state.pepper)).map_err(|_| ApiError::Internal)?;
+    // ET19: Argon2id is deliberately expensive — 19 MiB and 2 passes — and this
+    // call is unauthenticated and unthrottled. Run directly, each one pins a
+    // tokio worker for the duration, so a /signup flood starves *every* endpoint
+    // rather than just this one. ET6 moved /verify's hash behind an approved code
+    // for the same reason; that mitigation stops at this endpoint, which is one
+    // over and wide open.
+    //
+    // `spawn_blocking`, not the `block_in_place` used for the vendor HTTP call in
+    // verify.rs: that one panics on a current-thread runtime, which is exactly
+    // what `#[sqlx::test]` gives the e2e tests. The clones are a pepper and a
+    // phone number — noise next to 19 MiB of hashing.
+    let hash = {
+        let pepper = state.pepper.clone();
+        let e164 = e164.clone();
+        tokio::task::spawn_blocking(move || verify::phone_hash(&e164, Pepper(&pepper)))
+            .await
+            .map_err(|_| ApiError::Internal)?
+            .map_err(|_| ApiError::Internal)?
+    };
     if state
         .store
         .is_phone_in_cooldown(&hash)
@@ -144,23 +234,24 @@ async fn signup(
             "phone number is in cooldown after a recent deletion",
         ));
     }
+    // Classified exactly like `/verify`'s vendor failure (ET6), and for the
+    // same reason: a vendor outage stops the user *here*, one screen before
+    // the held screen ET8 built for it. Flattening this to 500 made that
+    // screen reachable only if the vendor was up for `send_code` and down for
+    // `verify` seconds later.
+    state.vendor.send_code(&e164).map_err(|e| match e {
+        VendorError::Unavailable => ApiError::VendorUnavailable,
+        VendorError::Other(_) => ApiError::Internal,
+    })?;
+    // ET15: one statement, not a check-then-act. This used to be a find followed
+    // by a create, which two concurrent signups for the same number could both
+    // pass — leaving a duplicate row that `erase_user` (single `user_id`) would
+    // not scrub.
     state
-        .vendor
-        .send_code(&e164)
-        .map_err(|_| ApiError::Internal)?;
-    if state
         .store
-        .find_user_by_phone_hash(&hash)
+        .find_or_create_pending_user(&hash)
         .await
-        .map_err(|_| ApiError::Internal)?
-        .is_none()
-    {
-        state
-            .store
-            .create_pending_user(&hash)
-            .await
-            .map_err(|_| ApiError::Internal)?;
-    }
+        .map_err(|_| ApiError::Internal)?;
     Ok(Json(SignupResponse {
         status: "code_sent",
     }))
@@ -181,12 +272,45 @@ struct VerifyResponse {
 
 async fn verify_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, ApiError> {
     if !state.config.accounts_enabled {
         return Err(ApiError::FeatureDisabled);
     }
-    let (hash, outcome) = verify::verify_phone(
+    // ET1, the resource half: the per-number limit below stops a *victim's* code
+    // being guessed; it never trips for a flood that uses a different number
+    // each time, and every one of those still buys a vendor round trip.
+    if !state
+        .rate_limiter
+        .check_and_bump_ip(client_ip(&headers, peer), UNAUTH_REQUESTS_PER_MINUTE_PER_IP)
+    {
+        return Err(ApiError::RateLimited);
+    }
+    // ET1: throttle before the vendor call, not after. This endpoint is
+    // unauthenticated by construction — it is how a caller *gets* a session — so
+    // the key is the number being claimed, not a `user_id`. Guarding here is
+    // what makes it a guard at all: `verify_phone` is where the 6-digit guess is
+    // spent and where a worker gets pinned for the vendor round trip, so a check
+    // after it would count the damage rather than prevent it.
+    //
+    // Normalizing twice (here and inside `verify_phone`) is deliberate: it costs
+    // a string scan and keeps the guard readable at the top of the handler,
+    // rather than threading a pre-normalized number through `verify_phone`'s
+    // signature to save it.
+    let e164 =
+        verify::normalize_e164(&req.phone).map_err(|_| ApiError::BadRequest("invalid phone"))?;
+    if !state
+        .rate_limiter
+        .check_and_bump_phone(ratelimit::phone_rate_key(&e164), VERIFY_ATTEMPTS_PER_MINUTE)
+    {
+        return Err(ApiError::RateLimited);
+    }
+    // `verify_phone` returning Ok IS the verification — a vendor timeout is a
+    // 503 here, never a session (ARCH-5). Everything below this line is
+    // reachable only for a code the vendor affirmatively approved.
+    let hash = verify::verify_phone(
         state.vendor.as_ref(),
         &req.phone,
         &req.code,
@@ -195,33 +319,55 @@ async fn verify_handler(
     .map_err(|e| match e {
         VerifyError::CodeRejected => ApiError::BadRequest("code rejected"),
         VerifyError::InvalidPhoneFormat => ApiError::BadRequest("invalid phone"),
+        VerifyError::VendorUnavailable => ApiError::VendorUnavailable,
         VerifyError::Hash(_) | VerifyError::Vendor(_) => ApiError::Internal,
     })?;
 
-    let user_id = match state
+    // ET14: `/verify` is the *second* endpoint that creates users, so it owes
+    // the same OQ5 cooldown check `/signup` does. Without it: sign up ->
+    // `DELETE /account` (cooldown starts, `users.phone_hash` is scrubbed but
+    // `phone_cooldown` keeps it) -> `POST /verify` with the still-valid code ->
+    // no live row matches the hash -> a fresh *verified* account is minted for a
+    // number that is supposed to be locked for 24h.
+    //
+    // Checked after `verify_phone` because `phone_cooldown` is keyed on the
+    // hash, and only an approved code yields one. Still a call-site check, which
+    // is the shape of the original bug — ET15 collapsed the two find-or-creates
+    // into one statement, so this is now the only rule the two endpoints must
+    // remember in parallel. It belongs in the DB.
+    if state
         .store
-        .find_user_by_phone_hash(&hash)
+        .is_phone_in_cooldown(&hash)
         .await
         .map_err(|_| ApiError::Internal)?
     {
-        Some(id) => id,
-        None => state
-            .store
-            .create_pending_user(&hash)
-            .await
-            .map_err(|_| ApiError::Internal)?,
-    };
-    let verified = matches!(outcome, VerificationOutcome::Verified);
-    state
+        return Err(ApiError::BadRequest(
+            "phone number is in cooldown after a recent deletion",
+        ));
+    }
+    // ET15: the other half of the same check-then-act — see `signup`.
+    let user_id = state
         .store
-        .mark_verified(user_id, verified)
+        .find_or_create_pending_user(&hash)
         .await
         .map_err(|_| ApiError::Internal)?;
-    let session_token = state.store.create_session(user_id);
+    state
+        .store
+        .mark_verified(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let session_token = state
+        .store
+        .create_session(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    // Always true now that this is the only path that reaches `create_session`.
+    // Kept on the wire so the client's `nextAfterVerify` gate stays live as
+    // defense-in-depth against a future server regression (founder decision).
     Ok(Json(VerifyResponse {
         user_id,
         session_token,
-        verified,
+        verified: true,
     }))
 }
 
@@ -240,7 +386,7 @@ async fn claim_username(
     headers: HeaderMap,
     Json(req): Json<UsernameRequest>,
 ) -> Result<Json<UsernameResponse>, ApiError> {
-    let user_id = authenticate(&headers, &state.store)?;
+    let user_id = authenticate(&headers, &state.store).await?;
     let (slot, width) = state
         .store
         .claim_username(user_id, &req.nickname)
@@ -272,7 +418,7 @@ async fn set_searchable(
     headers: HeaderMap,
     Json(req): Json<SearchableRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let user_id = authenticate(&headers, &state.store)?;
+    let user_id = authenticate(&headers, &state.store).await?;
     let hash = if req.searchable {
         let Some(hash) = &req.phone_search_hash else {
             return Err(ApiError::BadRequest(
@@ -315,7 +461,7 @@ async fn username_lookup(
     headers: HeaderMap,
     Query(q): Query<UsernameLookupQuery>,
 ) -> Result<Json<UsernameLookupResponse>, ApiError> {
-    authenticate(&headers, &state.store)?;
+    authenticate(&headers, &state.store).await?;
     let user_id = state
         .store
         .find_user_by_handle(&q.nickname, q.discriminator)
@@ -343,7 +489,7 @@ async fn set_pairing_bootstrap(
     headers: HeaderMap,
     Json(req): Json<PairingBootstrapRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let user_id = authenticate(&headers, &state.store)?;
+    let user_id = authenticate(&headers, &state.store).await?;
     if req.contact_link_b64.trim().is_empty() {
         return Err(ApiError::BadRequest("contact_link_b64 must not be empty"));
     }
@@ -377,7 +523,7 @@ async fn request_pairing_bootstrap(
     if !state.config.search_enabled {
         return Err(ApiError::FeatureDisabled);
     }
-    let caller_id = authenticate(&headers, &state.store)?;
+    let caller_id = authenticate(&headers, &state.store).await?;
 
     let caller_verified = state
         .store
@@ -409,7 +555,7 @@ async fn delete_account(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let user_id = authenticate(&headers, &state.store)?;
+    let user_id = authenticate(&headers, &state.store).await?;
     state
         .store
         .erase_user(user_id)
@@ -451,7 +597,7 @@ async fn search(
         return Err(ApiError::FeatureDisabled);
     }
     // T4: authenticated caller required.
-    let caller_id = authenticate(&headers, &state.store)?;
+    let caller_id = authenticate(&headers, &state.store).await?;
 
     // T20: unverified callers get a measurably tighter limit.
     let caller_verified = state
@@ -499,6 +645,88 @@ mod tests {
     use crate::verify::DevOtpVendor;
     use sqlx::PgPool;
 
+    /// ET1: `client_ip` decides *whose* bucket a request counts against, so
+    /// reading `X-Forwarded-For` from the wrong end is not a style question — it
+    /// hands an attacker a forged key and lets them throttle a stranger, which
+    /// is worse than having no limit at all.
+    mod client_ip {
+        use super::*;
+
+        fn headers(xff: Option<&str>) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            if let Some(v) = xff {
+                h.insert("x-forwarded-for", v.parse().unwrap());
+            }
+            h
+        }
+
+        fn peer() -> SocketAddr {
+            "10.0.0.9:5555".parse().unwrap()
+        }
+
+        /// Caddy appends the peer it saw, so a client-supplied prefix lands to
+        /// the LEFT of the truth. Taking the leftmost — the usual "client IP"
+        /// idiom — would read the forgery.
+        #[test]
+        fn a_forged_prefix_cannot_win_because_we_read_the_end_caddy_wrote() {
+            let ip = client_ip(&headers(Some("1.2.3.4, 203.0.113.7")), peer());
+
+            assert_eq!(
+                ip,
+                "203.0.113.7".parse::<IpAddr>().unwrap(),
+                "the rightmost entry is the only one the proxy wrote"
+            );
+            assert_ne!(ip, "1.2.3.4".parse::<IpAddr>().unwrap());
+        }
+
+        #[test]
+        fn a_single_entry_is_the_real_client() {
+            assert_eq!(
+                client_ip(&headers(Some("203.0.113.7")), peer()),
+                "203.0.113.7".parse::<IpAddr>().unwrap()
+            );
+        }
+
+        #[test]
+        fn whitespace_after_the_comma_is_not_a_parse_failure() {
+            assert_eq!(
+                client_ip(&headers(Some("1.2.3.4,   203.0.113.7  ")), peer()),
+                "203.0.113.7".parse::<IpAddr>().unwrap()
+            );
+        }
+
+        /// No proxy: `cargo run`, the e2e tests. The peer *is* the client.
+        #[test]
+        fn without_the_header_the_socket_peer_is_the_client() {
+            assert_eq!(
+                client_ip(&headers(None), peer()),
+                "10.0.0.9".parse::<IpAddr>().unwrap()
+            );
+        }
+
+        /// Garbage must fall back to the peer, never panic and never key
+        /// everyone onto one bucket by accident.
+        #[test]
+        fn an_unparseable_header_falls_back_to_the_peer() {
+            assert_eq!(
+                client_ip(&headers(Some("not-an-ip")), peer()),
+                "10.0.0.9".parse::<IpAddr>().unwrap()
+            );
+            assert_eq!(
+                client_ip(&headers(Some("")), peer()),
+                "10.0.0.9".parse::<IpAddr>().unwrap()
+            );
+        }
+
+        #[test]
+        fn v6_survives_the_round_trip() {
+            assert_eq!(
+                client_ip(&headers(Some("2001:db8::1")), peer()),
+                "2001:db8::1".parse::<IpAddr>().unwrap()
+            );
+        }
+    }
+
     fn state_for(pool: PgPool) -> Arc<AppState> {
         Arc::new(AppState {
             store: Arc::new(DirectoryStore::from_pool(pool)),
@@ -517,7 +745,7 @@ mod tests {
         let state = state_for(pool);
         let target = state
             .store
-            .create_pending_user("target-hash-0")
+            .find_or_create_pending_user("target-hash-0")
             .await
             .unwrap();
         state
@@ -530,14 +758,14 @@ mod tests {
             .set_searchable(target, true, Some(&"a".repeat(64)))
             .await
             .unwrap();
-        let target_token = state.store.create_session(target);
+        let target_token = state.store.create_session(target).await.unwrap();
 
         let requester = state
             .store
-            .create_pending_user("requester-hash-0")
+            .find_or_create_pending_user("requester-hash-0")
             .await
             .unwrap();
-        let requester_token = state.store.create_session(requester);
+        let requester_token = state.store.create_session(requester).await.unwrap();
 
         let addr = spawn_for_tests(state).await.unwrap();
         let client = reqwest::Client::new();
@@ -593,7 +821,7 @@ mod tests {
         let state = state_for(pool);
         let target = state
             .store
-            .create_pending_user("target-hash-1")
+            .find_or_create_pending_user("target-hash-1")
             .await
             .unwrap();
         // Never calls set_searchable(true) — stays private.
@@ -605,10 +833,10 @@ mod tests {
 
         let requester = state
             .store
-            .create_pending_user("requester-hash-1")
+            .find_or_create_pending_user("requester-hash-1")
             .await
             .unwrap();
-        let requester_token = state.store.create_session(requester);
+        let requester_token = state.store.create_session(requester).await.unwrap();
 
         let addr = spawn_for_tests(state).await.unwrap();
         let resp = reqwest::Client::new()
@@ -627,7 +855,7 @@ mod tests {
         let state = state_for(pool);
         let target = state
             .store
-            .create_pending_user("target-hash-2")
+            .find_or_create_pending_user("target-hash-2")
             .await
             .unwrap();
         state
@@ -716,7 +944,9 @@ mod tests {
         let state = state_for(pool);
         let user_id = state
             .store
-            .create_pending_user("erase-me-hash-000000000000000000000000000000000000000000000000")
+            .find_or_create_pending_user(
+                "erase-me-hash-000000000000000000000000000000000000000000000000",
+            )
             .await
             .unwrap();
         state.store.claim_username(user_id, "temp").await.unwrap();
@@ -726,8 +956,9 @@ mod tests {
             .set_searchable(user_id, true, Some(&search_hash))
             .await
             .unwrap();
-        let token = state.store.create_session(user_id);
+        let token = state.store.create_session(user_id).await.unwrap();
 
+        let state_ref = state.clone(); // the store outlives the move into the server
         let addr = spawn_for_tests(state).await.unwrap();
         let client = reqwest::Client::new();
         let resp = client
@@ -738,13 +969,38 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
 
-        // Now findable-by-search must return nothing for that prefix.
-        let search = client
+        // ET2: the token that just erased the account must stop working. Until
+        // ET2 it kept authenticating against a dangling `user_id` — the rows were
+        // gone and the session was not, so an erased account's bearer token was
+        // still a valid caller.
+        let after_erase = client
             .get(format!("http://{addr}/search?prefix=erase"))
             .header("Authorization", format!("Bearer {token}"))
             .send()
             .await
             .unwrap();
+        assert_eq!(
+            after_erase.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "erasure must revoke the session, not just the rows"
+        );
+
+        // ...and the account is gone from search. Checked with a *different*,
+        // live caller: asserting this with the erased user's own token (as this
+        // test used to) now only proves the 401 above, not the removal.
+        let onlooker = state_ref
+            .store
+            .find_or_create_pending_user("onlooker-hash-000000000000000000000000000000000000000000")
+            .await
+            .unwrap();
+        let onlooker_token = state_ref.store.create_session(onlooker).await.unwrap();
+        let search = client
+            .get(format!("http://{addr}/search?prefix=erase"))
+            .header("Authorization", format!("Bearer {onlooker_token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(search.status(), reqwest::StatusCode::OK);
         let body: serde_json::Value = search.json().await.unwrap();
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
     }
@@ -752,7 +1008,7 @@ mod tests {
     #[sqlx::test]
     async fn search_response_carries_the_search_hash_but_never_the_keyed_auth_one(pool: PgPool) {
         // T8, refined: the response type still has no field that could hold
-        // the KEYED auth phone_hash (`create_pending_user`'s argument below
+        // the KEYED auth phone_hash (`find_or_create_pending_user`'s argument below
         // never appears). It DOES now carry `search_hash` — the separate,
         // unkeyed value the client needs to do the final exact match
         // locally (HIBP-style); that's the endpoint's whole point, not a
@@ -760,7 +1016,7 @@ mod tests {
         let state = state_for(pool);
         let user_id = state
             .store
-            .create_pending_user("aaaaaverysecretphonehash")
+            .find_or_create_pending_user("aaaaaverysecretphonehash")
             .await
             .unwrap();
         state
@@ -774,7 +1030,7 @@ mod tests {
             .set_searchable(user_id, true, Some(&search_hash))
             .await
             .unwrap();
-        let token = state.store.create_session(user_id);
+        let token = state.store.create_session(user_id).await.unwrap();
 
         let addr = spawn_for_tests(state).await.unwrap();
         let resp = reqwest::Client::new()
@@ -801,7 +1057,7 @@ mod tests {
         let state = state_for(pool);
         let target = state
             .store
-            .create_pending_user("lookup-hash")
+            .find_or_create_pending_user("lookup-hash")
             .await
             .unwrap();
         let (slot, _width) = state
@@ -811,10 +1067,10 @@ mod tests {
             .unwrap();
         let requester = state
             .store
-            .create_pending_user("requester-hash")
+            .find_or_create_pending_user("requester-hash")
             .await
             .unwrap();
-        let token = state.store.create_session(requester);
+        let token = state.store.create_session(requester).await.unwrap();
 
         let addr = spawn_for_tests(state).await.unwrap();
         let client = reqwest::Client::new();
@@ -846,8 +1102,8 @@ mod tests {
     #[sqlx::test]
     async fn set_searchable_rejects_missing_or_malformed_hash(pool: PgPool) {
         let state = state_for(pool);
-        let user_id = state.store.create_pending_user("h").await.unwrap();
-        let token = state.store.create_session(user_id);
+        let user_id = state.store.find_or_create_pending_user("h").await.unwrap();
+        let token = state.store.create_session(user_id).await.unwrap();
         let addr = spawn_for_tests(state).await.unwrap();
         let client = reqwest::Client::new();
 

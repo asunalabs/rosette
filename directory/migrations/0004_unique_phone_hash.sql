@@ -1,0 +1,29 @@
+-- ET15: make "one live account per phone number" a constraint instead of a
+-- convention.
+--
+-- `phone_hash` had no uniqueness, and both user-creating endpoints did an
+-- unsynchronized check-then-act — `find_user_by_phone_hash`, then
+-- `create_pending_user`. Two concurrent requests for the same number therefore
+-- created two rows. That was survivable-looking (`find_user_by_phone_hash`
+-- hides it with `ORDER BY user_id DESC LIMIT 1`) right up until erasure:
+-- `erase_user` takes a single `user_id` and scrubs one row, so the shadow kept
+-- the peppered hash and a deletion T15/T19 promises is *real* was quietly half
+-- done.
+--
+-- Partial, not a plain UNIQUE: `erase_user` sets `phone_hash = ''` alongside
+-- `deleted_at`, so every erased row would collide on `''` under a plain index.
+-- Live rows are the ones that must be unique; tombstones are free to share.
+--
+-- No dedupe step on purpose. If this index fails to create, live duplicates
+-- exist, and picking a survivor is not a decision a migration should make
+-- silently: the shadow rows can hold their own claimed nickname (`UNIQUE
+-- (nickname, discriminator)`) and their own sessions, so scrubbing one is data
+-- loss that wants a human. Failing here is the loud, correct outcome — and this
+-- is expected to be a no-op, since nothing is deployed and no duplicates exist
+-- in any known database. Diagnose with:
+--
+--   SELECT phone_hash, COUNT(*), array_agg(user_id)
+--     FROM users WHERE deleted_at IS NULL
+--    GROUP BY phone_hash HAVING COUNT(*) > 1;
+CREATE UNIQUE INDEX idx_users_phone_hash_live ON users (phone_hash)
+    WHERE deleted_at IS NULL;

@@ -104,10 +104,24 @@ The accent must be trivially replaceable. Rules:
 | `bubbleMine` | `#5B3A6C` | `#6B4183` | own bubbles — SOLID accent family |
 | `onBubbleMine` | `#FFFFFF` | `#FFFFFF` | text/time on own bubbles (time at 72% opacity) |
 | `bubbleTheirs` | `#F0EEF0` | `#242027` | incoming bubbles |
-| `error` | `#C62828` | `#E5484D` | real failures only |
+| `error` | `#C62828` | `#F16A6F` | real failures only |
 | `errorSoft` | `#FBE9E7` | `#35201B` | error fills |
-| `warning` | `#8F6400` | `#D4A945` | expiring links etc. |
+| `warning` | `#7A5500` | `#D4A945` | expiring links etc. |
 | `warningSoft` | `#F5ECD4` | `#322B18` | warning fills |
+
+Every `*Soft` fill is a text background, not decoration — `InstrumentStatusChip`
+renders `warning` **on** `warningSoft` — so each pair owes the 4.5:1 above, not
+3:1 (chip text is `labelMedium`, 13.5sp, which is not "large text"). Measured:
+
+| pair | light | dark |
+| --- | --- | --- |
+| `warning` on `warningSoft` | 5.70 | 6.40 |
+| `error` on `errorSoft` | 4.80 | 5.12 |
+
+The two that moved were introduced failing and fixed on 2026-07-16 (ET12), not
+re-tuned for taste: light `warning` was `#8F6400` (**4.47**, under this file's
+own bar) and dark `error` was `#E5484D` (**3.91**). Re-measure this table when
+any of the four change — the pair is the unit, not the token.
 | `info` | `#4C5A6B` | `#94A3B8` | connection banner text |
 | `onAccent` | `#FFFFFF` | `#121013` | text on `accent` fills |
 - **Success/verified = accent**, not green: trust wears the brand color.
@@ -165,6 +179,15 @@ implementation (JS/SVG v0): `docs/design/design-preview.html`.
   then optional secondary pill 12dp below).
 
 ## Layout
+
+> **Read the SPECCED, NOT BUILT markers below before filing a QA bug.** CLAUDE.md
+> makes this file normative and tells QA to flag code that doesn't match it, so a
+> spec written in the present tense about something unbuilt manufactures a
+> permanent QA violation — the reviewer can only conclude the code is wrong.
+> Marked entries are the design we intend; the "Today:" line under each is what
+> the app actually renders. Added by ET9 (2026-07-16) after DOC-1 found three of
+> them; drop a marker only in the commit that makes its claim true.
+
 - **Approach:** standard messenger anatomy on purpose (familiarity is the
   wedge). Onboarding flow: welcome → phone verify (flag + country code in
   the input pill's leading segment) → OTP (mono cells) → username claim.
@@ -172,9 +195,41 @@ implementation (JS/SVG v0): `docs/design/design-preview.html`.
 - **Breakpoint:** 700dp — desktop is icon rail (60dp) + chat list pane
   (290dp) + conversation pane. Device link is a centered card: QR on white
   tile + numbered steps.
-- **Bottom navigation (mobile):** floating pill tab bar (Chats / Calls /
-  Settings), selected tab = `surface2` pill.
-- **FAB:** 52dp accent circle, bottom-right above the tab bar.
+- **Bottom navigation (mobile):** floating pill tab bar, selected tab =
+  `surface2` pill. **Settings is NOT a tab** (amended 2026-07-16) — see "You
+  menu" below.
+  - **SPECCED, NOT BUILT (DT9).** *Today:* `App.kt:92` renders
+    `listOf("Chats", "Find people")`. Neither the old spec (Chats / Calls) nor
+    the new one (Find people is a FAB destination, below) describes it — the tab
+    bar currently matches nothing, which is why this marker exists.
+- **You menu (amended 2026-07-16):** the chat list's top-left is your own
+  Rosette (36dp). Tapping it expands a Signal-style dropdown carrying your
+  handle and a link to the Settings screen. Rationale: Settings is chrome,
+  not a destination — the tab bar is for places you go, and your identity
+  belongs where Signal's structural language puts it. The dropdown is the
+  ONLY route to Settings.
+  - **SPECCED, NOT BUILT (DT4).** *Today:* `ChatListScreen.kt` renders a plain
+    `Text("Chats")` top-left, no Rosette and no dropdown. **There is no Settings
+    screen at all**, so "the dropdown is the only route to Settings" is
+    currently true only in the vacuous sense.
+- **Your handle is never hidden.** It appears in the You menu in Plex Mono
+  (`mira#07` is a crypto fact, per Typography) and is tap-to-copy. A user who
+  cannot recite their own handle cannot be found, which defeats the directory.
+  - **SPECCED, NOT BUILT (DT4)** — depends on the You menu above.
+- **FAB:** 52dp accent circle, bottom-right above the tab bar. Opens **Find
+  people** as a pushed screen (amended 2026-07-16 — Find people is a FAB
+  destination, not a tab; that's why it has a back affordance).
+  - **SPECCED, NOT BUILT (DT9).** *Today:* no FAB exists anywhere, and Find
+    people is reached as a tab (`App.kt:92`) — the exact arrangement this entry
+    amends away from.
+- **Verification lives in the conversation (amended 2026-07-16):** the
+  conversation header's name is tappable → contact sheet (Rosette large,
+  handle in mono, "Verify safety number") → compare screen → on success,
+  the ceremony fires. "Is this really them?" is a question asked *inside a
+  conversation*, so it is answered there — never in Settings.
+  - **SPECCED, NOT BUILT (DT6).** *Today:* `ConversationScreen.kt` renders the
+    name as plain text with no `clickable`, there is no contact sheet or compare
+    screen, and `markVerified` has no call site in the app.
 
 ## Motion
 - **Approach:** minimal-functional; calm.
@@ -205,3 +260,8 @@ implementation (JS/SVG v0): `docs/design/design-preview.html`.
 | 2026-07-14 | Bubbles: solid-accent outgoing + white text, quiet-gray incoming, uniform 18dp, inline trailing timestamps | Old tinted `bubbleMine` read washed-out; timestamp-as-row wasted space; rounded beats rectangular next to pills + circles |
 | 2026-07-14 | Iconography = Lucide, strokes only | Founder rejected placeholder glyphs; Lucide is ISC, consistent, non-Material |
 | 2026-07-14 | Onboarding priority order; flag emoji in country-code segment; "Restore account" CTA copy | Founder: old onboarding screens were the weakest surface |
+| 2026-07-16 | **Settings moves out of the tab bar** into a top-left Rosette → Signal-style dropdown. Tab bar becomes Chats / Calls | /plan-design-review: Settings is chrome, not a destination; matches the Signal skeleton already adopted; frees the tab bar |
+| 2026-07-16 | **Find people is a FAB destination, not a tab** | Its back arrow proved it was never a tab; restores DESIGN.md's specced FAB and gives the chat list its missing compose affordance |
+| 2026-07-16 | **Verification = conversation header → contact sheet → safety numbers**, then the ceremony | The trust question is asked inside a conversation, so it's answered there. `markVerified` had zero call sites; the Rosette's verified band and "the one ceremony" were unreachable code |
+| 2026-07-16 | **`warning` token owns "we're waiting on our own infrastructure"; `error` stays quarantined to real user-facing failures** | A vendor outage is not the user's failure. Rendering it in `error` both spends the one token that means something and blames the wrong party (T27 held state) |
+| 2026-07-16 | **Onboarding steps get a back affordance; `error` clears on every transition** | A mistyped number was an unescapable dead end; `onRestore`'s message leaked across steps and glowed red under an unrelated CTA |

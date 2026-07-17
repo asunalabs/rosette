@@ -192,6 +192,34 @@ fun InstrumentPhoneField(
     }
 }
 
+/**
+ * Which token a status chip wears. DESIGN.md "Voice quarantine": `error` only
+ * ever means a real failure, so a vendor outage we're waiting out is
+ * [Warning], not [Error] — the user did nothing wrong. Getting this backwards
+ * both spends the error token and blames the wrong party.
+ */
+enum class StatusTone { Warning, Error, Positive }
+
+/** Pill chip carrying one line of status, adjacent to the control it's about (never parked at the screen edge). */
+@Composable
+fun InstrumentStatusChip(text: String, tone: StatusTone, modifier: Modifier = Modifier) {
+    val palette = LocalChatPalette.current
+    val (fg, bg) = when (tone) {
+        StatusTone.Warning -> palette.warning to palette.warningSoft
+        StatusTone.Error -> palette.error to palette.errorSoft
+        // DESIGN.md: "Success/verified = accent, not green: trust wears the brand color."
+        StatusTone.Positive -> palette.accent to palette.accentSoft
+    }
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(50))
+            .background(bg)
+            .padding(horizontal = 14.dp, vertical = 7.dp),
+    ) {
+        Text(text, style = MaterialTheme.typography.labelMedium, color = fg)
+    }
+}
+
 @Composable
 fun InstrumentToggle(checked: Boolean, onCheckedChange: (Boolean) -> Unit, modifier: Modifier = Modifier) {
     val palette = LocalChatPalette.current

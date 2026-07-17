@@ -1,7 +1,7 @@
 //! T13: signup -> OTP -> username claim -> findable-by-search, end to end
 //! over real HTTP against a real (ephemeral, per-test) Postgres DB. Also
-//! covers the T2 soft-gate path: a degraded (vendor-timeout) account must
-//! NOT become findable.
+//! covers ET6/ARCH-5: a vendor timeout must mint no session at all (it used
+//! to soft-gate into a "degraded" one, which was an auth bypass).
 
 use std::sync::Arc;
 
@@ -25,6 +25,7 @@ fn state_with_vendor(pool: PgPool, vendor: Arc<dyn OtpVendor>) -> Arc<AppState> 
 #[sqlx::test]
 async fn fresh_account_reaches_search_findable_state_end_to_end(pool: PgPool) {
     let state = state_with_vendor(pool, Arc::new(DevOtpVendor));
+    let store_ref = state.store.clone(); // kept for a direct DB check below
     let addr = directory::spawn_for_tests(state).await.unwrap();
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -50,6 +51,23 @@ async fn fresh_account_reaches_search_findable_state_end_to_end(pool: PgPool) {
     let verify_body: serde_json::Value = verify.json().await.unwrap();
     assert_eq!(verify_body["verified"], true);
     let token = verify_body["session_token"].as_str().unwrap().to_string();
+
+    // The response body's `verified` is a server-side constant (api.rs hardcodes
+    // it), so asserting on it proves nothing about the DB. The column is what
+    // `is_verified` reads to pick the search rate-limit tier — assert on that, or
+    // `mark_verified` could write `false` and the whole suite would still pass.
+    let hash = directory::verify::phone_hash(phone, directory::verify::Pepper(b"e2e-test-pepper"))
+        .unwrap();
+    let user_id = store_ref
+        .find_user_by_phone_hash(&hash)
+        .await
+        .unwrap()
+        .expect("verify created the user");
+    assert_eq!(
+        store_ref.is_verified(user_id).await.unwrap(),
+        Some(true),
+        "an approved code must flip the DB flag, not just the response body"
+    );
 
     // 3. username claim
     let username = client
@@ -102,19 +120,186 @@ async fn fresh_account_reaches_search_findable_state_end_to_end(pool: PgPool) {
     assert_eq!(results[0]["handle"], "e2ealice#01");
 }
 
-struct AlwaysTimeoutVendor;
-impl OtpVendor for AlwaysTimeoutVendor {
+/// Up for `send_code`, down for `verify` — deliberately, so the test below
+/// isolates `/verify`: the victim needs a real pending row from `/signup`
+/// before the attacker's `/verify` can be judged. Not a claim that outages
+/// look like this. `AlwaysUnavailableVendor` covers the realistic shape,
+/// where the vendor is down for both calls.
+struct VerifyUnavailableVendor;
+impl OtpVendor for VerifyUnavailableVendor {
     fn send_code(&self, _e164: &str) -> Result<(), VendorError> {
         Ok(())
     }
     fn verify(&self, _e164: &str, _code: &str) -> Result<bool, VendorError> {
-        Err(VendorError::Timeout)
+        Err(VendorError::Unavailable)
     }
 }
 
+/// A real outage: the vendor answers nothing, so `/signup` fails too.
+struct AlwaysUnavailableVendor;
+impl OtpVendor for AlwaysUnavailableVendor {
+    fn send_code(&self, _e164: &str) -> Result<(), VendorError> {
+        Err(VendorError::Unavailable)
+    }
+    fn verify(&self, _e164: &str, _code: &str) -> Result<bool, VendorError> {
+        Err(VendorError::Unavailable)
+    }
+}
+
+/// The held screen ET8 built lives one screen *past* `/signup`, so `/signup`
+/// must classify a vendor outage the same way `/verify` does. It used to
+/// flatten every vendor error to 500, which the client reads as a generic
+/// error — so during the outage the held screen was for, the user never
+/// reached it.
 #[sqlx::test]
-async fn degraded_soft_gate_account_never_becomes_findable(pool: PgPool) {
-    let state = state_with_vendor(pool, Arc::new(AlwaysTimeoutVendor));
+async fn vendor_outage_makes_signup_fail_closed_with_503(pool: PgPool) {
+    let state = state_with_vendor(pool, Arc::new(AlwaysUnavailableVendor));
+    let addr = directory::spawn_for_tests(state).await.unwrap();
+    let base = format!("http://{addr}");
+
+    let res = reqwest::Client::new()
+        .post(format!("{base}/signup"))
+        .json(&serde_json::json!({ "phone": "+15559990003" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "a vendor outage is transient and retryable — 503, not a 500 that reads as our bug"
+    );
+}
+
+/// ET1: `/verify` is unauthenticated by construction, so before this the only
+/// thing standing between an attacker and a victim's 6-digit code was whatever
+/// attempt cap the OTP vendor happened to enforce — a property of the vendor,
+/// not of us, and `OtpVendor` exists to make vendors swappable.
+#[sqlx::test]
+async fn brute_forcing_one_numbers_otp_hits_a_429(pool: PgPool) {
+    let state = state_with_vendor(pool, Arc::new(DevOtpVendor));
+    let addr = directory::spawn_for_tests(state).await.unwrap();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let phone = "+15559990005";
+    client
+        .post(format!("{base}/signup"))
+        .json(&serde_json::json!({ "phone": phone }))
+        .send()
+        .await
+        .unwrap();
+
+    // Guess wrong, repeatedly, exactly as a script would.
+    let mut statuses = Vec::new();
+    for i in 0..12 {
+        let res = client
+            .post(format!("{base}/verify"))
+            .json(&serde_json::json!({ "phone": phone, "code": format!("{i:06}") }))
+            .send()
+            .await
+            .unwrap();
+        statuses.push(res.status());
+    }
+
+    assert!(
+        statuses.contains(&reqwest::StatusCode::TOO_MANY_REQUESTS),
+        "a sustained guess flood must be throttled, got: {statuses:?}"
+    );
+    let allowed = statuses
+        .iter()
+        .filter(|s| **s != reqwest::StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert_eq!(
+        allowed, 5,
+        "only the window's worth of guesses may reach the vendor"
+    );
+
+    // The throttle must not become an oracle: a rejected guess and a throttled
+    // one already differ (400 vs 429), but neither may leak a session.
+    let last: serde_json::Value = client
+        .post(format!("{base}/verify"))
+        .json(&serde_json::json!({ "phone": phone, "code": DEV_OTP_CODE }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        last.get("session_token").is_none(),
+        "even the correct code must wait out the window, got: {last}"
+    );
+}
+
+/// ET14, the attacker's view: `/verify` is the second endpoint that creates
+/// users, and it never checked OQ5's post-deletion cooldown — only `/signup`
+/// did. So the 24h lock was one HTTP call wide: erase, then re-verify with the
+/// code you already hold. The erased row no longer matches the hash, so the
+/// find-or-create fell through to a fresh INSERT and minted a fresh
+/// *verified* account for a number that is supposed to be untouchable.
+#[sqlx::test]
+async fn an_erased_number_cannot_be_reclaimed_through_verify_during_cooldown(pool: PgPool) {
+    let state = state_with_vendor(pool, Arc::new(DevOtpVendor));
+    let addr = directory::spawn_for_tests(state).await.unwrap();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let phone = "+15559990004";
+    client
+        .post(format!("{base}/signup"))
+        .json(&serde_json::json!({ "phone": phone }))
+        .send()
+        .await
+        .unwrap();
+    let verify = client
+        .post(format!("{base}/verify"))
+        .json(&serde_json::json!({ "phone": phone, "code": DEV_OTP_CODE }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(verify.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = verify.json().await.unwrap();
+    let token = body["session_token"].as_str().unwrap().to_string();
+
+    // Erase: starts the cooldown and scrubs `users.phone_hash` — but
+    // `phone_cooldown` keeps the hash, which is what makes the lock checkable.
+    let erased = client
+        .delete(format!("{base}/account"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(erased.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // The attack. No new /signup — that endpoint would have refused. Straight
+    // to /verify with the code from before the erasure.
+    let reclaim = client
+        .post(format!("{base}/verify"))
+        .json(&serde_json::json!({ "phone": phone, "code": DEV_OTP_CODE }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        reclaim.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "an erased number is locked for 24h — /verify must not re-mint it"
+    );
+    let body: serde_json::Value = reclaim.json().await.unwrap();
+    assert!(
+        body.get("session_token").is_none(),
+        "a refused reclaim must carry no session material, got: {body}"
+    );
+}
+
+/// ARCH-5, the attacker's view: during a vendor outage, an unauthenticated
+/// POST /verify carrying a *victim's* number and an arbitrary code used to
+/// return a session token bound to that victim (account erasure and an MLS
+/// pairing MITM follow). The vendor times out for the whole test, so the code
+/// below is never checked by anyone — and must therefore buy nothing.
+#[sqlx::test]
+async fn vendor_timeout_mints_no_session_and_leaves_the_victim_unverified(pool: PgPool) {
+    let state = state_with_vendor(pool, Arc::new(VerifyUnavailableVendor));
     let store_ref = state.store.clone(); // kept for a direct DB check below
     let addr = directory::spawn_for_tests(state).await.unwrap();
     let base = format!("http://{addr}");
@@ -130,44 +315,34 @@ async fn degraded_soft_gate_account_never_becomes_findable(pool: PgPool) {
 
     let verify = client
         .post(format!("{base}/verify"))
-        .json(&serde_json::json!({ "phone": phone, "code": "000000" }))
-        .send()
-        .await
-        .unwrap();
-    // Degraded signup still succeeds (T2) but comes back unverified.
-    assert_eq!(verify.status(), reqwest::StatusCode::OK);
-    let body: serde_json::Value = verify.json().await.unwrap();
-    assert_eq!(body["verified"], false);
-    let user_id = body["user_id"].as_u64().unwrap();
-    let token = body["session_token"].as_str().unwrap().to_string();
-
-    // Claiming a username and opting into search are both independent of
-    // verification status by design (T24's opt-in is a visibility toggle,
-    // not a re-verification) — but neither action should silently flip
-    // verified to true. Check the DB directly, not just another endpoint's
-    // response shape.
-    client
-        .post(format!("{base}/username"))
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&serde_json::json!({ "nickname": "degraded" }))
-        .send()
-        .await
-        .unwrap();
-    client
-        .post(format!("{base}/searchable"))
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&serde_json::json!({
-            "searchable": true,
-            "phone_search_hash": format!("degrade{}", "0".repeat(57)),
-        }))
+        .json(&serde_json::json!({ "phone": phone, "code": "not-the-code" }))
         .send()
         .await
         .unwrap();
 
-    let still_verified = store_ref.is_verified(user_id).await.unwrap();
     assert_eq!(
-        still_verified,
+        verify.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "an unchecked code must fail closed, not mint a degraded session"
+    );
+    let body: serde_json::Value = verify.json().await.unwrap();
+    assert!(
+        body.get("session_token").is_none() && body.get("user_id").is_none(),
+        "503 body must carry no session material, got: {body}"
+    );
+
+    // The pending row from /signup still exists — assert on the DB, not on
+    // another endpoint's response shape: the flag is what search reads.
+    let hash = directory::verify::phone_hash(phone, directory::verify::Pepper(b"e2e-test-pepper"))
+        .unwrap();
+    let user_id = store_ref
+        .find_user_by_phone_hash(&hash)
+        .await
+        .unwrap()
+        .expect("signup created a pending user");
+    assert_eq!(
+        store_ref.is_verified(user_id).await.unwrap(),
         Some(false),
-        "degraded account must not silently become verified"
+        "a timed-out verify must not flip the victim's verified flag"
     );
 }
