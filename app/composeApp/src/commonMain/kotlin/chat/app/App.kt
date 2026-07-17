@@ -1,29 +1,42 @@
 package chat.app
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import chat.app.chatlist.ChatListScreen
 import chat.app.chatlist.ConversationScreen
 import chat.app.directory.DirectoryClient
 import chat.app.directory.DirectoryException
 import chat.app.directory.isSessionExpired
 import chat.app.onboarding.OnboardingFlow
-import chat.app.pairing.FindPeopleScreen
 import chat.app.session.Session
 import chat.app.session.rememberSessionStore
+import chat.app.pairing.FindPeopleScreen
+import chat.app.storage.DbConfig
+import chat.app.storage.deleteDbFile
+import chat.app.storage.rememberDbConfig
 import chat.app.theme.ChatTheme
+import chat.app.theme.InstrumentButton
 import chat.app.theme.InstrumentTabBar
 import chat.app.theme.LocalChatPalette
 import chat.engine.ChatEngine
 import chat.engine.Conversation
+import chat.engine.EngineException
 
 /**
  * T27: phone verification gates the app itself — no unverified-but-usable
@@ -39,6 +52,7 @@ fun App() {
         var session by remember { mutableStateOf(store.load()) }
         val current = session
         val client = remember { DirectoryClient() }
+        val db = rememberDbConfig()
         if (current == null) {
             OnboardingFlow(client) { token, claimedHandle, phone ->
                 val newSession = Session(token, claimedHandle, phone)
@@ -49,6 +63,7 @@ fun App() {
             EngineScreen(
                 client = client,
                 session = current,
+                db = db,
                 // The only path back to onboarding once a session exists. Without
                 // it a 401 is terminal: the branch above keys on `current == null`,
                 // so a token the directory has forgotten is never replaced and
@@ -70,12 +85,29 @@ private enum class Tab { Chats, FindPeople }
 private fun EngineScreen(
     client: DirectoryClient,
     session: Session,
+    db: DbConfig,
     onSessionExpired: () -> Unit,
 ) {
     val palette = LocalChatPalette.current
-    // remember {} — one engine per composition, as the contract prescribes
-    // one per app start.
-    val engine = remember { ChatEngine(session.handle) }
+    // Issue #1: SQLCipher-persistent engine — identity, pairing, and history
+    // survive restarts. remember {} — one engine per composition, as the
+    // contract prescribes one per app start.
+    fun open(): ChatEngine? = try {
+        ChatEngine.newPersistent(session.handle, db.dbPath, db.dbKey)
+    } catch (_: EngineException) {
+        // BadKey/StorageFailed: the key store lost the key but the DB file
+        // survived (e.g. device-to-device data copy). Unreadable forever —
+        // offer the reset path, never crash, never silent fresh state.
+        null
+    }
+    var engineOrNull by remember { mutableStateOf(open()) }
+    val engine = engineOrNull ?: run {
+        ResetLocalDataScreen(onReset = {
+            deleteDbFile(db.dbPath)
+            engineOrNull = open()
+        })
+        return
+    }
     var tab by remember { mutableStateOf(Tab.Chats) }
     var openConversation by remember { mutableStateOf<Conversation?>(null) }
 
@@ -123,5 +155,32 @@ private fun EngineScreen(
             selected = tab.ordinal,
             onSelect = { tab = Tab.entries[it] },
         )
+    }
+}
+
+/** Issue #1 failure path: key store wiped but the DB file survived. */
+@Composable
+private fun ResetLocalDataScreen(onReset: () -> Unit) {
+    val palette = LocalChatPalette.current
+    Column(
+        modifier = Modifier.fillMaxSize().background(palette.bg).padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            "This device can't read its local data",
+            style = MaterialTheme.typography.headlineSmall,
+            color = palette.ink,
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "The key protecting this device's messages is gone, so the data " +
+                "stored here can't be opened. Reset to start fresh — your " +
+                "account itself is not affected.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = palette.muted,
+        )
+        Spacer(Modifier.height(24.dp))
+        InstrumentButton("Reset local data", onClick = onReset)
     }
 }
