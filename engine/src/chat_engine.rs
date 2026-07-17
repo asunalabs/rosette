@@ -313,6 +313,13 @@ impl ChatEngine {
         Ok(self.session.epoch()?)
     }
 
+    /// DT6: the safety number both peers compare in the verify ceremony. See
+    /// `ChatSession::safety_number` — bound to the MLS signature keys, so a MITM
+    /// diverges. Errors until paired (no group yet).
+    pub fn safety_number(&self) -> anyhow::Result<String> {
+        Ok(self.session.safety_number()?)
+    }
+
     /// Send an application message to the conversation. Reconnects and
     /// retries on connection loss; the stable message id (a hash of the wire
     /// bytes) means an ambiguous resend at worst produces a duplicate the
