@@ -40,7 +40,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/verify", post(verify_handler))
         .route("/username", post(claim_username))
         .route("/username-lookup", get(username_lookup))
-        .route("/searchable", post(set_searchable))
+        .route("/searchable", get(get_searchable).post(set_searchable))
         .route("/account", delete(delete_account))
         .route("/search", get(search))
         .route("/pairing-bootstrap", post(set_pairing_bootstrap))
@@ -453,6 +453,28 @@ struct SearchableRequest {
 
 fn is_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[derive(Serialize)]
+struct SearchableResponse {
+    searchable: bool,
+}
+
+/// DT5: read the caller's own phone-search opt-in so the UI renders the true
+/// state. Same auth posture as every account-scoped endpoint; a dangling token
+/// whose user no longer exists resolves to 401, never a silent `false`.
+async fn get_searchable(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<SearchableResponse>, ApiError> {
+    let user_id = authenticate(&headers, &state.store).await?;
+    let searchable = state
+        .store
+        .is_searchable(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::Unauthorized)?;
+    Ok(Json(SearchableResponse { searchable }))
 }
 
 async fn set_searchable(
@@ -1692,5 +1714,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(off.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+
+    #[sqlx::test]
+    async fn get_searchable_reflects_the_stored_opt_in(pool: PgPool) {
+        // DT5: the endpoint the client reads instead of guessing OFF. Drive the
+        // full round-trip over HTTP: default false → opt in → true → opt out →
+        // false, so a regression that hardcodes either value is caught.
+        let state = state_for(pool);
+        let user_id = state.store.find_or_create_pending_user("h").await.unwrap();
+        let token = state.store.create_session(user_id).await.unwrap();
+        let addr = spawn_for_tests(state).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let get = |c: reqwest::Client, t: String| async move {
+            c.get(format!("http://{addr}/searchable"))
+                .header("Authorization", format!("Bearer {t}"))
+                .send()
+                .await
+                .unwrap()
+        };
+
+        // A fresh account is not searchable (T24) — and GET says so, rather than
+        // the null the client used to render as a confident OFF.
+        let before = get(client.clone(), token.clone()).await;
+        assert_eq!(before.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            before.json::<serde_json::Value>().await.unwrap()["searchable"],
+            false
+        );
+
+        client
+            .post(format!("http://{addr}/searchable"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({ "searchable": true, "phone_search_hash": "a".repeat(64) }))
+            .send()
+            .await
+            .unwrap();
+
+        let after = get(client.clone(), token.clone()).await;
+        assert_eq!(
+            after.json::<serde_json::Value>().await.unwrap()["searchable"],
+            true
+        );
+
+        // An unauthenticated read is 401, never a leaked default.
+        let anon = client
+            .get(format!("http://{addr}/searchable"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anon.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
 }

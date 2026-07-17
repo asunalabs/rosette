@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -175,6 +176,18 @@ private fun PhoneLookup(
     var query by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
 
+    // DT5: load the real opt-in state instead of assuming OFF. Until this
+    // resolves (or if it fails) `searchable` stays null and the toggle renders
+    // disabled/unknown — never a confident OFF the user never chose.
+    LaunchedEffect(session.sessionToken) {
+        try {
+            searchable = client.getSearchable(session.sessionToken)
+        } catch (e: DirectoryException) {
+            if (e.isSessionExpired()) onSessionExpired()
+            // else leave null: unknown stays unknown.
+        }
+    }
+
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Text(
             "Let people who have my number find me",
@@ -184,6 +197,7 @@ private fun PhoneLookup(
         )
         InstrumentToggle(
             checked = searchable == true,
+            enabled = searchable != null,
             onCheckedChange = { on ->
                 scope.launch {
                     try {

@@ -87,6 +87,9 @@ private data class UsernameLookupResponse(val user_id: Long)
 private data class SearchableRequest(val searchable: Boolean, val phone_search_hash: String? = null)
 
 @Serializable
+private data class SearchableResponse(val searchable: Boolean)
+
+@Serializable
 private data class SearchResponse(val results: List<SearchResultDto>)
 
 @Serializable
@@ -215,6 +218,18 @@ class DirectoryClient(baseUrl: String = defaultDirectoryBaseUrl()) {
             parameter("discriminator", discriminator)
         } }?.body()
         return res?.user_id
+    }
+
+    /**
+     * GET /searchable — the caller's current opt-in state (DT5). Lets the UI
+     * render the real value instead of assuming OFF; a load failure leaves the
+     * toggle "unknown", never a false OFF.
+     */
+    suspend fun getSearchable(sessionToken: String): Boolean {
+        val res: SearchableResponse = call { http.get("$baseUrl/searchable") {
+            bearerAuth(sessionToken)
+        } }.body()
+        return res.searchable
     }
 
     /**
