@@ -26,6 +26,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -300,17 +301,35 @@ fun InstrumentTabBar(tabs: List<String>, selected: Int, onSelect: (Int) -> Unit,
  * DESIGN.md "Shape" bubbles: uniformly rounded 18dp; mine = solid accent
  * family + white text, theirs = quiet gray; timestamp trails the last line
  * inline, never its own row.
+ *
+ * DT3: `pending` dims the bubble while a send is in flight; `failed` renders
+ * the FFI's own "Not sent yet · tap to retry" line (`ffi/src/lib.rs:70`) in the
+ * `error` tone (a send that didn't leave the device IS a real failure, so
+ * `error` is the right token per DESIGN.md, not `warning`). `onRetry` fires on
+ * a tap of that line. Both default off, so the other call sites are unchanged.
  */
 @Composable
-fun MessageBubble(body: String, mine: Boolean, modifier: Modifier = Modifier, time: String? = null) {
+fun MessageBubble(
+    body: String,
+    mine: Boolean,
+    modifier: Modifier = Modifier,
+    time: String? = null,
+    pending: Boolean = false,
+    failed: Boolean = false,
+    onRetry: (() -> Unit)? = null,
+) {
     val palette = LocalChatPalette.current
     val bg = if (mine) palette.bubbleMine else palette.bubbleTheirs
     val fg = if (mine) palette.onBubbleMine else palette.ink
-    Row(modifier = modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        horizontalAlignment = if (mine) Alignment.End else Alignment.Start,
+    ) {
         Row(
             modifier = Modifier
                 .clip(RoundedCornerShape(18.dp))
                 .background(bg)
+                .then(if (pending) Modifier.alpha(0.6f) else Modifier)
                 .padding(horizontal = 14.dp, vertical = 9.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
@@ -325,6 +344,16 @@ fun MessageBubble(body: String, mine: Boolean, modifier: Modifier = Modifier, ti
                 Spacer(Modifier.width(8.dp))
                 Text(time, style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = fg.copy(alpha = 0.72f))
             }
+        }
+        if (failed) {
+            Text(
+                "Not sent yet · tap to retry",
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                color = palette.error,
+                modifier = Modifier
+                    .padding(top = 2.dp, end = 4.dp, start = 4.dp)
+                    .then(if (onRetry != null) Modifier.clickable(onClick = onRetry) else Modifier),
+            )
         }
     }
 }
