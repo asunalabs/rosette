@@ -154,7 +154,7 @@ fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
 
 /// T4: every search caller must be authenticated. Used by /username and
 /// /searchable too, since those are also account-scoped actions.
-fn authenticate(headers: &HeaderMap, store: &DirectoryStore) -> Result<u64, ApiError> {
+async fn authenticate(headers: &HeaderMap, store: &DirectoryStore) -> Result<u64, ApiError> {
     let value = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -162,7 +162,11 @@ fn authenticate(headers: &HeaderMap, store: &DirectoryStore) -> Result<u64, ApiE
     let token = value
         .strip_prefix("Bearer ")
         .ok_or(ApiError::Unauthorized)?;
-    store.session_user_id(token).ok_or(ApiError::Unauthorized)
+    store
+        .session_user_id(token)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::Unauthorized)
 }
 
 async fn health() -> &'static str {
@@ -352,7 +356,11 @@ async fn verify_handler(
         .mark_verified(user_id)
         .await
         .map_err(|_| ApiError::Internal)?;
-    let session_token = state.store.create_session(user_id);
+    let session_token = state
+        .store
+        .create_session(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
     // Always true now that this is the only path that reaches `create_session`.
     // Kept on the wire so the client's `nextAfterVerify` gate stays live as
     // defense-in-depth against a future server regression (founder decision).
@@ -378,7 +386,7 @@ async fn claim_username(
     headers: HeaderMap,
     Json(req): Json<UsernameRequest>,
 ) -> Result<Json<UsernameResponse>, ApiError> {
-    let user_id = authenticate(&headers, &state.store)?;
+    let user_id = authenticate(&headers, &state.store).await?;
     let (slot, width) = state
         .store
         .claim_username(user_id, &req.nickname)
@@ -410,7 +418,7 @@ async fn set_searchable(
     headers: HeaderMap,
     Json(req): Json<SearchableRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let user_id = authenticate(&headers, &state.store)?;
+    let user_id = authenticate(&headers, &state.store).await?;
     let hash = if req.searchable {
         let Some(hash) = &req.phone_search_hash else {
             return Err(ApiError::BadRequest(
@@ -453,7 +461,7 @@ async fn username_lookup(
     headers: HeaderMap,
     Query(q): Query<UsernameLookupQuery>,
 ) -> Result<Json<UsernameLookupResponse>, ApiError> {
-    authenticate(&headers, &state.store)?;
+    authenticate(&headers, &state.store).await?;
     let user_id = state
         .store
         .find_user_by_handle(&q.nickname, q.discriminator)
@@ -481,7 +489,7 @@ async fn set_pairing_bootstrap(
     headers: HeaderMap,
     Json(req): Json<PairingBootstrapRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let user_id = authenticate(&headers, &state.store)?;
+    let user_id = authenticate(&headers, &state.store).await?;
     if req.contact_link_b64.trim().is_empty() {
         return Err(ApiError::BadRequest("contact_link_b64 must not be empty"));
     }
@@ -515,7 +523,7 @@ async fn request_pairing_bootstrap(
     if !state.config.search_enabled {
         return Err(ApiError::FeatureDisabled);
     }
-    let caller_id = authenticate(&headers, &state.store)?;
+    let caller_id = authenticate(&headers, &state.store).await?;
 
     let caller_verified = state
         .store
@@ -547,7 +555,7 @@ async fn delete_account(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let user_id = authenticate(&headers, &state.store)?;
+    let user_id = authenticate(&headers, &state.store).await?;
     state
         .store
         .erase_user(user_id)
@@ -589,7 +597,7 @@ async fn search(
         return Err(ApiError::FeatureDisabled);
     }
     // T4: authenticated caller required.
-    let caller_id = authenticate(&headers, &state.store)?;
+    let caller_id = authenticate(&headers, &state.store).await?;
 
     // T20: unverified callers get a measurably tighter limit.
     let caller_verified = state
@@ -750,14 +758,14 @@ mod tests {
             .set_searchable(target, true, Some(&"a".repeat(64)))
             .await
             .unwrap();
-        let target_token = state.store.create_session(target);
+        let target_token = state.store.create_session(target).await.unwrap();
 
         let requester = state
             .store
             .find_or_create_pending_user("requester-hash-0")
             .await
             .unwrap();
-        let requester_token = state.store.create_session(requester);
+        let requester_token = state.store.create_session(requester).await.unwrap();
 
         let addr = spawn_for_tests(state).await.unwrap();
         let client = reqwest::Client::new();
@@ -828,7 +836,7 @@ mod tests {
             .find_or_create_pending_user("requester-hash-1")
             .await
             .unwrap();
-        let requester_token = state.store.create_session(requester);
+        let requester_token = state.store.create_session(requester).await.unwrap();
 
         let addr = spawn_for_tests(state).await.unwrap();
         let resp = reqwest::Client::new()
@@ -948,7 +956,7 @@ mod tests {
             .set_searchable(user_id, true, Some(&search_hash))
             .await
             .unwrap();
-        let token = state.store.create_session(user_id);
+        let token = state.store.create_session(user_id).await.unwrap();
 
         let state_ref = state.clone(); // the store outlives the move into the server
         let addr = spawn_for_tests(state).await.unwrap();
@@ -985,7 +993,7 @@ mod tests {
             .find_or_create_pending_user("onlooker-hash-000000000000000000000000000000000000000000")
             .await
             .unwrap();
-        let onlooker_token = state_ref.store.create_session(onlooker);
+        let onlooker_token = state_ref.store.create_session(onlooker).await.unwrap();
         let search = client
             .get(format!("http://{addr}/search?prefix=erase"))
             .header("Authorization", format!("Bearer {onlooker_token}"))
@@ -1022,7 +1030,7 @@ mod tests {
             .set_searchable(user_id, true, Some(&search_hash))
             .await
             .unwrap();
-        let token = state.store.create_session(user_id);
+        let token = state.store.create_session(user_id).await.unwrap();
 
         let addr = spawn_for_tests(state).await.unwrap();
         let resp = reqwest::Client::new()
@@ -1062,7 +1070,7 @@ mod tests {
             .find_or_create_pending_user("requester-hash")
             .await
             .unwrap();
-        let token = state.store.create_session(requester);
+        let token = state.store.create_session(requester).await.unwrap();
 
         let addr = spawn_for_tests(state).await.unwrap();
         let client = reqwest::Client::new();
@@ -1095,7 +1103,7 @@ mod tests {
     async fn set_searchable_rejects_missing_or_malformed_hash(pool: PgPool) {
         let state = state_for(pool);
         let user_id = state.store.find_or_create_pending_user("h").await.unwrap();
-        let token = state.store.create_session(user_id);
+        let token = state.store.create_session(user_id).await.unwrap();
         let addr = spawn_for_tests(state).await.unwrap();
         let client = reqwest::Client::new();
 

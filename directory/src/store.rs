@@ -4,12 +4,24 @@
 //! where an embedded single-file DB is the point). Matches how Signal's
 //! account/directory-style data lives in a real DB, not a per-node file.
 //!
-//! Session tokens are the one deliberately non-persistent piece: kept in
-//! an in-memory map, not a table. A directory restart means callers
-//! re-verify; that's an acceptable ceiling at this stage.
+//! Session tokens used to be the one deliberately non-persistent piece — an
+//! in-memory map, on the reasoning that "a directory restart means callers
+//! re-verify; that's an acceptable ceiling at this stage." The ceiling would
+//! have been acceptable. **The premise was false, and that is why they now live
+//! in a table.** Callers could not re-verify: the app persists the token
+//! (`SessionStore`) and `App.kt` shows onboarding only when the stored session
+//! is null, so a restart did not send anyone back through verification — it left
+//! every installed client holding a token the server had forgotten, with
+//! `clear()` never called and no 401 handled anywhere. One deploy permanently
+//! broke search and pairing for every user.
+//!
+//! Worth keeping as a pattern, not just a fix: the decision was deliberate,
+//! documented, and reasonable, and it was still wrong — because the sentence
+//! justifying it described client behaviour that nobody checked against the
+//! client. Same shape as ET6 (`verify_phone` failed closed; the flow didn't) and
+//! ET8 (the 503 mapped; the screen was unreachable). When a comment here asserts
+//! something about the app, go read the app.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::RngCore;
@@ -19,6 +31,15 @@ use crate::search::{PhoneEntry, PrefixIndex};
 use crate::username::{self, UsernameError};
 
 pub const PHONE_COOLDOWN_HOURS: i64 = 24;
+
+/// How long a bearer token stays good.
+///
+/// Long, because expiry is not free: the app's only recovery from a dead token
+/// is to re-run onboarding, which sends a real SMS. Short TTLs would bill us
+/// for our own caution. Bounded anyway, because the token is stored in plaintext
+/// on the device (`SessionStore`'s own `ponytail:` note) and an unbounded
+/// credential's blast radius only grows.
+pub const SESSION_TTL_DAYS: i64 = 90;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClaimError {
@@ -30,8 +51,6 @@ pub enum ClaimError {
 
 pub struct DirectoryStore {
     pool: PgPool,
-    // Ephemeral, in-process only — see module docs.
-    sessions: Mutex<HashMap<String, u64>>,
 }
 
 fn now_unix() -> i64 {
@@ -52,10 +71,7 @@ impl DirectoryStore {
     /// Tests use `#[sqlx::test]` to get a fresh migrated DB per test and
     /// hand the resulting pool in here.
     pub fn from_pool(pool: PgPool) -> Self {
-        Self {
-            pool,
-            sessions: Mutex::new(HashMap::new()),
-        }
+        Self { pool }
     }
 
     /// Find-or-create for a phone hash, as **one** statement (ET15).
@@ -320,22 +336,20 @@ impl DirectoryStore {
             .bind(user_id as i64)
             .execute(&mut *tx)
             .await?;
-        tx.commit().await?;
-        // ET2: after the rows are gone, drop the tokens. `authenticate` resolves
-        // callers *solely* through this map, so until now a bearer token issued
-        // before erasure kept working against a dangling `user_id` — the account
-        // was deleted and its session was not. Deliberately after `commit`: a
-        // revoked session with a rolled-back erasure would lock out a live user.
+        // ET2: the tokens go with the rows. `authenticate` resolves callers
+        // solely through these, so a session outliving its account was a live
+        // caller with a dangling `user_id`.
         //
-        // ponytail: O(n) scan over live sessions, because the map has no
-        // user_id -> tokens direction. n is "sessions since the last restart" and
-        // erasure is rare. A reverse index if that stops being true — or,
-        // better, sessions in Postgres, which is the same change that would give
-        // them a TTL (the map only grows today) and let them survive a restart.
-        self.sessions
-            .lock()
-            .unwrap()
-            .retain(|_, uid| *uid != user_id);
+        // Inside the transaction now, which the in-memory version could not be:
+        // that one had to run after `commit`, because a revoked session with a
+        // rolled-back erasure would lock out a live user. One atom instead, and
+        // `idx_sessions_user_id` replaces the O(n) scan a `token -> user_id` map
+        // forced.
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(user_id as i64)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -388,7 +402,7 @@ impl DirectoryStore {
         Ok(row.map(|r| r.get::<String, _>("contact_link_b64")))
     }
 
-    pub fn create_session(&self, user_id: u64) -> String {
+    pub async fn create_session(&self, user_id: u64) -> sqlx::Result<String> {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
         let token = bytes.iter().fold(String::with_capacity(64), |mut s, b| {
@@ -396,12 +410,39 @@ impl DirectoryStore {
             let _ = write!(s, "{b:02x}");
             s
         });
-        self.sessions.lock().unwrap().insert(token.clone(), user_id);
-        token
+        sqlx::query("INSERT INTO sessions (token, user_id, created_at) VALUES ($1, $2, $3)")
+            .bind(&token)
+            .bind(user_id as i64)
+            .bind(now_unix())
+            .execute(&self.pool)
+            .await?;
+        Ok(token)
     }
 
-    pub fn session_user_id(&self, token: &str) -> Option<u64> {
-        self.sessions.lock().unwrap().get(token).copied()
+    /// Resolves a bearer token to a live user, or `None`.
+    ///
+    /// Three conditions, not one. The token must exist; it must be inside
+    /// [`SESSION_TTL_DAYS`]; and the account must still be live. The last is
+    /// belt-and-braces — `erase_user` deletes the rows in its own transaction —
+    /// but a tombstone is exactly the state a dangling token used to
+    /// authenticate as, so the query refuses to be able to express it.
+    ///
+    /// ponytail: expired rows are filtered at read time, not swept. They are
+    /// harmless (this is the only reader) and cost storage, not correctness.
+    /// Add `DELETE FROM sessions WHERE created_at <= cutoff` on a timer if the
+    /// table ever gets big enough to notice.
+    pub async fn session_user_id(&self, token: &str) -> sqlx::Result<Option<u64>> {
+        let cutoff = now_unix() - SESSION_TTL_DAYS * 24 * 3600;
+        let row = sqlx::query(
+            "SELECT s.user_id FROM sessions s
+             JOIN users u ON u.user_id = s.user_id
+             WHERE s.token = $1 AND s.created_at > $2 AND u.deleted_at IS NULL",
+        )
+        .bind(token)
+        .bind(cutoff)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<i64, _>("user_id") as u64))
     }
 }
 
@@ -435,6 +476,83 @@ impl PrefixIndex for DirectoryStore {
 mod tests {
     use super::*;
 
+    /// The bug that moved sessions into the DB: a restart used to drop the map,
+    /// and the app can't recover from that on its own (it persists the token and
+    /// only shows onboarding when there isn't one). A token has to outlive the
+    /// process that issued it.
+    ///
+    /// `from_pool` twice on one pool is exactly that: a second `DirectoryStore`
+    /// with none of the first one's memory — which is all a restart was.
+    #[sqlx::test]
+    async fn a_token_survives_the_process_that_issued_it(pool: PgPool) {
+        let user = {
+            let before_restart = DirectoryStore::from_pool(pool.clone());
+            let user = before_restart
+                .find_or_create_pending_user("restart-hash")
+                .await
+                .unwrap();
+            let token = before_restart.create_session(user).await.unwrap();
+            (user, token)
+        };
+        let (user_id, token) = user;
+
+        let after_restart = DirectoryStore::from_pool(pool);
+
+        assert_eq!(
+            after_restart.session_user_id(&token).await.unwrap(),
+            Some(user_id),
+            "a deploy must not sign every installed client out forever"
+        );
+    }
+
+    /// The TTL is the reason the table can't grow without bound. Written by
+    /// reaching past the API — `create_session` always stamps `now` — because
+    /// the alternative is a test that sleeps for 90 days.
+    #[sqlx::test]
+    async fn a_token_past_the_ttl_stops_authenticating(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let user = store.find_or_create_pending_user("ttl-hash").await.unwrap();
+        let token = store.create_session(user).await.unwrap();
+
+        let expired = now_unix() - (SESSION_TTL_DAYS + 1) * 24 * 3600;
+        sqlx::query("UPDATE sessions SET created_at = $1 WHERE token = $2")
+            .bind(expired)
+            .bind(&token)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(store.session_user_id(&token).await.unwrap(), None);
+    }
+
+    /// Defense-in-depth: `erase_user` deletes the sessions, so this row should
+    /// not exist. If some future erase path forgets, the join must still refuse —
+    /// a tombstone is precisely what a dangling token used to authenticate as.
+    #[sqlx::test]
+    async fn a_token_for_a_tombstoned_user_is_refused_even_if_the_row_survives(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let user = store
+            .find_or_create_pending_user("tombstone-hash")
+            .await
+            .unwrap();
+        let token = store.create_session(user).await.unwrap();
+
+        // Tombstone the user WITHOUT going through erase_user, i.e. simulate the
+        // erase path that forgets its sessions.
+        sqlx::query("UPDATE users SET deleted_at = $1 WHERE user_id = $2")
+            .bind(now_unix())
+            .bind(user as i64)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.session_user_id(&token).await.unwrap(),
+            None,
+            "the join, not just erase_user, has to refuse a tombstone"
+        );
+    }
+
     /// ET2: `authenticate` resolves every caller through the sessions map alone,
     /// so a token that outlives its account is a live caller with a dangling
     /// `user_id`. Erasure has to take the tokens with the rows.
@@ -447,28 +565,28 @@ mod tests {
             .unwrap();
         // More than one, because erasure keys on the user and the map keys on
         // the token: a fix that only dropped "the" token would pass with one.
-        let phone = store.create_session(user);
-        let laptop = store.create_session(user);
+        let phone = store.create_session(user).await.unwrap();
+        let laptop = store.create_session(user).await.unwrap();
         let bystander = store
             .find_or_create_pending_user("bystander-hash")
             .await
             .unwrap();
-        let bystander_token = store.create_session(bystander);
+        let bystander_token = store.create_session(bystander).await.unwrap();
 
         store.erase_user(user).await.unwrap();
 
         assert_eq!(
-            store.session_user_id(&phone),
+            store.session_user_id(&phone).await.unwrap(),
             None,
             "erased account's token still authenticates"
         );
         assert_eq!(
-            store.session_user_id(&laptop),
+            store.session_user_id(&laptop).await.unwrap(),
             None,
             "every session, not just the last one"
         );
         assert_eq!(
-            store.session_user_id(&bystander_token),
+            store.session_user_id(&bystander_token).await.unwrap(),
             Some(bystander),
             "erasing one account must not sign everyone else out"
         );
@@ -737,8 +855,11 @@ mod tests {
     async fn session_roundtrip(pool: PgPool) {
         let store = DirectoryStore::from_pool(pool);
         let u = store.find_or_create_pending_user("h").await.unwrap();
-        let token = store.create_session(u);
-        assert_eq!(store.session_user_id(&token), Some(u));
-        assert_eq!(store.session_user_id("not-a-real-token"), None);
+        let token = store.create_session(u).await.unwrap();
+        assert_eq!(store.session_user_id(&token).await.unwrap(), Some(u));
+        assert_eq!(
+            store.session_user_id("not-a-real-token").await.unwrap(),
+            None
+        );
     }
 }

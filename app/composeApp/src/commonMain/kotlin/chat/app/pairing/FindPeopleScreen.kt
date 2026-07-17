@@ -24,6 +24,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import chat.app.directory.DirectoryClient
 import chat.app.directory.DirectoryException
+import chat.app.directory.isSessionExpired
 import chat.app.directory.SearchResult
 import chat.app.directory.hashPrefix
 import chat.app.directory.normalizePhoneInput
@@ -52,6 +53,7 @@ fun FindPeopleScreen(
     session: Session,
     engine: ChatEngine,
     onBack: () -> Unit,
+    onSessionExpired: () -> Unit,
 ) {
     val palette = LocalChatPalette.current
     var mode by remember { mutableStateOf(LookupMode.Username) }
@@ -71,7 +73,9 @@ fun FindPeopleScreen(
                     status = "Paired with $label."
                 }
             } catch (e: DirectoryException) {
-                status = e.message
+                // A dead token is not a status line — it needs onboarding, not
+                // a message the user can only stare at.
+                if (e.isSessionExpired()) onSessionExpired() else status = e.message
             } catch (e: EngineException) {
                 status = "Pairing failed: ${e.message}"
             } finally {
@@ -109,7 +113,7 @@ fun FindPeopleScreen(
                             status = if (userId == null) "No one has that handle." else null
                             userId?.let { pairWith(it, "$nickname#$discriminator") }
                         } catch (e: DirectoryException) {
-                            status = e.message
+                            if (e.isSessionExpired()) onSessionExpired() else status = e.message
                         } finally {
                             loading = false
                         }
@@ -121,6 +125,7 @@ fun FindPeopleScreen(
                     loading = loading,
                     setLoading = { loading = it },
                     setStatus = { status = it },
+                    onSessionExpired = onSessionExpired,
                     onFound = ::pairWith,
                 )
             }
@@ -159,6 +164,7 @@ private fun PhoneLookup(
     loading: Boolean,
     setLoading: (Boolean) -> Unit,
     setStatus: (String?) -> Unit,
+    onSessionExpired: () -> Unit,
     onFound: (Long, String) -> Unit,
 ) {
     val palette = LocalChatPalette.current
@@ -182,7 +188,7 @@ private fun PhoneLookup(
                         client.setSearchable(session.sessionToken, on, hash)
                         searchable = on
                     } catch (e: DirectoryException) {
-                        setStatus(e.message)
+                        if (e.isSessionExpired()) onSessionExpired() else setStatus(e.message)
                     }
                 }
             },
@@ -211,7 +217,7 @@ private fun PhoneLookup(
                         onFound(match.userId, match.handle)
                     }
                 } catch (e: DirectoryException) {
-                    setStatus(e.message)
+                    if (e.isSessionExpired()) onSessionExpired() else setStatus(e.message)
                 } finally {
                     setLoading(false)
                 }

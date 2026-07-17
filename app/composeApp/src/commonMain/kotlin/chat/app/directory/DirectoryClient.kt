@@ -33,6 +33,22 @@ import kotlinx.serialization.json.Json
  */
 class DirectoryException(message: String, val status: Int? = null) : Exception(message)
 
+/**
+ * The directory does not recognise this token.
+ *
+ * Sessions live in Postgres now, so the routine cause — a restart wiping an
+ * in-memory map — is gone. Three remain: the 90-day TTL lapsed, the account was
+ * erased (ET2 revokes its sessions with the rows), or the database was restored
+ * from before the token was issued.
+ *
+ * Rare is not the same as handled. The app persists the token and `App.kt` shows
+ * onboarding only when there isn't one, so **any** unhandled 401 is a permanent
+ * dead end: search and pairing fail forever and the only fix is wiping app data.
+ * That is exactly what the restart bug was, and moving sessions to a table made
+ * it rarer without making it recoverable. This is what makes it recoverable.
+ */
+fun DirectoryException.isSessionExpired(): Boolean = status == 401
+
 @Serializable
 data class VerifyResult(val userId: Long, val sessionToken: String, val verified: Boolean)
 
