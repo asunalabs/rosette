@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -115,15 +116,22 @@ fun ConversationScreen(
             // reverseLayout draws the first item at the bottom, so declare the
             // in-flight sends first (newest, belong below every stored message).
             items(pending.asReversed(), key = { it.id }) { p ->
-                Box(Modifier.padding(vertical = 4.dp)) {
+                Box(Modifier.padding(top = 5.dp)) {
                     MessageBubble(body = p.body, mine = true, pending = true)
                 }
             }
-            items(messages.reversed(), key = { it.id }) { m ->
-                Box(Modifier.padding(vertical = 4.dp)) {
+            // DT11: newest-first for the reverseLayout. `top` padding sits above
+            // each bubble (toward its older neighbor): 5dp within a run of the
+            // same sender, 13dp where the sender changes (DESIGN.md:161 grouping).
+            val newestFirst = messages.asReversed()
+            itemsIndexed(newestFirst, key = { _, m -> m.id }) { i, m ->
+                val olderNeighbor = newestFirst.getOrNull(i + 1)
+                val gapTop = if (olderNeighbor != null && olderNeighbor.mine == m.mine) 5.dp else 13.dp
+                Box(Modifier.padding(top = gapTop)) {
                     MessageBubble(
                         body = m.body,
                         mine = m.mine,
+                        time = formatClockTime(m.timestampMs),
                         failed = m.delivery == DeliveryState.FAILED,
                         onRetry = if (m.delivery == DeliveryState.FAILED) {
                             { send(m.body) }
