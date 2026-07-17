@@ -6,6 +6,13 @@ members = ["proto", "core", "engine", "relay", "cli", "ffi", "directory"]
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
+# Argon2id at spec cost (64 MiB) is unusably slow unoptimized; keep the
+# KDF fast even in `cargo test` (blake2 is its compression core).
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 bincode = "1"

@@ -22,6 +22,8 @@
 //! ET8 (the 503 mapped; the screen was unreachable). When a comment here asserts
 //! something about the app, go read the app.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::RngCore;
@@ -49,11 +51,80 @@ pub enum ClaimError {
     Db(#[from] sqlx::Error),
 }
 
-pub struct DirectoryStore {
-    pool: PgPool,
+/// Issue #2: one account's recovery upload — ciphertexts, salts, and auth
+/// hashes only (see migration 0004). Field names follow the client bundle;
+/// the `_hash` suffixes match the columns they land in.
+#[derive(Clone)]
+pub struct BackupUpload {
+    pub blob: Vec<u8>,
+    pub w_pin: Vec<u8>,
+    pub salt_p: Vec<u8>,
+    pub w_phrase: Vec<u8>,
+    pub salt_f: Vec<u8>,
+    pub auth_pin_hash: Vec<u8>,
+    pub salt_a: Vec<u8>,
+    pub auth_phrase_hash: Vec<u8>,
+    pub salt_pa: Vec<u8>,
 }
 
-fn now_unix() -> i64 {
+/// Issue #3: one account's full backups row, returned only after a
+/// successful PIN- or phrase-proof (`verify_backup_auth`).
+pub struct BackupRow {
+    pub blob: Vec<u8>,
+    pub w_pin: Vec<u8>,
+    pub salt_p: Vec<u8>,
+    pub w_phrase: Vec<u8>,
+    pub salt_f: Vec<u8>,
+    pub auth_pin_hash: Vec<u8>,
+    pub salt_a: Vec<u8>,
+    pub auth_phrase_hash: Vec<u8>,
+    pub salt_pa: Vec<u8>,
+}
+
+/// Issue #3: outcome of a restore auth attempt.
+pub enum RestoreVerdict {
+    Match(Box<BackupRow>),
+    /// Wrong PIN; `remaining` counts attempts left before the next lockout.
+    WrongPin {
+        remaining: i32,
+    },
+    WrongPhrase,
+    /// PIN path locked out until this unix time. The phrase path is never
+    /// locked (64.6-bit space; the OTP gate rate-limits it).
+    Locked {
+        until: i64,
+    },
+}
+
+/// Lockout schedule after every 10th wrong PIN: 1h, 4h, then 24h repeating.
+fn lockout_hours(lockout_index: i64) -> i64 {
+    match lockout_index {
+        ..=1 => 1,
+        2 => 4,
+        _ => 24,
+    }
+}
+
+/// Constant-time byte comparison — auth hashes are secrets-adjacent, so no
+/// early-exit compare (and no new dependency for three lines).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+pub struct DirectoryStore {
+    pool: PgPool,
+    /// Issue #3: short-lived restore tokens (user_id, expires_at). Ephemeral,
+    /// in-process only — unlike sessions, which now live in Postgres. A ≤10-min
+    /// token is not worth a table: a directory restart just means the user
+    /// re-verifies their phone, and the deploy is single-instance
+    /// (`directory/deploy/docker-compose.yml`).
+    // ponytail: in-memory map, single instance. Needs a table before a second
+    // replica exists — begin and complete would otherwise land on different
+    // processes and every restore would fail.
+    restore_tokens: Mutex<HashMap<String, (u64, i64)>>,
+}
+
+pub(crate) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before 1970")
@@ -71,7 +142,10 @@ impl DirectoryStore {
     /// Tests use `#[sqlx::test]` to get a fresh migrated DB per test and
     /// hand the resulting pool in here.
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            restore_tokens: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Find-or-create for a phone hash, as **one** statement (ET15).
@@ -336,6 +410,13 @@ impl DirectoryStore {
             .bind(user_id as i64)
             .execute(&mut *tx)
             .await?;
+        // Issue #2: the recovery bundle only exists to resurrect the account
+        // it belongs to — real erasure (T15/T19) takes it too. (The FK is
+        // CASCADE, but users rows are scrubbed, never deleted.)
+        sqlx::query("DELETE FROM backups WHERE user_id = $1")
+            .bind(user_id as i64)
+            .execute(&mut *tx)
+            .await?;
         // ET2: the tokens go with the rows. `authenticate` resolves callers
         // solely through these, so a session outliving its account was a live
         // caller with a dangling `user_id`.
@@ -402,6 +483,46 @@ impl DirectoryStore {
         Ok(row.map(|r| r.get::<String, _>("contact_link_b64")))
     }
 
+    /// Issue #2: upsert this account's recovery bundle. A fresh upload
+    /// resets the PIN-attempt lockout — the uploader holds a valid session
+    /// (already inside the account), and new material means the old attempt
+    /// count is meaningless.
+    pub async fn upsert_backup(&self, user_id: u64, b: &BackupUpload) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO backups (user_id, blob, w_pin, salt_p, w_phrase, salt_f,
+                 auth_pin_hash, salt_a, auth_phrase_hash, salt_pa,
+                 pin_attempts, locked_until, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, NULL, $11)
+             ON CONFLICT (user_id) DO UPDATE SET
+                blob = excluded.blob,
+                w_pin = excluded.w_pin,
+                salt_p = excluded.salt_p,
+                w_phrase = excluded.w_phrase,
+                salt_f = excluded.salt_f,
+                auth_pin_hash = excluded.auth_pin_hash,
+                salt_a = excluded.salt_a,
+                auth_phrase_hash = excluded.auth_phrase_hash,
+                salt_pa = excluded.salt_pa,
+                pin_attempts = 0,
+                locked_until = NULL,
+                updated_at = excluded.updated_at",
+        )
+        .bind(user_id as i64)
+        .bind(&b.blob)
+        .bind(&b.w_pin)
+        .bind(&b.salt_p)
+        .bind(&b.w_phrase)
+        .bind(&b.salt_f)
+        .bind(&b.auth_pin_hash)
+        .bind(&b.salt_a)
+        .bind(&b.auth_phrase_hash)
+        .bind(&b.salt_pa)
+        .bind(now_unix())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn create_session(&self, user_id: u64) -> sqlx::Result<String> {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
@@ -444,6 +565,139 @@ impl DirectoryStore {
         .await?;
         Ok(row.map(|r| r.get::<i64, _>("user_id") as u64))
     }
+
+    /// Issue #3: mint a restore token after phone re-verification. Expires
+    /// after `ttl_secs`; consumed on successful bundle handout only, so
+    /// wrong-PIN retries inside the window don't force another OTP.
+    pub fn create_restore_token(&self, user_id: u64, ttl_secs: i64) -> String {
+        let token = random_token();
+        self.restore_tokens
+            .lock()
+            .unwrap()
+            .insert(token.clone(), (user_id, now_unix() + ttl_secs));
+        token
+    }
+
+    pub fn restore_token_user(&self, token: &str) -> Option<u64> {
+        let mut tokens = self.restore_tokens.lock().unwrap();
+        match tokens.get(token) {
+            Some(&(user_id, expires_at)) if expires_at > now_unix() => Some(user_id),
+            Some(_) => {
+                tokens.remove(token);
+                None
+            }
+            None => None,
+        }
+    }
+
+    pub fn consume_restore_token(&self, token: &str) {
+        self.restore_tokens.lock().unwrap().remove(token);
+    }
+
+    /// Issue #3: the two auth salts handed out after phone re-verification
+    /// so the client can compute its PIN/phrase proof. Salts are public by
+    /// design — handing them to a phone-verified caller reveals nothing.
+    pub async fn backup_salts(&self, user_id: u64) -> sqlx::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let row = sqlx::query("SELECT salt_a, salt_pa FROM backups WHERE user_id = $1")
+            .bind(user_id as i64)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| (r.get("salt_a"), r.get("salt_pa"))))
+    }
+
+    /// Issue #3: compare a client proof against the stored auth hash and
+    /// enforce the PIN lockout. Row-locked so concurrent attempts serialize:
+    /// the attempt counter can never lose an increment.
+    pub async fn verify_backup_auth(
+        &self,
+        user_id: u64,
+        auth: &[u8],
+        is_pin: bool,
+    ) -> sqlx::Result<Option<RestoreVerdict>> {
+        let mut tx = self.pool.begin().await?;
+        let Some(row) = sqlx::query("SELECT * FROM backups WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id as i64)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let now = now_unix();
+        let locked_until: Option<i64> = row.get("locked_until");
+        if is_pin {
+            if let Some(until) = locked_until {
+                if until > now {
+                    return Ok(Some(RestoreVerdict::Locked { until }));
+                }
+            }
+        }
+
+        let expected: Vec<u8> = if is_pin {
+            row.get("auth_pin_hash")
+        } else {
+            row.get("auth_phrase_hash")
+        };
+        if ct_eq(auth, &expected) {
+            sqlx::query(
+                "UPDATE backups SET pin_attempts = 0, locked_until = NULL WHERE user_id = $1",
+            )
+            .bind(user_id as i64)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(Some(RestoreVerdict::Match(Box::new(BackupRow {
+                blob: row.get("blob"),
+                w_pin: row.get("w_pin"),
+                salt_p: row.get("salt_p"),
+                w_phrase: row.get("w_phrase"),
+                salt_f: row.get("salt_f"),
+                auth_pin_hash: row.get("auth_pin_hash"),
+                salt_a: row.get("salt_a"),
+                auth_phrase_hash: row.get("auth_phrase_hash"),
+                salt_pa: row.get("salt_pa"),
+            }))));
+        }
+
+        if !is_pin {
+            return Ok(Some(RestoreVerdict::WrongPhrase));
+        }
+
+        let attempts: i32 = row.get::<i32, _>("pin_attempts") + 1;
+        if attempts % 10 == 0 {
+            let until = now + lockout_hours((attempts / 10) as i64) * 3600;
+            sqlx::query(
+                "UPDATE backups SET pin_attempts = $1, locked_until = $2 WHERE user_id = $3",
+            )
+            .bind(attempts)
+            .bind(until)
+            .bind(user_id as i64)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(Some(RestoreVerdict::Locked { until }))
+        } else {
+            sqlx::query("UPDATE backups SET pin_attempts = $1 WHERE user_id = $2")
+                .bind(attempts)
+                .bind(user_id as i64)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(Some(RestoreVerdict::WrongPin {
+                remaining: 10 - attempts % 10,
+            }))
+        }
+    }
+}
+
+fn random_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 #[async_trait::async_trait]
@@ -861,5 +1115,126 @@ mod tests {
             store.session_user_id("not-a-real-token").await.unwrap(),
             None
         );
+    }
+
+    fn backup_upload() -> BackupUpload {
+        BackupUpload {
+            blob: vec![1],
+            w_pin: vec![2],
+            salt_p: vec![3; 16],
+            w_phrase: vec![4],
+            salt_f: vec![5; 16],
+            auth_pin_hash: vec![6; 32],
+            salt_a: vec![7; 16],
+            auth_phrase_hash: vec![8; 32],
+            salt_pa: vec![9; 16],
+        }
+    }
+
+    #[sqlx::test]
+    async fn backup_upsert_replaces_and_resets_the_lockout(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let u = store.find_or_create_pending_user("h").await.unwrap();
+        store.upsert_backup(u, &backup_upload()).await.unwrap();
+
+        // Simulate a lockout in progress; a fresh upload must clear it.
+        sqlx::query(
+            "UPDATE backups SET pin_attempts = 7, locked_until = 9999999999 WHERE user_id = $1",
+        )
+        .bind(u as i64)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let replacement = BackupUpload {
+            blob: vec![42],
+            ..backup_upload()
+        };
+        store.upsert_backup(u, &replacement).await.unwrap();
+
+        let row =
+            sqlx::query("SELECT blob, pin_attempts, locked_until FROM backups WHERE user_id = $1")
+                .bind(u as i64)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(row.get::<Vec<u8>, _>("blob"), vec![42]);
+        assert_eq!(row.get::<i32, _>("pin_attempts"), 0);
+        assert_eq!(row.get::<Option<i64>, _>("locked_until"), None);
+    }
+
+    #[sqlx::test]
+    async fn restore_auth_locks_after_10_wrong_pins_but_phrase_still_works(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let u = store.find_or_create_pending_user("h").await.unwrap();
+        store.upsert_backup(u, &backup_upload()).await.unwrap();
+        let right_pin = vec![6u8; 32];
+        let right_phrase = vec![8u8; 32];
+        let wrong = vec![0u8; 32];
+
+        for i in 1..=9 {
+            match store.verify_backup_auth(u, &wrong, true).await.unwrap() {
+                Some(RestoreVerdict::WrongPin { remaining }) => assert_eq!(remaining, 10 - i),
+                _ => panic!("attempt {i} should be WrongPin"),
+            }
+        }
+        let until = match store.verify_backup_auth(u, &wrong, true).await.unwrap() {
+            Some(RestoreVerdict::Locked { until }) => until,
+            _ => panic!("10th wrong attempt must lock"),
+        };
+        assert!(
+            until > now_unix() + 3500 && until <= now_unix() + 3700,
+            "first lockout is 1h"
+        );
+
+        // Even the RIGHT pin is refused while locked.
+        assert!(matches!(
+            store.verify_backup_auth(u, &right_pin, true).await.unwrap(),
+            Some(RestoreVerdict::Locked { .. })
+        ));
+        // The phrase path is never locked, and success resets the counter.
+        assert!(matches!(
+            store
+                .verify_backup_auth(u, &right_phrase, false)
+                .await
+                .unwrap(),
+            Some(RestoreVerdict::Match(_))
+        ));
+        assert!(matches!(
+            store.verify_backup_auth(u, &right_pin, true).await.unwrap(),
+            Some(RestoreVerdict::Match(_))
+        ));
+    }
+
+    #[sqlx::test]
+    async fn restore_tokens_expire_and_consume(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let u = store.find_or_create_pending_user("h").await.unwrap();
+
+        let token = store.create_restore_token(u, 600);
+        assert_eq!(store.restore_token_user(&token), Some(u));
+        store.consume_restore_token(&token);
+        assert_eq!(store.restore_token_user(&token), None, "single-use");
+
+        let expired = store.create_restore_token(u, -1);
+        assert_eq!(
+            store.restore_token_user(&expired),
+            None,
+            "expired tokens are dead"
+        );
+    }
+
+    #[sqlx::test]
+    async fn erase_user_deletes_the_backup(pool: PgPool) {
+        let store = DirectoryStore::from_pool(pool);
+        let u = store.find_or_create_pending_user("h").await.unwrap();
+        store.upsert_backup(u, &backup_upload()).await.unwrap();
+        store.erase_user(u).await.unwrap();
+        let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM backups WHERE user_id = $1")
+            .bind(u as i64)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+            .get("n");
+        assert_eq!(n, 0, "recovery bundle must not survive erasure");
     }
 }

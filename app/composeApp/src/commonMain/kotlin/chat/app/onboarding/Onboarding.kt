@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -40,6 +41,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.app.directory.DirectoryClient
 import chat.app.directory.DirectoryException
+import chat.app.directory.RestoreBegin
 import chat.app.directory.VerifyResult
 import chat.app.directory.normalizePhoneInput
 import chat.app.theme.ChatMonoStyle
@@ -50,9 +52,13 @@ import chat.app.theme.InstrumentStatusChip
 import chat.app.theme.LocalChatPalette
 import chat.app.theme.Rosette
 import chat.app.theme.StatusTone
+import chat.engine.BackupBundle
+import chat.engine.backupAuthProof
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * T27: phone verification gates the app itself, Signal-style — there is no
@@ -83,7 +89,45 @@ sealed interface OnboardingState {
         val attempts: Int = 0,
     ) : OnboardingState
     data class ClaimUsername(val sessionToken: String, val phone: String) : OnboardingState
+
+    /** Issue #2: mandatory recovery PIN, set right after the username. */
+    data class SetPin(val sessionToken: String, val handle: String, val phone: String) : OnboardingState
+
+    /** Issue #2: one-time display of the 5-word phrase that recovers the PIN. */
+    data class ShowPhrase(
+        val sessionToken: String,
+        val handle: String,
+        val phone: String,
+        val phrase: String,
+    ) : OnboardingState
+
+    /** Issue #3: restore-account flow behind the Welcome CTA. */
+    data object RestorePhone : OnboardingState
+    data class RestoreOtp(val phone: String) : OnboardingState
+    data class RestorePin(val begin: RestoreBegin, val phone: String) : OnboardingState
+    data class RestorePhrase(val begin: RestoreBegin, val phone: String) : OnboardingState
+
+    /** Issue #3: phrase-path success forces a fresh PIN before entering the app. */
+    data class RestoreNewPin(
+        val begin: RestoreBegin,
+        val phone: String,
+        val bundle: BackupBundle,
+        val phrase: String,
+    ) : OnboardingState
 }
+
+/**
+ * Issue #3: everything App needs to finish a restore — build the engine
+ * from the bundle with `ChatEngine.newFromBackup`, save the session, and
+ * (phrase path, [newPin] != null) rewrap + re-upload before entering.
+ */
+data class RestoreRequest(
+    val bundle: BackupBundle,
+    val secret: String,
+    val newPin: String?,
+    val sessionToken: String,
+    val phone: String,
+)
 
 /**
  * T27's gate, extracted as one pure decision so it is testable without a UI.
@@ -122,6 +166,17 @@ internal fun nextAfterVerify(phone: String, result: VerifyResult): OnboardingSta
  * The tag is positional and must stay in sync with [restore] — a saver that
  * silently mis-restores is worse than one that doesn't save, so an unknown tag
  * throws rather than guessing.
+ *
+ * **Issue #2/#3 states save their strings; the restore path does not (merge
+ * decision, 2026-07-17).** `SetPin`/`ShowPhrase` are the signup path and hold
+ * only what `ClaimUsername` already justifies saving, plus the phrase — losing
+ * that screen to a rotation would cost the user their one and only look at it.
+ * The three post-OTP restore states hold `RestoreBegin`/`BackupBundle` instead:
+ * salts, wrap material, and the encrypted identity blob. Those are not going
+ * into `savedInstanceState`, which the system may write to disk — so they
+ * collapse to `RestorePhone` and the user re-enters their number. That costs one
+ * SMS in a rare case, and the ≤10-min restore token has usually expired across a
+ * process death anyway, so saving it would mostly restore a dead token.
  */
 private val OnboardingStateSaver: Saver<OnboardingState, Any> = listSaver(
     save = { s ->
@@ -134,6 +189,18 @@ private val OnboardingStateSaver: Saver<OnboardingState, Any> = listSaver(
             // bundle it lands in is process-private; dropping it to avoid saving a
             // secret would strand a verified user with no way forward.
             is OnboardingState.ClaimUsername -> listOf("claim", s.sessionToken, s.phone)
+            is OnboardingState.SetPin -> listOf("setpin", s.sessionToken, s.handle, s.phone)
+            is OnboardingState.ShowPhrase ->
+                listOf("showphrase", s.sessionToken, s.handle, s.phone, s.phrase)
+            is OnboardingState.RestorePhone -> listOf("restorephone")
+            is OnboardingState.RestoreOtp -> listOf("restoreotp", s.phone)
+            // See the KDoc: these carry crypto material, so the flow restarts at
+            // the phone step rather than round-tripping salts and the blob
+            // through a system bundle.
+            is OnboardingState.RestorePin,
+            is OnboardingState.RestorePhrase,
+            is OnboardingState.RestoreNewPin,
+            -> listOf("restorephone")
         }
     },
     restore = { v ->
@@ -142,6 +209,15 @@ private val OnboardingStateSaver: Saver<OnboardingState, Any> = listSaver(
             "phone" -> OnboardingState.PhoneEntry(v[1] as Boolean)
             "otp" -> OnboardingState.AwaitingOtp(v[1] as String, v[2] as Boolean, v[3] as Int)
             "claim" -> OnboardingState.ClaimUsername(v[1] as String, v[2] as String)
+            "setpin" -> OnboardingState.SetPin(v[1] as String, v[2] as String, v[3] as String)
+            "showphrase" -> OnboardingState.ShowPhrase(
+                v[1] as String,
+                v[2] as String,
+                v[3] as String,
+                v[4] as String,
+            )
+            "restorephone" -> OnboardingState.RestorePhone
+            "restoreotp" -> OnboardingState.RestoreOtp(v[1] as String)
             else -> error("unknown OnboardingState tag: $tag")
         }
     },
@@ -220,6 +296,13 @@ internal fun heldChipText(attempts: Int): String =
  *
  * Any other failure returns [current] untouched — the state is fine, the error
  * channel explains it.
+ *
+ * **Issue #3's restore path shares [sendCode] and is deliberately excluded.**
+ * Its states carry no `held` flag, and — more importantly — falling through to
+ * the `PhoneEntry` default would answer "we couldn't send your restore code" by
+ * moving the user into *signup*. Losing the flow you asked for is a worse
+ * outcome than the outage that caused it, so a restore holds its own screen and
+ * takes the error channel instead of the chip.
  */
 internal fun nextAfterSendError(
     current: OnboardingState,
@@ -228,11 +311,28 @@ internal fun nextAfterSendError(
 ): OnboardingState = when {
     !isVerificationUnavailable(e) -> current
     current is OnboardingState.AwaitingOtp -> OnboardingState.AwaitingOtp(phone, held = true)
+    current is OnboardingState.RestorePhone || current is OnboardingState.RestoreOtp -> current
     else -> OnboardingState.PhoneEntry(held = true)
 }
 
+/**
+ * [enroll] runs the recovery enrollment (engine `backupEnroll` + bundle
+ * upload) and returns the 5-word phrase; it gets the session token and
+ * claimed handle because it builds the persistent engine (issue #1) before
+ * the first backup upload. Null skips the PIN/phrase steps (tests only —
+ * App.kt always passes it; issue #2 acceptance 1 makes the steps mandatory).
+ */
 @Composable
-fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, handle: String, phone: String) -> Unit) {
+fun OnboardingFlow(
+    client: DirectoryClient,
+    enroll: (suspend (sessionToken: String, handle: String, pin: String) -> String)? = null,
+    /**
+     * Issue #3: finishes a restore (engine + session). Null keeps the
+     * Welcome CTA on its "not available yet" stub (tests only).
+     */
+    restore: (suspend (RestoreRequest) -> Unit)? = null,
+    onComplete: (sessionToken: String, handle: String, phone: String) -> Unit,
+) {
     val palette = LocalChatPalette.current
     // ET11: the step survives rotation; `error` and `loading` deliberately do
     // not. Both describe a request that died with the old Activity — restoring
@@ -275,20 +375,27 @@ fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, h
         state = next
     }
 
-    fun sendCode(rawPhone: String) {
+    fun sendCode(rawPhone: String, next: (phone: String) -> OnboardingState) {
         loading = true; error = null
         val phone = normalizePhoneInput(rawPhone)
         inFlight = scope.launch {
             try {
                 client.signup(phone)
-                // A code really was sent, so any prior hold is over.
-                state = OnboardingState.AwaitingOtp(phone)
+                // A code really was sent, so any prior hold is over: every
+                // caller's [next] builds a fresh state, defaulting `held` false.
+                state = next(phone)
             } catch (e: DirectoryException) {
                 // ET17: same rule as /verify — a 503 is our vendor failing, not the
                 // user, so the chip carries it and the error channel (which reads as
                 // blame) stays empty.
                 state = nextAfterSendError(state, phone, e)
-                error = if (isVerificationUnavailable(e)) null else e.message
+                // Keyed on whether the *resulting* state can actually show a hold,
+                // not on the status alone: the restore path has no chip, so blanking
+                // its error would leave a 503 with no state change and no message —
+                // a tap that visibly does nothing.
+                val heldByState = (state as? OnboardingState.PhoneEntry)?.held == true ||
+                    (state as? OnboardingState.AwaitingOtp)?.held == true
+                error = if (heldByState) null else e.message
             } finally {
                 // ET10: only the request that still owns the screen may clear the
                 // spinner. A cancelled one doesn't — `goTo` already reset it, and a
@@ -298,18 +405,52 @@ fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, h
         }
     }
 
+    /**
+     * Issue #3: derive the auth proof (Argon2, seconds) and redeem it for
+     * the bundle — off the UI thread; [then] runs there too, so it can do
+     * the equally heavy `newFromBackup`.
+     */
+    fun fetchBundle(begin: RestoreBegin, secret: String, method: String, then: suspend (BackupBundle) -> Unit) {
+        loading = true; error = null
+        scope.launch {
+            try {
+                withContext(Dispatchers.Default) {
+                    val salt = if (method == "pin") begin.saltA else begin.saltPa
+                    val bundle = client.restoreComplete(
+                        begin.restoreToken, method, backupAuthProof(secret, salt),
+                    )
+                    then(bundle)
+                }
+            } catch (e: Exception) {
+                // DirectoryException carries the server's message verbatim
+                // (remaining attempts, lockout wait) — show it as-is.
+                error = e.message ?: "Restore failed."
+            } finally {
+                loading = false
+            }
+        }
+    }
+
     Column(modifier = Modifier.fillMaxSize().background(palette.bg).padding(horizontal = 24.dp, vertical = 28.dp)) {
         Box(Modifier.weight(1f)) {
             when (val s = state) {
                 is OnboardingState.Welcome -> WelcomeStep(
                     onContinue = { goTo(OnboardingState.PhoneEntry()) },
-                    onRestore = { error = "Restore isn't available yet." },
+                    onRestore = {
+                        // ET10: `goTo` rather than a bare assignment — it cancels
+                        // whatever the last step left in flight and clears `error`.
+                        if (restore == null) {
+                            error = "Restore isn't available yet."
+                        } else {
+                            goTo(OnboardingState.RestorePhone)
+                        }
+                    },
                 )
                 is OnboardingState.PhoneEntry -> PhoneEntryStep(
                     loading = loading,
                     held = s.held,
                     onBack = { goTo(OnboardingState.Welcome) },
-                    onSubmit = ::sendCode,
+                    onSubmit = { raw -> sendCode(raw) { OnboardingState.AwaitingOtp(it) } },
                 )
                 is OnboardingState.AwaitingOtp -> OtpStep(
                     phone = s.phone,
@@ -317,7 +458,7 @@ fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, h
                     held = s.held,
                     attempts = s.attempts,
                     onBack = { goTo(OnboardingState.PhoneEntry()) },
-                    onResend = { sendCode(s.phone) },
+                    onResend = { sendCode(s.phone) { OnboardingState.AwaitingOtp(it) } },
                     // ET3: a new answer is being proposed, so the hold no longer
                     // describes it — the chip says "your code is fine" about a code
                     // that no longer exists. Only fires when something is actually
@@ -347,9 +488,92 @@ fun OnboardingFlow(client: DirectoryClient, onComplete: (sessionToken: String, h
                     scope.launch {
                         try {
                             val handle = client.claimUsername(s.sessionToken, nickname)
-                            onComplete(s.sessionToken, handle, s.phone)
+                            if (enroll == null) {
+                                onComplete(s.sessionToken, handle, s.phone)
+                            } else {
+                                state = OnboardingState.SetPin(s.sessionToken, handle, s.phone)
+                            }
                         } catch (e: DirectoryException) {
                             error = e.message
+                        } finally {
+                            loading = false
+                        }
+                    }
+                }
+                is OnboardingState.SetPin -> PinSetStep(loading) { pin ->
+                    loading = true; error = null
+                    scope.launch {
+                        try {
+                            val phrase = checkNotNull(enroll)(s.sessionToken, s.handle, pin)
+                            state = OnboardingState.ShowPhrase(s.sessionToken, s.handle, s.phone, phrase)
+                        } catch (e: Exception) {
+                            // DirectoryException or the engine's own error —
+                            // either way the step stays put and says why.
+                            error = e.message ?: "Couldn't set up recovery."
+                        } finally {
+                            loading = false
+                        }
+                    }
+                }
+                is OnboardingState.ShowPhrase -> RecoveryPhraseStep(s.phrase) {
+                    onComplete(s.sessionToken, s.handle, s.phone)
+                }
+                // held/attempts are signup's ET3/ET17 outage treatment; the restore
+                // path surfaces an outage through `error` instead (see
+                // [nextAfterSendError]), so it opts out rather than faking a chip.
+                is OnboardingState.RestorePhone -> PhoneEntryStep(
+                    loading = loading,
+                    held = false,
+                    onBack = { goTo(OnboardingState.Welcome) },
+                    onSubmit = { raw -> sendCode(raw) { OnboardingState.RestoreOtp(it) } },
+                )
+                is OnboardingState.RestoreOtp -> OtpStep(
+                    phone = s.phone,
+                    loading = loading,
+                    held = false,
+                    attempts = 0,
+                    onBack = { goTo(OnboardingState.RestorePhone) },
+                    onResend = { sendCode(s.phone) { OnboardingState.RestoreOtp(it) } },
+                    onCodeEdited = {},
+                ) { code ->
+                    loading = true; error = null
+                    scope.launch {
+                        try {
+                            val begin = client.restoreBegin(s.phone, code)
+                            state = OnboardingState.RestorePin(begin, s.phone)
+                        } catch (e: DirectoryException) {
+                            error = e.message
+                        } finally {
+                            loading = false
+                        }
+                    }
+                }
+                is OnboardingState.RestorePin -> RestorePinStep(
+                    loading = loading,
+                    onForgot = { state = OnboardingState.RestorePhrase(s.begin, s.phone) },
+                ) { pin ->
+                    fetchBundle(s.begin, pin, "pin") { bundle ->
+                        checkNotNull(restore)(
+                            RestoreRequest(bundle, pin, null, s.begin.sessionToken, s.phone),
+                        )
+                    }
+                }
+                is OnboardingState.RestorePhrase -> RestorePhraseStep(loading) { phrase ->
+                    fetchBundle(s.begin, phrase, "phrase") { bundle ->
+                        state = OnboardingState.RestoreNewPin(s.begin, s.phone, bundle, phrase)
+                    }
+                }
+                is OnboardingState.RestoreNewPin -> PinSetStep(loading) { newPin ->
+                    loading = true; error = null
+                    scope.launch {
+                        try {
+                            withContext(Dispatchers.Default) {
+                                checkNotNull(restore)(
+                                    RestoreRequest(s.bundle, s.phrase, newPin, s.begin.sessionToken, s.phone),
+                                )
+                            }
+                        } catch (e: Exception) {
+                            error = e.message ?: "Restore failed."
                         } finally {
                             loading = false
                         }
@@ -626,5 +850,183 @@ private fun UsernameStep(loading: Boolean, onSubmit: (nickname: String) -> Unit)
             enabled = !loading && nickname.isNotBlank(),
             loading = loading,
         )
+    }
+}
+
+private val PIN_RANGE = 4..6
+
+/**
+ * Issue #2: mandatory recovery PIN — enter then confirm, 4-6 digits, mono
+ * cells like the OTP (a crypto fact per DESIGN.md). The copy says what the
+ * PIN is FOR: account recovery, not an app lock.
+ */
+@Composable
+private fun PinSetStep(loading: Boolean, onSubmit: (pin: String) -> Unit) {
+    val palette = LocalChatPalette.current
+    var pin by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var confirming by remember { mutableStateOf(false) }
+    var mismatch by remember { mutableStateOf(false) }
+    val current = if (confirming) confirm else pin
+    Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(34.dp))
+        StepHeader(
+            headline = if (confirming) "Confirm your PIN" else "Set your PIN",
+            body = "4-6 digits. It's how you recover your account on a new phone — not an app lock.",
+        )
+        Spacer(Modifier.height(28.dp))
+        OtpCells(
+            code = current,
+            onChange = {
+                if (confirming) confirm = it else pin = it
+                mismatch = false
+            },
+        )
+        if (mismatch) {
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "PINs don't match — try again.",
+                color = palette.error,
+                style = MaterialTheme.typography.labelMedium,
+            )
+        }
+        Spacer(Modifier.weight(1f))
+        InstrumentButton(
+            text = when {
+                loading -> "Securing…"
+                confirming -> "Confirm PIN"
+                else -> "Continue"
+            },
+            onClick = {
+                when {
+                    !confirming -> confirming = true
+                    confirm == pin -> onSubmit(pin)
+                    else -> { mismatch = true; confirm = "" }
+                }
+            },
+            enabled = !loading && current.length in PIN_RANGE,
+            loading = loading,
+        )
+    }
+}
+
+/**
+ * Issue #3: PIN entry during restore. Failures show the server's message
+ * verbatim (remaining attempts, lockout wait) via the flow-level error
+ * line; the phrase fallback link is always available.
+ */
+@Composable
+private fun RestorePinStep(loading: Boolean, onForgot: () -> Unit, onSubmit: (pin: String) -> Unit) {
+    val palette = LocalChatPalette.current
+    var pin by remember { mutableStateOf("") }
+    Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(34.dp))
+        StepHeader(
+            headline = "Enter your PIN",
+            body = "The 4-6 digit PIN you set when you created your account.",
+        )
+        Spacer(Modifier.height(28.dp))
+        OtpCells(code = pin, onChange = { pin = it })
+        Spacer(Modifier.height(20.dp))
+        Text(
+            "Forgot PIN? Use recovery phrase",
+            style = MaterialTheme.typography.labelLarge,
+            color = palette.accent,
+            modifier = Modifier.clickable(enabled = !loading, onClick = onForgot).padding(4.dp),
+        )
+        Spacer(Modifier.weight(1f))
+        InstrumentButton(
+            text = if (loading) "Checking…" else "Restore",
+            onClick = { onSubmit(pin) },
+            enabled = !loading && pin.length in PIN_RANGE,
+            loading = loading,
+        )
+    }
+}
+
+/**
+ * Issue #3: the phrase fallback — one lowercase field, five words,
+ * normalized before derivation (see engine `backupAuthProof`).
+ */
+@Composable
+private fun RestorePhraseStep(loading: Boolean, onSubmit: (phrase: String) -> Unit) {
+    var phrase by remember { mutableStateOf("") }
+    val wordCount = phrase.trim().split(Regex("\\s+")).count { it.isNotBlank() }
+    Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(34.dp))
+        StepHeader(
+            headline = "Your recovery phrase",
+            body = "The five words you wrote down. Order matters; capitals and extra spaces don't.",
+        )
+        Spacer(Modifier.height(28.dp))
+        InstrumentField(
+            value = phrase,
+            onValueChange = { phrase = it },
+            placeholder = "five words with spaces",
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.weight(1f))
+        InstrumentButton(
+            text = if (loading) "Checking…" else "Restore",
+            onClick = { onSubmit(phrase) },
+            enabled = !loading && wordCount == 5,
+            loading = loading,
+        )
+    }
+}
+
+/**
+ * Issue #2: the 5 words that recover the PIN, on a tap-to-reveal 16dp card
+ * (DESIGN.md), shown exactly once. A single checkbox gates the CTA — no
+ * forced re-entry.
+ */
+@Composable
+private fun RecoveryPhraseStep(phrase: String, onDone: () -> Unit) {
+    val palette = LocalChatPalette.current
+    var revealed by remember { mutableStateOf(false) }
+    var written by remember { mutableStateOf(false) }
+    Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(34.dp))
+        StepHeader(
+            headline = "Your recovery phrase",
+            body = "If you forget your PIN, these five words are the only way to get back in. Write them down.",
+        )
+        Spacer(Modifier.height(28.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .background(palette.surface)
+                .clickable(enabled = !revealed) { revealed = true }
+                .padding(vertical = 24.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (!revealed) {
+                Text("Tap to reveal", style = MaterialTheme.typography.labelLarge, color = palette.muted)
+            } else {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    phrase.split(" ").forEach { word ->
+                        Text(word, style = ChatMonoStyle.copy(fontSize = 20.sp), color = palette.ink)
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(20.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.clickable(enabled = revealed) { written = !written },
+        ) {
+            Checkbox(checked = written, onCheckedChange = { written = it }, enabled = revealed)
+            Text(
+                "I wrote them down",
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (revealed) palette.ink else palette.muted,
+            )
+        }
+        Spacer(Modifier.weight(1f))
+        InstrumentButton("Continue", onClick = onDone, enabled = written)
     }
 }

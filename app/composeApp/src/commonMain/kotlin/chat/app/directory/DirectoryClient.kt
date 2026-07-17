@@ -5,10 +5,12 @@ import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.ResponseException
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import chat.engine.BackupBundle
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
 import io.ktor.client.request.parameter
 import io.ktor.client.request.post
+import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.http.ContentType
@@ -89,6 +91,58 @@ private data class SearchResponse(val results: List<SearchResultDto>)
 
 @Serializable
 private data class SearchResultDto(val user_id: Long, val handle: String, val search_hash: String)
+
+/** Issue #3: what `restoreBegin` hands back — tokens plus the two auth salts the proof derivations need. */
+data class RestoreBegin(
+    val restoreToken: String,
+    val sessionToken: String,
+    val saltA: ByteArray,
+    val saltPa: ByteArray,
+)
+
+@Serializable
+private data class RestoreBeginRequest(val phone: String, val code: String)
+
+@Serializable
+private data class RestoreBeginResponse(
+    val restore_token: String,
+    val session_token: String,
+    val salt_a: String,
+    val salt_pa: String,
+)
+
+@Serializable
+private data class RestoreCompleteRequest(
+    val restore_token: String,
+    val method: String,
+    val auth: String,
+)
+
+@Serializable
+private data class RestoreCompleteResponse(
+    val blob: String,
+    val w_pin: String,
+    val salt_p: String,
+    val w_phrase: String,
+    val salt_f: String,
+    val auth_pin: String,
+    val salt_a: String,
+    val auth_phrase: String,
+    val salt_pa: String,
+)
+
+@Serializable
+private data class BackupPutRequest(
+    val blob: String,
+    val w_pin: String,
+    val salt_p: String,
+    val w_phrase: String,
+    val salt_f: String,
+    val auth_pin: String,
+    val salt_a: String,
+    val auth_phrase: String,
+    val salt_pa: String,
+)
 
 @Serializable
 private data class PairingBootstrapRequest(val contact_link_b64: String)
@@ -184,6 +238,77 @@ class DirectoryClient(baseUrl: String = defaultDirectoryBaseUrl()) {
             parameter("prefix", prefix)
         } }.body()
         return res.results.map { SearchResult(it.user_id, it.handle, it.search_hash) }
+    }
+
+    /**
+     * PUT /v1/backup — upload the E2E-encrypted recovery bundle (issue #2).
+     * Every field is ciphertext, a salt, or an auth hash straight from the
+     * engine's `BackupBundle`; the server can never read the blob.
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    suspend fun putBackup(sessionToken: String, bundle: BackupBundle) {
+        val b64 = kotlin.io.encoding.Base64.Default
+        call { http.put("$baseUrl/v1/backup") {
+            bearerAuth(sessionToken)
+            contentType(ContentType.Application.Json)
+            setBody(BackupPutRequest(
+                blob = b64.encode(bundle.blob),
+                w_pin = b64.encode(bundle.wPin),
+                salt_p = b64.encode(bundle.saltP),
+                w_phrase = b64.encode(bundle.wPhrase),
+                salt_f = b64.encode(bundle.saltF),
+                auth_pin = b64.encode(bundle.authPin),
+                salt_a = b64.encode(bundle.saltA),
+                auth_phrase = b64.encode(bundle.authPhrase),
+                salt_pa = b64.encode(bundle.saltPa),
+            ))
+        } }
+    }
+
+    /**
+     * POST /v1/backup/restore/begin — phone re-verification for restore
+     * (issue #3). Returns tokens + the two auth salts; never any bundle
+     * material — that needs a PIN or phrase proof via [restoreComplete].
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    suspend fun restoreBegin(phone: String, code: String): RestoreBegin {
+        val res: RestoreBeginResponse = call { http.post("$baseUrl/v1/backup/restore/begin") {
+            contentType(ContentType.Application.Json)
+            setBody(RestoreBeginRequest(phone, code))
+        } }.body()
+        val b64 = kotlin.io.encoding.Base64.Default
+        return RestoreBegin(
+            restoreToken = res.restore_token,
+            sessionToken = res.session_token,
+            saltA = b64.decode(res.salt_a),
+            saltPa = b64.decode(res.salt_pa),
+        )
+    }
+
+    /**
+     * POST /v1/backup/restore/complete — redeem a PIN ("pin") or phrase
+     * ("phrase") proof (see engine `backupAuthProof`) for the full bundle.
+     * Wrong proofs surface the server's message verbatim (remaining
+     * attempts / lockout wait) as a [DirectoryException].
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    suspend fun restoreComplete(restoreToken: String, method: String, auth: ByteArray): BackupBundle {
+        val res: RestoreCompleteResponse = call { http.post("$baseUrl/v1/backup/restore/complete") {
+            contentType(ContentType.Application.Json)
+            setBody(RestoreCompleteRequest(restoreToken, method, kotlin.io.encoding.Base64.Default.encode(auth)))
+        } }.body()
+        val b64 = kotlin.io.encoding.Base64.Default
+        return BackupBundle(
+            blob = b64.decode(res.blob),
+            wPin = b64.decode(res.w_pin),
+            saltP = b64.decode(res.salt_p),
+            wPhrase = b64.decode(res.w_phrase),
+            saltF = b64.decode(res.salt_f),
+            authPin = b64.decode(res.auth_pin),
+            saltA = b64.decode(res.salt_a),
+            authPhrase = b64.decode(res.auth_phrase),
+            saltPa = b64.decode(res.salt_pa),
+        )
     }
 
     /** POST /pairing-bootstrap — publish (or replenish) this account's one-time contact link for search-initiated pairing. */

@@ -74,6 +74,18 @@ struct SessionSnapshot {
     storage: std::collections::HashMap<Vec<u8>, Vec<u8>>,
 }
 
+/// Identity-only copy of a `snapshot()` blob for the recovery backup
+/// (issue #2): group handle and MLS storage stripped, because ratchet state
+/// must never time-travel through a backup. `restore` accepts the result as
+/// a fresh, unpaired session with the same identity.
+pub fn strip_snapshot_to_identity(bytes: &[u8]) -> Result<Vec<u8>, SessionError> {
+    let mut snap: SessionSnapshot =
+        bincode::deserialize(bytes).map_err(|e| SessionError::Decode(e.to_string()))?;
+    snap.group_id = None;
+    snap.storage.clear();
+    bincode::serialize(&snap).map_err(|e| SessionError::Decode(e.to_string()))
+}
+
 impl ChatSession {
     /// Exposed so `pairing::key_package_from_link` can validate a scanned
     /// KeyPackage against this identity's own crypto backend.

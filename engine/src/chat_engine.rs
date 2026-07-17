@@ -101,12 +101,30 @@ impl ChatEngine {
         relay_addr: &str,
         relay_fingerprint: [u8; 32],
     ) -> anyhow::Result<Self> {
+        Self::connect_with_session(
+            display_name,
+            relay_addr,
+            relay_fingerprint,
+            ChatSession::new(display_name),
+        )
+        .await
+    }
+
+    /// `connect`, but with a caller-supplied session — the account-recovery
+    /// path (issue #3): a restored device keeps its original identity
+    /// (signer + credential) so peers see no identity change.
+    pub async fn connect_with_session(
+        display_name: &str,
+        relay_addr: &str,
+        relay_fingerprint: [u8; 32],
+        session: ChatSession,
+    ) -> anyhow::Result<Self> {
         let relay = RelayClient::connect(relay_addr, relay_fingerprint).await?;
         let (mailbox_qid, mailbox_key) = relay.create_mailbox().await?;
         relay.subscribe(vec![mailbox_qid]).await?;
         Ok(ChatEngine {
             display_name: display_name.to_string(),
-            session: ChatSession::new(display_name),
+            session,
             relay,
             relay_addr: relay_addr.to_string(),
             relay_fingerprint,
@@ -207,6 +225,16 @@ impl ChatEngine {
     /// the 2-member group, create the group inbox, and deliver the bootstrap
     /// payload to the peer's mailbox. Returns a fully paired engine.
     pub async fn pair_with_link(display_name: &str, link_b64: &str) -> anyhow::Result<Self> {
+        Self::pair_with_link_using(display_name, link_b64, None).await
+    }
+
+    /// `pair_with_link` with an optional restored session (issue #3) — same
+    /// reason as [`Self::connect_with_session`].
+    pub async fn pair_with_link_using(
+        display_name: &str,
+        link_b64: &str,
+        session: Option<ChatSession>,
+    ) -> anyhow::Result<Self> {
         let link_bytes = base64::engine::general_purpose::STANDARD.decode(link_b64.trim())?;
         let link = ContactLink::from_bytes(&link_bytes)?;
         let Endpoint {
@@ -216,7 +244,10 @@ impl ChatEngine {
             send_key: peer_send_key,
         } = link.primary_endpoint().clone();
 
-        let mut engine = Self::connect(display_name, &relay_addr, relay_fingerprint).await?;
+        let session = session.unwrap_or_else(|| ChatSession::new(display_name));
+        let mut engine =
+            Self::connect_with_session(display_name, &relay_addr, relay_fingerprint, session)
+                .await?;
         let peer_kp = chatcore::pairing::key_package_from_link(&link, engine.session.provider())?;
         engine.session.create_group()?;
         let welcome_wire = engine.session.add_members(&[peer_kp])?;
