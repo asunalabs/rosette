@@ -264,6 +264,7 @@ private fun EngineScreen(
             when (tab) {
                 Tab.Chats -> ChatListScreen(
                     engine = engine,
+                    handle = session.handle,
                     revision = revision,
                     onOpenConversation = { openConversation = it },
                     onOpenSettings = { screen = Screen.Settings },
