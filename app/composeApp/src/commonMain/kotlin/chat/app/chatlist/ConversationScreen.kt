@@ -19,8 +19,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -33,6 +35,14 @@ import chat.app.theme.MessageBubble
 import chat.app.theme.Rosette
 import chat.engine.ChatEngine
 import chat.engine.Conversation
+import chat.engine.DeliveryState
+import chat.engine.EngineException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/** DT3: an optimistic outgoing message, shown Pending until the send resolves. */
+private data class PendingSend(val id: String, val body: String)
 
 /**
  * The bubble-thread screen (the pasted Signal reference's conversation view).
@@ -40,10 +50,48 @@ import chat.engine.Conversation
  * undesigned surface, not something to improvise here.
  */
 @Composable
-fun ConversationScreen(engine: ChatEngine, conversation: Conversation, onBack: () -> Unit, modifier: Modifier = Modifier) {
+fun ConversationScreen(
+    engine: ChatEngine,
+    conversation: Conversation,
+    /** DT2: bumped on every engine event — re-reads the thread. See `rememberEngineRevision`. */
+    revision: Int,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val palette = LocalChatPalette.current
-    var messages by remember(conversation.id) { mutableStateOf(engine.messages(conversation.id)) }
+    val messages = remember(conversation.id, revision) { engine.messages(conversation.id) }
     var draft by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+
+    // DT3: the engine records a sent message only AFTER the relay round-trip
+    // (as Sent or Failed) — there's no optimistic write on its side. So we hold
+    // the in-flight message here to draw the Pending bubble, and drop it once
+    // the coroutine resolves and the store's real message takes over via
+    // `revision`. Its own id space ("pending-N") never collides with the store's
+    // "msg-N", so LazyColumn keys stay unique across the swap.
+    val pending = remember(conversation.id) { mutableStateListOf<PendingSend>() }
+    var nextPendingId by remember(conversation.id) { mutableStateOf(0) }
+
+    fun send(body: String) {
+        val id = "pending-${nextPendingId++}"
+        pending.add(PendingSend(id, body))
+        scope.launch {
+            try {
+                // engine.send blocks until the relay accepts or gives up; off
+                // the UI thread so an unreachable relay never freezes the frame.
+                withContext(Dispatchers.Default) { engine.send(conversation.id, body) }
+            } catch (_: EngineException) {
+                // The engine already recorded the send as DeliveryState.Failed and
+                // dispatched ConversationUpdated, so the Failed bubble arrives via
+                // `revision`. Nothing to surface here but dropping the optimistic one.
+                // ponytail: retry appends a fresh send rather than mutating the
+                // failed row in place — the engine has no update-message call.
+                // Good enough for the walking skeleton; revisit if double bubbles bite.
+            } finally {
+                pending.removeAll { it.id == id }
+            }
+        }
+    }
 
     Column(modifier = modifier.fillMaxSize().background(palette.bg)) {
         Row(
@@ -64,9 +112,25 @@ fun ConversationScreen(engine: ChatEngine, conversation: Conversation, onBack: (
             modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp),
             reverseLayout = true,
         ) {
+            // reverseLayout draws the first item at the bottom, so declare the
+            // in-flight sends first (newest, belong below every stored message).
+            items(pending.asReversed(), key = { it.id }) { p ->
+                Box(Modifier.padding(vertical = 4.dp)) {
+                    MessageBubble(body = p.body, mine = true, pending = true)
+                }
+            }
             items(messages.reversed(), key = { it.id }) { m ->
                 Box(Modifier.padding(vertical = 4.dp)) {
-                    MessageBubble(body = m.body, mine = m.mine)
+                    MessageBubble(
+                        body = m.body,
+                        mine = m.mine,
+                        failed = m.delivery == DeliveryState.FAILED,
+                        onRetry = if (m.delivery == DeliveryState.FAILED) {
+                            { send(m.body) }
+                        } else {
+                            null
+                        },
+                    )
                 }
             }
         }
@@ -89,9 +153,8 @@ fun ConversationScreen(engine: ChatEngine, conversation: Conversation, onBack: (
                     .clip(CircleShape)
                     .background(if (canSend) palette.accent else palette.surface2)
                     .clickable(enabled = canSend) {
-                        engine.send(conversation.id, draft)
+                        send(draft)
                         draft = ""
-                        messages = engine.messages(conversation.id)
                     },
                 contentAlignment = Alignment.Center,
             ) {

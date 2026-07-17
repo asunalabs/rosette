@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -40,6 +41,8 @@ import chat.app.theme.InstrumentTabBar
 import chat.app.theme.LocalChatPalette
 import chat.engine.ChatEngine
 import chat.engine.Conversation
+import chat.engine.EngineEvent
+import chat.engine.EngineEventListener
 import chat.engine.EngineException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -131,6 +134,40 @@ private enum class Tab { Chats, FindPeople }
 /** Issue #4: full-screen surfaces above the tab bar. */
 private enum class Screen { Main, Settings, ChangePin }
 
+/**
+ * DT2: the engine pushes, the UI pulls. Returns a counter bumped on every
+ * engine event; anything reading engine state keys its `remember` on it and
+ * re-reads.
+ *
+ * Registered here, at the engine's own scope, and never inside a screen:
+ * `setListener` REPLACES, so a second registration would silently unhook the
+ * first. One engine, one listener, fanned out from a single counter.
+ *
+ * The counter says *that* something changed, not what. Every store mutation
+ * already dispatches (inbound, send, pairing, verify), and
+ * `conversations()`/`messages()` are a mutex and a clone away — so re-reading
+ * keeps the Rust store the one source of truth. Patching event payloads into a
+ * Kotlin-side copy would create a second one, free to drift.
+ */
+@Composable
+private fun rememberEngineRevision(engine: ChatEngine): Int {
+    var revision by remember(engine) { mutableStateOf(0) }
+    DisposableEffect(engine) {
+        engine.setListener(object : EngineEventListener {
+            // Always the `chat-ffi-dispatch` thread, never the UI thread (FFI
+            // contract, review OV8). Single writer, so `++` cannot lose a bump,
+            // and Compose state is safe to write from any thread.
+            override fun onEvent(event: EngineEvent) {
+                revision++
+            }
+        })
+        // `set_listener` has no unset, and the engine outlives this screen
+        // (remembered one scope up) — nothing to tear down.
+        onDispose {}
+    }
+    return revision
+}
+
 @Composable
 private fun EngineScreen(
     client: DirectoryClient,
@@ -160,6 +197,7 @@ private fun EngineScreen(
         })
         return
     }
+    val revision = rememberEngineRevision(engine)
     var tab by remember { mutableStateOf(Tab.Chats) }
     var openConversation by remember { mutableStateOf<Conversation?>(null) }
     val scope = rememberCoroutineScope()
@@ -190,7 +228,12 @@ private fun EngineScreen(
 
     val conversation = openConversation
     if (conversation != null) {
-        ConversationScreen(engine = engine, conversation = conversation, onBack = { openConversation = null })
+        ConversationScreen(
+            engine = engine,
+            conversation = conversation,
+            revision = revision,
+            onBack = { openConversation = null },
+        )
         return
     }
 
@@ -221,6 +264,7 @@ private fun EngineScreen(
             when (tab) {
                 Tab.Chats -> ChatListScreen(
                     engine = engine,
+                    revision = revision,
                     onOpenConversation = { openConversation = it },
                     onOpenSettings = { screen = Screen.Settings },
                 )

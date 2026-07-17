@@ -32,13 +32,15 @@ import chat.engine.Conversation
 @Composable
 fun ChatListScreen(
     engine: ChatEngine,
+    /** DT2: bumped on every engine event — re-reads the store. See `rememberEngineRevision`. */
+    revision: Int,
     onOpenConversation: (Conversation) -> Unit,
     modifier: Modifier = Modifier,
     /** Issue #4: settings entry point lives in this top bar. */
     onOpenSettings: () -> Unit = {},
 ) {
     val palette = LocalChatPalette.current
-    val conversations = remember { engine.conversations() }
+    val conversations = remember(revision) { engine.conversations() }
 
     Column(modifier = modifier.fillMaxSize().background(palette.bg)) {
         Box(Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 16.dp), contentAlignment = Alignment.CenterStart) {
