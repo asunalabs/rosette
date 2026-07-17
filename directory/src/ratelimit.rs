@@ -41,7 +41,20 @@ enum Bucket {
     Caller,
     /// An unauthenticated caller, keyed by the number they are claiming.
     Phone,
+    /// An unauthenticated caller, keyed by the address they came from.
+    Ip,
 }
+
+/// Requests per minute per source address to the two unauthenticated endpoints.
+///
+/// Generous on purpose: this is not the anti-guessing limit (that is
+/// [`VERIFY_ATTEMPTS_PER_MINUTE`], per number, and much tighter). This one exists
+/// only to stop a flood *spread across many numbers*, where the per-number limit
+/// never trips and every request still costs a vendor round trip or an Argon2id
+/// hash. It has to clear a whole office or a carrier-NAT range sharing one
+/// address, so it is sized to make scripts expensive rather than to police
+/// humans.
+pub const UNAUTH_REQUESTS_PER_MINUTE_PER_IP: u32 = 30;
 
 /// A rate-limit key for an unauthenticated `/verify` caller, from the number
 /// they claim to own.
@@ -98,6 +111,18 @@ impl RateLimiter {
     /// a deployment call, not a code one. See the deferred note in ET1.
     pub fn check_and_bump_phone(&self, phone_key: u64, limit_per_minute: u32) -> bool {
         self.bump(Bucket::Phone, phone_key, limit_per_minute)
+    }
+
+    /// The other half of ET1: per source address, for the endpoints that have no
+    /// caller to key on. Guards the resource rather than the secret — a flood
+    /// across many numbers never trips the per-number limit, but still buys a
+    /// vendor round trip and an Argon2id hash each.
+    pub fn check_and_bump_ip(&self, ip: std::net::IpAddr, limit_per_minute: u32) -> bool {
+        // Hash the address rather than key on it: a v6 address is 128 bits and
+        // the map wants a u64, and nothing here needs the address back.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        ip.hash(&mut h);
+        self.bump(Bucket::Ip, h.finish(), limit_per_minute)
     }
 
     fn bump(&self, bucket: Bucket, key: u64, limit_per_minute: u32) -> bool {

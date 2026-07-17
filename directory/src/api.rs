@@ -3,10 +3,10 @@
 //! for self-hosted operators, so the ops vocabulary here (health endpoint,
 //! Cache-Control) is the standard HTTP-microservice one.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::{Query, Request, State};
+use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::DirectoryConfig;
 use crate::ratelimit::{
-    self, RateLimiter, UNVERIFIED_SEARCH_PER_MINUTE, VERIFIED_SEARCH_PER_MINUTE,
-    VERIFY_ATTEMPTS_PER_MINUTE,
+    self, RateLimiter, UNAUTH_REQUESTS_PER_MINUTE_PER_IP, UNVERIFIED_SEARCH_PER_MINUTE,
+    VERIFIED_SEARCH_PER_MINUTE, VERIFY_ATTEMPTS_PER_MINUTE,
 };
 use crate::search::{search_by_prefix, PREFIX_LEN_HEX};
 use crate::store::{ClaimError, DirectoryStore};
@@ -51,10 +51,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn(no_store_middleware))
 }
 
+/// `into_make_service_with_connect_info` (ET1): without it `ConnectInfo` is not
+/// in the request extensions and the per-IP limit's extractor rejects every
+/// request. Both entry points need it, and the tests go through the same one
+/// the server does — an unthrottled test harness would be a harness for
+/// different code.
 pub async fn bind_and_serve(addr: &str, state: Arc<AppState>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("directory listening on {}", listener.local_addr()?);
-    axum::serve(listener, router(state)).await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -64,7 +73,11 @@ pub async fn spawn_for_tests(state: Arc<AppState>) -> anyhow::Result<SocketAddr>
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router(state)).await;
+        let _ = axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     });
     Ok(addr)
 }
@@ -107,6 +120,38 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// ET1: the address Caddy actually saw, for the endpoints with no caller to key
+/// a limit on.
+///
+/// **Why `X-Forwarded-For` is trustworthy here, when in general it is not.**
+/// `directory` is not reachable directly: `deploy/docker-compose.yml` publishes
+/// no port for it (only Caddy's 80/443), so the sole path in is Caddy's
+/// `reverse_proxy directory:7444` — one hop, same box, same compose network.
+/// There is no second proxy and no direct route to forge around.
+///
+/// **The rightmost entry, not the leftmost.** Caddy *appends* the peer it saw,
+/// so a client who sends `X-Forwarded-For: 1.2.3.4` produces `1.2.3.4, <real>`.
+/// The last entry is the one Caddy wrote; everything left of it is
+/// attacker-controlled. The usual "client IP = first entry" idiom would hand an
+/// attacker a forged key, letting them throttle *someone else* — worse than not
+/// limiting at all, which is exactly why this was deferred until the deployment
+/// was known rather than guessed.
+///
+/// Falls back to the socket peer when the header is absent: that is the local
+/// path (`cargo run`, the e2e tests), where there is no proxy and the peer is
+/// the client. **If a second hop is ever put in front of Caddy, revisit this** —
+/// the rightmost entry would then be Caddy's own address and every caller would
+/// share one bucket.
+fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
+        .map(str::trim)
+        .and_then(|s| s.parse::<IpAddr>().ok())
+        .unwrap_or_else(|| peer.ip())
+}
+
 /// T4: every search caller must be authenticated. Used by /username and
 /// /searchable too, since those are also account-scoped actions.
 fn authenticate(headers: &HeaderMap, store: &DirectoryStore) -> Result<u64, ApiError> {
@@ -136,10 +181,23 @@ struct SignupResponse {
 
 async fn signup(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<SignupRequest>,
 ) -> Result<Json<SignupResponse>, ApiError> {
     if !state.config.accounts_enabled {
         return Err(ApiError::FeatureDisabled);
+    }
+    // ET1: before the Argon2id below, which is the whole cost of this endpoint.
+    // ET19 moved that hash off the executor so a flood cannot stall other
+    // endpoints; it still burns 19 MiB and two passes per call, and nothing
+    // authenticates here. The per-number limit does not help — a flood uses a
+    // different number every time.
+    if !state
+        .rate_limiter
+        .check_and_bump_ip(client_ip(&headers, peer), UNAUTH_REQUESTS_PER_MINUTE_PER_IP)
+    {
+        return Err(ApiError::RateLimited);
     }
     let e164 =
         verify::normalize_e164(&req.phone).map_err(|_| ApiError::BadRequest("invalid phone"))?;
@@ -210,10 +268,21 @@ struct VerifyResponse {
 
 async fn verify_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, ApiError> {
     if !state.config.accounts_enabled {
         return Err(ApiError::FeatureDisabled);
+    }
+    // ET1, the resource half: the per-number limit below stops a *victim's* code
+    // being guessed; it never trips for a flood that uses a different number
+    // each time, and every one of those still buys a vendor round trip.
+    if !state
+        .rate_limiter
+        .check_and_bump_ip(client_ip(&headers, peer), UNAUTH_REQUESTS_PER_MINUTE_PER_IP)
+    {
+        return Err(ApiError::RateLimited);
     }
     // ET1: throttle before the vendor call, not after. This endpoint is
     // unauthenticated by construction — it is how a caller *gets* a session — so
@@ -567,6 +636,88 @@ mod tests {
     use super::*;
     use crate::verify::DevOtpVendor;
     use sqlx::PgPool;
+
+    /// ET1: `client_ip` decides *whose* bucket a request counts against, so
+    /// reading `X-Forwarded-For` from the wrong end is not a style question — it
+    /// hands an attacker a forged key and lets them throttle a stranger, which
+    /// is worse than having no limit at all.
+    mod client_ip {
+        use super::*;
+
+        fn headers(xff: Option<&str>) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            if let Some(v) = xff {
+                h.insert("x-forwarded-for", v.parse().unwrap());
+            }
+            h
+        }
+
+        fn peer() -> SocketAddr {
+            "10.0.0.9:5555".parse().unwrap()
+        }
+
+        /// Caddy appends the peer it saw, so a client-supplied prefix lands to
+        /// the LEFT of the truth. Taking the leftmost — the usual "client IP"
+        /// idiom — would read the forgery.
+        #[test]
+        fn a_forged_prefix_cannot_win_because_we_read_the_end_caddy_wrote() {
+            let ip = client_ip(&headers(Some("1.2.3.4, 203.0.113.7")), peer());
+
+            assert_eq!(
+                ip,
+                "203.0.113.7".parse::<IpAddr>().unwrap(),
+                "the rightmost entry is the only one the proxy wrote"
+            );
+            assert_ne!(ip, "1.2.3.4".parse::<IpAddr>().unwrap());
+        }
+
+        #[test]
+        fn a_single_entry_is_the_real_client() {
+            assert_eq!(
+                client_ip(&headers(Some("203.0.113.7")), peer()),
+                "203.0.113.7".parse::<IpAddr>().unwrap()
+            );
+        }
+
+        #[test]
+        fn whitespace_after_the_comma_is_not_a_parse_failure() {
+            assert_eq!(
+                client_ip(&headers(Some("1.2.3.4,   203.0.113.7  ")), peer()),
+                "203.0.113.7".parse::<IpAddr>().unwrap()
+            );
+        }
+
+        /// No proxy: `cargo run`, the e2e tests. The peer *is* the client.
+        #[test]
+        fn without_the_header_the_socket_peer_is_the_client() {
+            assert_eq!(
+                client_ip(&headers(None), peer()),
+                "10.0.0.9".parse::<IpAddr>().unwrap()
+            );
+        }
+
+        /// Garbage must fall back to the peer, never panic and never key
+        /// everyone onto one bucket by accident.
+        #[test]
+        fn an_unparseable_header_falls_back_to_the_peer() {
+            assert_eq!(
+                client_ip(&headers(Some("not-an-ip")), peer()),
+                "10.0.0.9".parse::<IpAddr>().unwrap()
+            );
+            assert_eq!(
+                client_ip(&headers(Some("")), peer()),
+                "10.0.0.9".parse::<IpAddr>().unwrap()
+            );
+        }
+
+        #[test]
+        fn v6_survives_the_round_trip() {
+            assert_eq!(
+                client_ip(&headers(Some("2001:db8::1")), peer()),
+                "2001:db8::1".parse::<IpAddr>().unwrap()
+            );
+        }
+    }
 
     fn state_for(pool: PgPool) -> Arc<AppState> {
         Arc::new(AppState {
