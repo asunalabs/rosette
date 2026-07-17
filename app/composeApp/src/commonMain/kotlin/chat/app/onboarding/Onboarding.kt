@@ -833,16 +833,19 @@ private fun UsernameStep(loading: Boolean, onSubmit: (nickname: String) -> Unit)
             body = "How people find you — if you let them. Search is off by default; you can turn it on later.",
         )
         Spacer(Modifier.height(28.dp))
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            Rosette(seed = nickname.ifBlank { "…" }, size = 44.dp)
-            Spacer(Modifier.width(16.dp))
-            InstrumentField(
-                value = nickname,
-                onValueChange = { nickname = it },
-                placeholder = "mira",
-                modifier = Modifier.weight(1f),
-            )
-        }
+        // DT12: no Rosette here. The mark is fingerprint-derived and its whole
+        // heritage is "mathematically hard to forge" (DESIGN.md) — but the handle
+        // isn't minted until this screen's submit, so a Rosette here could only be
+        // seeded on the mutable nickname, making `mira#07` and `mira#99` identical.
+        // Teaching "this mark is your identity" with a mark anyone reproduces by
+        // typing your name is worse than showing none. The real one appears once a
+        // handle exists (the You menu, chat rows).
+        InstrumentField(
+            value = nickname,
+            onValueChange = { nickname = it },
+            placeholder = "mira",
+            modifier = Modifier.fillMaxWidth(),
+        )
         Spacer(Modifier.weight(1f))
         InstrumentButton(
             text = if (loading) "Claiming…" else "Continue",
