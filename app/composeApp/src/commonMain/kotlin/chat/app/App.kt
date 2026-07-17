@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
@@ -70,6 +71,9 @@ fun App() {
         // EngineScreen picks it up instead of reopening the same SQLCipher
         // file it already holds.
         var pendingEngine by remember { mutableStateOf<ChatEngine?>(null) }
+        // DT16: inset content past the system bars and lift it above the keyboard
+        // under edge-to-edge (enableEdgeToEdge in MainActivity). No-op off Android.
+        Box(Modifier.fillMaxSize().safeDrawingPadding()) {
         if (current == null) {
             OnboardingFlow(
                 client = client,
@@ -129,6 +133,7 @@ fun App() {
                     session = null
                 },
             )
+        }
         }
     }
 }

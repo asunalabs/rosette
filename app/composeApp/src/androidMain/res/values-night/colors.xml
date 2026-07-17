@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- DT16: dark-mode cold-launch background = ChatTheme's dark `bg` (#0B090C). -->
+    <color name="window_bg">#0B090C</color>
+</resources>
