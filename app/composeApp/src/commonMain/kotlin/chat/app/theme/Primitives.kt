@@ -18,7 +18,11 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -54,8 +58,14 @@ fun InstrumentButton(
     primary: Boolean = true,
 ) {
     val palette = LocalChatPalette.current
-    val bg = if (!enabled) palette.surface2 else if (primary) palette.accent else palette.surface
-    val fg = if (!enabled) palette.muted else if (primary) palette.onAccent else palette.ink
+    // DT15: loading is an ACTIVE state, not a disabled one. The accent is the
+    // only color allowed to mean "we intend this" (DESIGN.md:195), so it must
+    // stay lit while the user's intent executes — only a genuinely can't-act
+    // button drops to surface2. (Callers pass enabled = !loading, so without
+    // this the pill went grey the instant it started working.)
+    val interactive = enabled || loading
+    val bg = if (!interactive) palette.surface2 else if (primary) palette.accent else palette.surface
+    val fg = if (!interactive) palette.muted else if (primary) palette.onAccent else palette.ink
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -65,11 +75,21 @@ fun InstrumentButton(
             .clickable(enabled = enabled && !loading, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        if (loading) {
-            CircularProgressIndicator(modifier = Modifier.size(20.dp), color = fg, strokeWidth = 2.dp)
+        // Always the label — callers pass "Claiming…"/"Verifying…" while loading,
+        // so the copy is never dead. A pulsing alpha carries the "working" signal
+        // instead of Material's CircularProgressIndicator (a hard-NO in this system).
+        val alpha = if (loading) {
+            val transition = rememberInfiniteTransition(label = "button-loading")
+            transition.animateFloat(
+                initialValue = 0.45f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(tween(650), RepeatMode.Reverse),
+                label = "pulse",
+            ).value
         } else {
-            Text(text, style = MaterialTheme.typography.labelLarge, color = fg)
+            1f
         }
+        Text(text, style = MaterialTheme.typography.labelLarge, color = fg, modifier = Modifier.alpha(alpha))
     }
 }
 
