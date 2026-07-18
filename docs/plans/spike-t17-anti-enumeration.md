@@ -48,8 +48,8 @@ just confirms it holds):** the server never logs or needs to log which
 exact hash within a bucket was the target — consistent with T9's existing
 "ephemeral counters, no query-content logging" design. There's genuinely
 nothing more specific to hand over than "someone queried bucket N," which
-is the whole point of the compelled-disclosure mitigation the legal review signed
-off on.
+is the whole point of the compelled-disclosure mitigation the external
+legal review signed off on.
 
 **Tuning knob — prefix length / target bucket size *k*:** Pick prefix
 length so expected bucket size stays roughly constant as the user base

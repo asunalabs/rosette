@@ -37,10 +37,10 @@ v1.1 at the earliest (OQ8 unanswered).
   account regardless of age (`searchable BOOLEAN DEFAULT FALSE`, toggled
   via `POST /searchable`). This, not an age gate, is what limits
   discoverability exposure — matches the completed external legal review
-  (`[private legal records]`).
+  (records kept privately, outside this repository).
 - **Age posture:** 13+, self-declared, no verification (Signal's shipped
-  policy). One open item in the private legal record before treating this as fully
-  closed.
+  policy). One open item in the private legal record before treating this
+  as fully closed.
 - **Deletion:** erasure scrubs `phone_hash`/`phone_hash_prefix`/
   `searchable`; the `(nickname, discriminator)` slot is **permanently
   reserved** (retained, inert, never displayed or searchable) as
@@ -133,7 +133,7 @@ pairing bootstraps:
   front-ends).
 - **Legal**: OQ9 cleared 2026-07-12 after external legal review — data
   minimization (nothing to hand over) is the compelled-disclosure answer;
-  records kept privately.
+  records kept privately, outside this repository.
 - **Deferred UX expansions** (mutual-contact signal, unified add flow,
   invite-link growth loop): TODOS.md #9.
 

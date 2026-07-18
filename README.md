@@ -1,20 +1,33 @@
-# chat (working name)
+# Rosette
 
-A private messenger. Conversations are end-to-end encrypted with MLS
-(OpenMLS); relays store-and-forward padded ciphertext and can't read names,
-content, or membership.
+A private messenger for the Chat Control era. Conversations are end-to-end
+encrypted with MLS (OpenMLS); relays store-and-forward padded ciphertext and
+can't read names, content, or membership. Built for mainstream EU users who
+want a familiar messenger that doesn't scan — not a hobbyist threat-model
+exercise.
+
+> If we were ever forced to choose between giving government access to user
+> data or shutting down, we would shut down.
+
+The name is the identicon: every contact renders as a deterministic
+guilloché **rosette** — the anti-forgery engraving on banknotes and
+passports — derived from their key fingerprint. Hard to forge, easy to
+recognize.
 
 Status: working protocol skeleton. Relay, encrypted 1:1 chat over the CLI,
 and the Kotlin Multiplatform app shell all run today, paired by exchanging a
-QR/contact link — no phone, no email, no account, real app screens are in
-progress. A Signal-model identity/directory pivot is implemented as a
-standalone service (`directory/`): phone required at signup (Argon2id-hashed,
+QR/contact link — no phone, no email, no account required for the core path.
+A Signal-model identity/directory pivot is implemented as a standalone
+service (`directory/`): phone required at signup (Argon2id-hashed,
 verification-only, hidden by default), k-anonymity-bucketed phone/username
 search opt-in (off by default), backed by PostgreSQL. Not yet wired to the
 client or to `core`/`engine`'s pairing flow — see
 [docs/plans/tasks-identity-directory-pivot.md](docs/plans/tasks-identity-directory-pivot.md)
 for what's done versus open (T25 in particular: no bridge exists yet from a
 directory search hit to an actual MLS pairing session).
+
+**Free forever for individuals. No paid tier, ever.** Billing needs an
+identity link, and this app's whole point is not having one.
 
 ## Try it
 
@@ -32,7 +45,7 @@ cargo run -p cli -- connect "<link>"                      # 3: bob → chat
 |-----|---------------|
 | [Project guide](docs/explanation/project-guide.md) | Start here: what everything does, why it's shaped this way, current status |
 | [Getting started](docs/tutorials/getting-started.md) | Tutorial: full stack running locally, first encrypted message |
-| [How to run a relay](docs/how-to/run-a-relay.md) | Operators: binary or Docker, persistence, fingerprint handling |
+| [How to run a relay](docs/how-to/run-a-relay.md) | Operators: binary or Docker, TLS/identity handling, systemd, attestation gate |
 | [How to chat from the CLI](docs/how-to/chat-from-the-cli.md) | Pair and chat from the terminal |
 | [Command reference](docs/reference/commands.md) | Every flag, file, env var, and protocol limit |
 | [Architecture](docs/explanation/architecture.md) | The system design, crate boundaries, and migration plan |
@@ -64,7 +77,7 @@ cd app && ./gradlew :engine-kt:desktopTest   # FFI smoke test across the seam
 test gets its own ephemeral DB via `sqlx::test`):
 
 ```bash
-docker run -d --name chat-directory-postgres -e POSTGRES_PASSWORD=devpassword \
+docker run -d --name rosette-directory-postgres -e POSTGRES_PASSWORD=devpassword \
   -e POSTGRES_USER=directory -e POSTGRES_DB=directory -p 5432:5432 postgres:16-alpine
 export DATABASE_URL="postgres://directory:devpassword@localhost:5432/directory"
 cargo test --workspace
@@ -79,3 +92,14 @@ DIRECTORY_ALLOW_DEV_PEPPER=1 cargo run -p directory   # listens on 127.0.0.1:744
 
 CI runs both on every push (`.github/workflows/ci.yml`). Backend and frontend
 tracks work independently against the [FFI contract](docs/reference/ffi-contract.md).
+
+## Security
+
+Pre-audit software — see [SECURITY.md](SECURITY.md) for how to report
+vulnerabilities privately. The external audit gates public beta.
+
+## License
+
+No license yet — all rights reserved while one is chosen (AGPL-3.0 is the
+leading candidate). Until a `LICENSE` file lands: read it, build it, run it,
+open issues and PRs; ask first before redistributing or reusing the code.

@@ -122,8 +122,7 @@ docs/
 │   ├── architecture.md              Full system design, crate boundaries, decision log, migration plan
 │   └── project-guide.md             This document — the orientation map
 ├── plans/                           Durable, checked-in task lists and specs (see below)
-├── design/                          Wireframes and the approved UI direction
-└── legal/                           (private, not in the public tree)
+└── design/                          Wireframes and the approved UI direction
 ```
 
 `docs/plans/` is where a `/plan-*-review` or `/autoplan` pass writes task

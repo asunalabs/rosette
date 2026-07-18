@@ -1,4 +1,4 @@
-# Design System — "Quiet Room" (chat, working name — OQ1)
+# Design System — "Quiet Room" (Rosette — OQ1 resolved 2026-07-18)
 
 Source of truth for every visual/UI decision. Rendered reference (live
 tokens, live Rosette algorithm, mocked phone + desktop screens, light+dark
@@ -265,3 +265,4 @@ implementation (JS/SVG v0): `docs/design/design-preview.html`.
 | 2026-07-16 | **Verification = conversation header → contact sheet → safety numbers**, then the ceremony | The trust question is asked inside a conversation, so it's answered there. `markVerified` had zero call sites; the Rosette's verified band and "the one ceremony" were unreachable code |
 | 2026-07-16 | **`warning` token owns "we're waiting on our own infrastructure"; `error` stays quarantined to real user-facing failures** | A vendor outage is not the user's failure. Rendering it in `error` both spends the one token that means something and blames the wrong party (T27 held state) |
 | 2026-07-16 | **Onboarding steps get a back affordance; `error` clears on every transition** | A mistyped number was an unescapable dead end; `onRestore`'s message leaked across steps and glowed red under an unrelated CTA |
+| 2026-07-18 | **App named "Rosette" (OQ1 resolved)** — identicon name promoted to product name; register rosette.chat (canonical) + getrosette.eu (EU redirect) | Name unifies with the one visual signature; zero new brand assets; EU-warm vs paranoia-coded competitors; rosette.chat verified free at standard price. rosette.eu is parked for resale (~€4k ask) — declined, getrosette.eu free per EURid whois; get-prefix is standard in the category (getsession.org). .com/.app/.net/.org taken (Babel Street NLP legacy, different class; EUIPO/USPTO class 9/38/42 search pending) |
