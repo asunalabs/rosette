@@ -100,6 +100,7 @@ vulnerabilities privately. The external audit gates public beta.
 
 ## License
 
-No license yet — all rights reserved while one is chosen (AGPL-3.0 is the
-leading candidate). Until a `LICENSE` file lands: read it, build it, run it,
-open issues and PRs; ask first before redistributing or reusing the code.
+[GNU AGPL-3.0](LICENSE). Chosen so a modified relay or directory service run
+as a hosted network service must release its source too — the same
+anti-freeriding logic Signal applies to its own server code, and a match for
+this project's free-forever, non-commercial posture.
