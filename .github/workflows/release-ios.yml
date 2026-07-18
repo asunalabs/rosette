@@ -1,0 +1,86 @@
+# Builds an UNSIGNED iOS .ipa and publishes it to the Releases tab. Unsigned
+# because the install path is sideloading: AltStore / Sideloadly re-sign the
+# .ipa against your free Apple ID and your device at install time, so CI needs
+# no Apple certificates, no provisioning profile, and no device UDID.
+#
+# Two triggers:
+#   - workflow_dispatch  → updates one rolling "ios-latest" prerelease.
+#   - push tag ios-v*    → a pinned release for that version.
+name: release-ios
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "ios-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-ios
+  cancel-in-progress: false
+
+jobs:
+  ipa:
+    name: Unsigned .ipa
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      # Device build only (arm64) → just the one Rust triple Gobley links into
+      # the framework.
+      - name: Add Rust iOS target
+        run: rustup target add aarch64-apple-ios
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        working-directory: app/iosApp
+        run: xcodegen generate
+
+      # The Compile-Kotlin build phase (project.yml) runs Gradle to produce
+      # ComposeApp.framework during the archive. Unsigned: the framework is
+      # static, so there's no embedded binary to sign anyway.
+      - name: Archive (unsigned)
+        working-directory: app/iosApp
+        run: |
+          xcodebuild \
+            -project iosApp.xcodeproj \
+            -scheme iosApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/iosApp.xcarchive" \
+            archive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      # An .ipa is just a zip of Payload/<App>.app — no signing needed to build
+      # the container; the signature (or absence of one) lives inside the .app.
+      - name: Package .ipa
+        working-directory: app/iosApp
+        run: |
+          app="build/iosApp.xcarchive/Products/Applications/iosApp.app"
+          test -d "$app" || { echo "archive produced no .app"; exit 1; }
+          rm -rf build/Payload && mkdir -p build/Payload
+          cp -R "$app" build/Payload/
+          (cd build && zip -qry chat-unsigned.ipa Payload)
+          ls -lh build/chat-unsigned.ipa
+
+      - name: Publish to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ipa="app/iosApp/build/chat-unsigned.ipa"
+          notes="Unsigned .ipa. Install by sideloading: open it in **AltStore** or **Sideloadly**, sign in with your Apple ID, and install to your iPhone. A free Apple ID works (re-sign every 7 days)."
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${{ github.ref_name }}"
+            gh release create "$tag" "$ipa" --title "iOS $tag (unsigned)" --notes "$notes" --target "$GITHUB_SHA" \
+              || gh release upload "$tag" "$ipa" --clobber
+          else
+            # Rolling latest: one Releases entry that always holds the newest build.
+            gh release delete ios-latest --cleanup-tag --yes || true
+            gh release create ios-latest "$ipa" --title "iOS test build (latest, unsigned)" --notes "$notes" --prerelease --target "$GITHUB_SHA"
+          fi

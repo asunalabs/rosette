@@ -1,0 +1,40 @@
+# iOS build/test — the deferred half of T8 (docs/plans/tasks-ios-app.md).
+# Runs on Apple-hosted macOS runners because Kotlin/Native's Apple targets,
+# the Gobley-built Rust staticlib, and the simulator are all macOS-only.
+#
+# Separate from ci.yml (which stays ubuntu-only) so the `paths:` filter can
+# gate the whole workflow: macOS minutes bill at 10x, so a Rust-only or
+# docs-only change must not spin this up.
+name: iOS
+
+on:
+  push:
+    paths: &ios-paths
+      - 'app/**'
+      - 'ffi/**'
+      - 'core/**'
+      - 'engine/**'
+      - 'proto/**'
+      - '.github/workflows/ios.yml'
+  pull_request:
+    paths: *ios-paths
+
+jobs:
+  build:
+    name: composeApp + engine-kt (iosSimulatorArm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      # rustup is preinstalled on the macOS runner; add only the iOS triples
+      # Gobley needs to cross-build ffi's staticlib for the simulator.
+      - name: Add Rust iOS targets
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+      # Runs the shared commonTest suite (incl. Sha256Test) on the simulator —
+      # this is what proves the pure-Kotlin iOS SHA-256 matches the JVM one.
+      - name: Build + test on the iOS simulator
+        working-directory: app
+        run: ./gradlew :engine-kt:iosSimulatorArm64Test :composeApp:iosSimulatorArm64Test

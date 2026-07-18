@@ -1,0 +1,63 @@
+# XcodeGen spec for the iOS host (iOS-8). CI runs `xcodegen generate` to
+# produce iosApp.xcodeproj — we don't commit the generated project (same
+# principle as never committing the Gobley bindings). Keeping the spec small
+# and readable beats hand-maintaining project.pbxproj.
+name: iosApp
+
+options:
+  bundleIdPrefix: chat.app
+  deploymentTarget:
+    iOS: "15.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    # The Compile-Kotlin build phase shells out to Gradle, which writes all
+    # over the build dir — Xcode 15's script sandbox blocks that.
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  iosApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: iosApp
+    info:
+      path: iosApp/Info.plist
+      properties:
+        CFBundleDisplayName: chat
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: chat.app
+        # embedAndSignAppleFrameworkForXcode drops ComposeApp.framework here,
+        # keyed by the active configuration + SDK.
+        FRAMEWORK_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/../composeApp/build/xcode-frameworks/$(CONFIGURATION)/$(SDK_NAME)
+    dependencies:
+      # Static framework (isStatic=true in composeApp): linked into the app
+      # binary, not embedded. `implicit` because the build phase below produces
+      # it — the file doesn't exist at generate time.
+      - framework: ComposeApp.framework
+        embed: false
+        implicit: true
+    preBuildScripts:
+      - name: Compile Kotlin Framework
+        basedOnDependencyAnalysis: false
+        script: |
+          cd "$SRCROOT/.."
+          ./gradlew :composeApp:embedAndSignAppleFrameworkForXcode
+
+schemes:
+  iosApp:
+    build:
+      targets:
+        iosApp: all
+    run:
+      config: Debug
+    archive:
+      config: Release

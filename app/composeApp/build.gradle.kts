@@ -4,6 +4,7 @@
 // per-screen ad-hoc styling here before the design system exists.
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.konan.target.HostManager
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
@@ -21,6 +22,19 @@ kotlin {
     }
     jvmToolchain(17)
     jvm("desktop")
+    // iOS targets exist only on a Mac (same split gate as :engine-kt — Kotlin/
+    // Native's Apple targets, the Gobley staticlib, and the simulator are all
+    // macOS-only). Off-Mac the module still configures for Android + desktop.
+    // The framework is what the iosApp Xcode host links (iOS-8); static to
+    // match the Rust staticlib and CMP's default.
+    if (HostManager.hostIsMac) {
+        listOf(iosArm64(), iosSimulatorArm64(), iosX64()).forEach { target ->
+            target.binaries.framework {
+                baseName = "ComposeApp"
+                isStatic = true
+            }
+        }
+    }
 
     sourceSets {
         commonMain.dependencies {
