@@ -77,6 +77,30 @@ pub enum DeliveryState {
     Received,
 }
 
+/// T27: one directory-issued attestation token as the app carries it — the
+/// Kotlin `DirectoryClient.fetchAttestationTokens` decodes the base64 wire
+/// fields into these, then hands a batch to `stock_attestation_tokens`. The
+/// engine spends one per queue-creation; the relay verifies it offline.
+#[derive(uniffi::Record, Clone)]
+pub struct AttestationToken {
+    /// 16-byte nonce. A wrong length makes the whole token unusable, so
+    /// `stock_attestation_tokens` drops it rather than trusting it.
+    pub nonce: Vec<u8>,
+    pub expires_at: i64,
+    pub signature: Vec<u8>,
+}
+
+/// Drop a token whose nonce isn't exactly 16 bytes — a malformed token could
+/// never verify at the relay, so it is worthless, not dangerous.
+fn attestation_to_proto(t: AttestationToken) -> Option<proto::attestation::AttestationToken> {
+    let nonce: [u8; 16] = t.nonce.try_into().ok()?;
+    Some(proto::attestation::AttestationToken {
+        nonce,
+        expires_at: t.expires_at,
+        signature: t.signature,
+    })
+}
+
 /// Events the engine pushes to the UI. The UI registers one listener via
 /// `set_listener`; Kotlin wraps it into a Flow.
 #[derive(uniffi::Enum, Clone)]
@@ -271,6 +295,10 @@ struct Shared {
     /// MLS state into (its own connection — the engine's lives on the engine
     /// thread). None = in-memory engine.
     disk: Mutex<Option<DiskStore>>,
+    /// T27: attestation tokens waiting to be handed to the engine when it
+    /// spawns (the mailbox/group-inbox spend points live inside the engine
+    /// constructors). Drained at spawn; empty when the gate is off.
+    attestation: Mutex<Vec<proto::attestation::AttestationToken>>,
 }
 
 impl Shared {
@@ -484,6 +512,16 @@ impl ChatEngine {
         *self.listener.lock().unwrap() = Some(listener);
         let _ = self.shared.dispatch_tx.send(DispatchMsg::ListenerChanged);
     }
+
+    /// T27: hand the engine a batch of directory attestation tokens (from
+    /// `DirectoryClient.fetchAttestationTokens`). Call BEFORE the first
+    /// `create_contact_link` / `pair_with_link`, which mint the queues that
+    /// spend them. A no-op when the relay's gate is off (queue creation then
+    /// needs no token); malformed tokens are dropped, not trusted.
+    pub fn stock_attestation_tokens(&self, tokens: Vec<AttestationToken>) {
+        let mut stash = self.shared.attestation.lock().unwrap();
+        stash.extend(tokens.into_iter().filter_map(attestation_to_proto));
+    }
 }
 
 /// Constructor internals — uniffi::export impls only take exported methods.
@@ -558,6 +596,7 @@ impl ChatEngine {
                 dispatch_tx,
                 seq: AtomicU64::new(seq),
                 disk: Mutex::new(disk),
+                attestation: Mutex::new(Vec::new()),
             }),
             listener,
             backend: Mutex::new(None),
@@ -601,6 +640,10 @@ impl ChatEngine {
         let name = self.display_name.clone();
         let shared = self.shared.clone();
         let persist = self.persist.clone();
+        // T27: hand the just-fetched tokens to the engine that's about to mint
+        // this device's mailbox. Empty (gate off) → the mailbox is created with
+        // no token, which the relay accepts.
+        let tokens = std::mem::take(&mut *self.shared.attestation.lock().unwrap());
         std::thread::Builder::new()
             .name("chat-ffi-engine".to_string())
             .spawn(move || {
@@ -609,18 +652,16 @@ impl ChatEngine {
                     .build()
                     .expect("building the engine runtime never fails");
                 rt.block_on(async move {
-                    let attempt = match restored_session(persist.as_ref()) {
-                        Some(session) => {
-                            CoreEngine::connect_with_session(
-                                &name,
-                                &cfg.addr,
-                                cfg.fingerprint,
-                                session,
-                            )
-                            .await
-                        }
-                        None => CoreEngine::connect(&name, &cfg.addr, cfg.fingerprint).await,
-                    };
+                    let session = restored_session(persist.as_ref())
+                        .unwrap_or_else(|| chatcore::ChatSession::new(&name));
+                    let attempt = CoreEngine::connect_with_session(
+                        &name,
+                        &cfg.addr,
+                        cfg.fingerprint,
+                        session,
+                        tokens,
+                    )
+                    .await;
                     let mut core = match attempt {
                         Ok(core) => core,
                         Err(e) => {
@@ -676,6 +717,10 @@ impl ChatEngine {
         let name = self.display_name.clone();
         let shared = self.shared.clone();
         let persist = self.persist.clone();
+        // T27: the scanner mints two queues (its mailbox + the group inbox), so
+        // it spends up to two of these. Empty (gate off) → both created
+        // token-less, which the relay accepts.
+        let tokens = std::mem::take(&mut *self.shared.attestation.lock().unwrap());
         std::thread::Builder::new()
             .name("chat-ffi-engine".to_string())
             .spawn(move || {
@@ -686,7 +731,8 @@ impl ChatEngine {
                 rt.block_on(async move {
                     let session = restored_session(persist.as_ref());
                     let mut core =
-                        match CoreEngine::pair_with_link_using(&name, &link, session).await {
+                        match CoreEngine::pair_with_link_using(&name, &link, session, tokens).await
+                        {
                             Ok(core) => core,
                             Err(e) => {
                                 let _ = init_tx.send(Err(e));
@@ -1256,6 +1302,48 @@ mod tests {
             engine.pair_with_link("not b64 at all!!!".to_string()),
             Err(EngineError::InvalidContactLink)
         ));
+    }
+
+    #[test]
+    fn attestation_conversion_drops_wrong_length_nonces() {
+        // A well-formed 16-byte nonce converts.
+        let good = AttestationToken {
+            nonce: vec![7u8; 16],
+            expires_at: 42,
+            signature: vec![1, 2, 3],
+        };
+        let proto = attestation_to_proto(good).expect("16-byte nonce converts");
+        assert_eq!(proto.nonce, [7u8; 16]);
+        assert_eq!(proto.expires_at, 42);
+
+        // Wrong-length nonces are dropped, never truncated or padded.
+        for bad_len in [0, 15, 17, 32] {
+            let bad = AttestationToken {
+                nonce: vec![0u8; bad_len],
+                expires_at: 1,
+                signature: vec![],
+            };
+            assert!(
+                attestation_to_proto(bad).is_none(),
+                "len {bad_len} is dropped"
+            );
+        }
+
+        // stock_attestation_tokens keeps only the valid ones.
+        let engine = ChatEngine::new("bob".to_string());
+        engine.stock_attestation_tokens(vec![
+            AttestationToken {
+                nonce: vec![1u8; 16],
+                expires_at: 1,
+                signature: vec![],
+            },
+            AttestationToken {
+                nonce: vec![2u8; 3],
+                expires_at: 1,
+                signature: vec![],
+            },
+        ]);
+        assert_eq!(engine.shared.attestation.lock().unwrap().len(), 1);
     }
 
     #[test]

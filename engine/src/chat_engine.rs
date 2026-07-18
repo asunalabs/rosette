@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail};
 use base64::Engine as _;
 use chatcore::{message_id_for, ChatSession, Incoming, Store};
+use proto::attestation::AttestationToken;
 use proto::{
     ContactLink, DeliveryMode, Endpoint, Envelope, GroupSendKind, MessageId, QueueId, RejectionCode,
 };
@@ -63,6 +64,11 @@ pub struct ChatEngine {
     /// an already-updated seen set. None = in-memory engine (tests, and any
     /// caller that hasn't attached a store yet).
     store: Option<Store>,
+    /// T27: single-use directory tokens spent one per queue-creation. Empty
+    /// when the relay's attestation gate is off (the default) — `create_*`
+    /// then sends `None`, which the relay accepts. Not persisted: tokens are
+    /// only needed at connect/pair time, both of which re-fetch a fresh batch.
+    attestation_tokens: VecDeque<AttestationToken>,
 }
 
 /// The non-MLS half of what `resume` needs — queue credentials and relay
@@ -106,6 +112,7 @@ impl ChatEngine {
             relay_addr,
             relay_fingerprint,
             ChatSession::new(display_name),
+            Vec::new(),
         )
         .await
     }
@@ -118,9 +125,12 @@ impl ChatEngine {
         relay_addr: &str,
         relay_fingerprint: [u8; 32],
         session: ChatSession,
+        attestation_tokens: Vec<AttestationToken>,
     ) -> anyhow::Result<Self> {
         let relay = RelayClient::connect(relay_addr, relay_fingerprint).await?;
-        let (mailbox_qid, mailbox_key) = relay.create_mailbox().await?;
+        let mut attestation_tokens: VecDeque<AttestationToken> = attestation_tokens.into();
+        let (mailbox_qid, mailbox_key) =
+            relay.create_mailbox(attestation_tokens.pop_front()).await?;
         relay.subscribe(vec![mailbox_qid]).await?;
         Ok(ChatEngine {
             display_name: display_name.to_string(),
@@ -134,6 +144,7 @@ impl ChatEngine {
             seen: HashSet::new(),
             pending_events: VecDeque::new(),
             store: None,
+            attestation_tokens,
         })
     }
 
@@ -184,6 +195,9 @@ impl ChatEngine {
             seen,
             pending_events: VecDeque::new(),
             store: Some(store),
+            // Resume reuses the existing mailbox and never creates a queue, so
+            // it spends no token.
+            attestation_tokens: VecDeque::new(),
         })
     }
 
@@ -225,15 +239,17 @@ impl ChatEngine {
     /// the 2-member group, create the group inbox, and deliver the bootstrap
     /// payload to the peer's mailbox. Returns a fully paired engine.
     pub async fn pair_with_link(display_name: &str, link_b64: &str) -> anyhow::Result<Self> {
-        Self::pair_with_link_using(display_name, link_b64, None).await
+        Self::pair_with_link_using(display_name, link_b64, None, Vec::new()).await
     }
 
     /// `pair_with_link` with an optional restored session (issue #3) — same
-    /// reason as [`Self::connect_with_session`].
+    /// reason as [`Self::connect_with_session`]. `attestation_tokens` feeds the
+    /// two queues the scanner mints (its mailbox and the group inbox).
     pub async fn pair_with_link_using(
         display_name: &str,
         link_b64: &str,
         session: Option<ChatSession>,
+        attestation_tokens: Vec<AttestationToken>,
     ) -> anyhow::Result<Self> {
         let link_bytes = base64::engine::general_purpose::STANDARD.decode(link_b64.trim())?;
         let link = ContactLink::from_bytes(&link_bytes)?;
@@ -245,17 +261,25 @@ impl ChatEngine {
         } = link.primary_endpoint().clone();
 
         let session = session.unwrap_or_else(|| ChatSession::new(display_name));
-        let mut engine =
-            Self::connect_with_session(display_name, &relay_addr, relay_fingerprint, session)
-                .await?;
+        let mut engine = Self::connect_with_session(
+            display_name,
+            &relay_addr,
+            relay_fingerprint,
+            session,
+            attestation_tokens,
+        )
+        .await?;
         let peer_kp = chatcore::pairing::key_package_from_link(&link, engine.session.provider())?;
         engine.session.create_group()?;
         let welcome_wire = engine.session.add_members(&[peer_kp])?;
         let tree_wire = engine.session.export_ratchet_tree()?;
 
+        // Second spend: the group inbox. `connect_with_session` already popped
+        // the mailbox token; this pops the next from what survived.
+        let inbox_token = engine.attestation_tokens.pop_front();
         let (inbox_qid, inbox_key) = engine
             .relay
-            .create_group_inbox(1, vec![engine.mailbox_qid, peer_mailbox])
+            .create_group_inbox(1, vec![engine.mailbox_qid, peer_mailbox], inbox_token)
             .await?;
         let payload = BootstrapPayload {
             welcome_wire,

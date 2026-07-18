@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::bail;
+use proto::attestation::AttestationToken;
 use proto::framing::{read_frame, write_frame, ReadFrameError};
 use proto::{
     ClientFrame, ClientMessage, Envelope, GroupSendKind, PowSolution, QueueId, RejectionCode,
@@ -152,12 +153,16 @@ impl RelayClient {
         }
     }
 
-    pub async fn create_mailbox(&self) -> anyhow::Result<(QueueId, [u8; 32])> {
-        // T27: `attestation: None` until the client wires token spending (the
-        // relay accepts None unless configured with a directory key).
+    /// T27: `attestation` is the single-use token the relay verifies offline
+    /// when its gate is on; `None` is accepted while the gate is off (the
+    /// default). The engine sources it from its token pool.
+    pub async fn create_mailbox(
+        &self,
+        attestation: Option<AttestationToken>,
+    ) -> anyhow::Result<(QueueId, [u8; 32])> {
         self.create_queue_with_pow(|solution| ClientMessage::CreateMailbox {
             solution,
-            attestation: None,
+            attestation,
         })
         .await
     }
@@ -166,12 +171,13 @@ impl RelayClient {
         &self,
         initial_epoch: u64,
         fan_out_to: Vec<QueueId>,
+        attestation: Option<AttestationToken>,
     ) -> anyhow::Result<(QueueId, [u8; 32])> {
         self.create_queue_with_pow(|solution| ClientMessage::CreateGroupInbox {
             solution,
             initial_epoch,
             fan_out_to,
-            attestation: None,
+            attestation,
         })
         .await
     }

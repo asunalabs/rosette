@@ -31,7 +31,7 @@ async fn two_concurrent_in_flight_requests_resolve_correctly() {
     // Different expected reply types: create_mailbox needs PowChallenge then
     // QueueCreated, subscribe needs Ok. Cross-routing either reply fails the
     // strict type match inside the respective helper.
-    let (created, subscribed) = tokio::join!(client.create_mailbox(), client.subscribe(vec![]));
+    let (created, subscribed) = tokio::join!(client.create_mailbox(None), client.subscribe(vec![]));
     let (queue_id, _send_key) = created.expect("create_mailbox must succeed while pipelined");
     subscribed.expect("subscribe must succeed while pipelined");
     assert_ne!(queue_id, [0u8; 32]);
@@ -43,10 +43,10 @@ async fn many_concurrent_mixed_requests_each_get_their_own_reply() {
     let client = RelayClient::connect(&addr, fp).await.unwrap();
 
     let (a, b, c, d, s1, s2, s3, s4) = tokio::join!(
-        client.create_mailbox(),
-        client.create_mailbox(),
-        client.create_mailbox(),
-        client.create_mailbox(),
+        client.create_mailbox(None),
+        client.create_mailbox(None),
+        client.create_mailbox(None),
+        client.create_mailbox(None),
         client.subscribe(vec![]),
         client.subscribe(vec![]),
         client.subscribe(vec![]),

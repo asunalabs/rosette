@@ -61,7 +61,7 @@ struct Member {
 impl Member {
     async fn connect(name: &str, relay_addr: &str, fingerprint: [u8; 32]) -> Self {
         let relay = RelayClient::connect(relay_addr, fingerprint).await.unwrap();
-        let (mailbox_qid, mailbox_key) = relay.create_mailbox().await.unwrap();
+        let (mailbox_qid, mailbox_key) = relay.create_mailbox(None).await.unwrap();
         relay.subscribe(vec![mailbox_qid]).await.unwrap();
         Member {
             session: ChatSession::new(name),
@@ -141,6 +141,7 @@ async fn three_clients_converge_after_a_concurrent_commit_conflict() {
         .create_group_inbox(
             1,
             vec![alice.mailbox_qid, bob.mailbox_qid, carol.mailbox_qid],
+            None,
         )
         .await
         .unwrap();
