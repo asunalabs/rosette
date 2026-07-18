@@ -4,13 +4,17 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -25,6 +29,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import chat.app.chatlist.ChatListScreen
 import chat.app.chatlist.ConversationScreen
@@ -183,7 +188,6 @@ private fun EngineScreen(
     initial: ChatEngine?,
     onSessionExpired: () -> Unit,
 ) {
-    val palette = LocalChatPalette.current
     // Issue #1: SQLCipher-persistent engine — identity, pairing, and history
     // survive restarts. remember {} — one engine per composition, as the
     // contract prescribes one per app start. [initial] is the engine
@@ -245,18 +249,8 @@ private fun EngineScreen(
         // is the remaining edge for a user who onboarded fully offline.
     }
 
-    val conversation = openConversation
-    if (conversation != null) {
-        ConversationScreen(
-            engine = engine,
-            conversation = conversation,
-            revision = revision,
-            onBack = { openConversation = null },
-        )
-        return
-    }
-
-    // Issue #4: settings + Change PIN sit above the tabbed surface.
+    // Issue #4: settings + Change PIN are transient full-window surfaces at
+    // every width — they sit above the main surface, desktop panes included.
     when (screen) {
         Screen.Settings -> {
             SettingsScreen(
@@ -278,41 +272,204 @@ private fun EngineScreen(
         Screen.Main -> {}
     }
 
-    if (showFindPeople) {
-        FindPeopleScreen(
+    // DT17: at ≥700dp the desktop gets the three-pane layout DESIGN.md specs
+    // (icon rail + chat list + conversation). Narrower stays the phone flow,
+    // where each destination replaces the whole surface. This is a distinct
+    // structure, not the phone layout reflowed — which is why it's its own pass.
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        if (maxWidth >= 700.dp) {
+            DesktopLayout(
+                engine = engine,
+                session = session,
+                client = client,
+                revision = revision,
+                selected = openConversation,
+                showFindPeople = showFindPeople,
+                onSelectConversation = { openConversation = it; showFindPeople = false },
+                onCloseConversation = { openConversation = null },
+                onOpenSettings = { screen = Screen.Settings },
+                onFindPeople = { openConversation = null; showFindPeople = true },
+                onCloseFindPeople = { showFindPeople = false },
+                onContactAdded = { backupUploader.schedule() },
+                onSessionExpired = onSessionExpired,
+            )
+        } else {
+            MobileLayout(
+                engine = engine,
+                session = session,
+                client = client,
+                revision = revision,
+                openConversation = openConversation,
+                showFindPeople = showFindPeople,
+                onOpenConversation = { openConversation = it },
+                onCloseConversation = { openConversation = null },
+                onOpenSettings = { screen = Screen.Settings },
+                onFindPeople = { showFindPeople = true },
+                onCloseFindPeople = { showFindPeople = false },
+                onContactAdded = { backupUploader.schedule() },
+                onSessionExpired = onSessionExpired,
+            )
+        }
+    }
+}
+
+/**
+ * The phone flow (also every width below 700dp): one destination at a time,
+ * each replacing the whole surface. This is exactly what shipped before DT17 —
+ * lifted verbatim into its own composable so the desktop branch can sit beside
+ * it.
+ */
+@Composable
+private fun MobileLayout(
+    engine: ChatEngine,
+    session: Session,
+    client: DirectoryClient,
+    revision: Int,
+    openConversation: Conversation?,
+    showFindPeople: Boolean,
+    onOpenConversation: (Conversation) -> Unit,
+    onCloseConversation: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onFindPeople: () -> Unit,
+    onCloseFindPeople: () -> Unit,
+    onContactAdded: () -> Unit,
+    onSessionExpired: () -> Unit,
+) {
+    val palette = LocalChatPalette.current
+    when {
+        openConversation != null -> ConversationScreen(
+            engine = engine,
+            conversation = openConversation,
+            revision = revision,
+            onBack = onCloseConversation,
+        )
+        showFindPeople -> FindPeopleScreen(
             client = client,
             session = session,
             engine = engine,
-            onBack = { showFindPeople = false },
-            onContactAdded = { backupUploader.schedule() },
+            onBack = onCloseFindPeople,
+            onContactAdded = onContactAdded,
             onSessionExpired = onSessionExpired,
         )
-        return
-    }
-
-    // DT9: Chats is the root, no tab bar (the only other tab, Calls, is unbuilt —
-    // a one-tab bar is noise). The FAB is the compose affordance the list lacked.
-    Box(modifier = Modifier.fillMaxSize().background(palette.bg)) {
-        ChatListScreen(
-            engine = engine,
-            handle = session.handle,
-            revision = revision,
-            onOpenConversation = { openConversation = it },
-            onOpenSettings = { screen = Screen.Settings },
-            onFindPeople = { showFindPeople = true },
-        )
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(20.dp)
-                .size(52.dp)
-                .clip(CircleShape)
-                .background(palette.accent)
-                .clickable { showFindPeople = true },
-            contentAlignment = Alignment.Center,
-        ) {
-            Text("+", style = MaterialTheme.typography.headlineSmall, color = palette.onAccent)
+        // DT9: Chats is the root, no tab bar (the only other tab, Calls, is
+        // unbuilt — a one-tab bar is noise). The FAB is the compose affordance.
+        else -> Box(Modifier.fillMaxSize().background(palette.bg)) {
+            ChatListScreen(
+                engine = engine,
+                handle = session.handle,
+                revision = revision,
+                onOpenConversation = onOpenConversation,
+                onOpenSettings = onOpenSettings,
+                onFindPeople = onFindPeople,
+            )
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(20.dp)
+                    .size(52.dp)
+                    .clip(CircleShape)
+                    .background(palette.accent)
+                    .clickable(onClick = onFindPeople),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("+", style = MaterialTheme.typography.headlineSmall, color = palette.onAccent)
+            }
         }
+    }
+}
+
+/**
+ * DT17: the desktop three-pane layout (DESIGN.md "Layout → Breakpoint"):
+ * a 60dp icon rail, a 290dp chat-list pane, and the conversation pane filling
+ * the rest. Unlike the phone flow, the list stays visible while a conversation
+ * is open — selecting a row swaps the right pane, it doesn't cover the list.
+ */
+@Composable
+private fun DesktopLayout(
+    engine: ChatEngine,
+    session: Session,
+    client: DirectoryClient,
+    revision: Int,
+    selected: Conversation?,
+    showFindPeople: Boolean,
+    onSelectConversation: (Conversation) -> Unit,
+    onCloseConversation: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onFindPeople: () -> Unit,
+    onCloseFindPeople: () -> Unit,
+    onContactAdded: () -> Unit,
+    onSessionExpired: () -> Unit,
+) {
+    val palette = LocalChatPalette.current
+    Row(Modifier.fillMaxSize().background(palette.bg)) {
+        // Pane 1 — icon rail: the desktop stand-in for the phone's FAB (compose,
+        // top) and You-menu (identity/settings, bottom).
+        Column(
+            modifier = Modifier.width(60.dp).fillMaxHeight().background(palette.surface),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Spacer(Modifier.height(16.dp))
+            RailButton("+", palette.accent, palette.onAccent, onFindPeople)
+            Spacer(Modifier.weight(1f))
+            RailButton(
+                session.handle.take(1).uppercase(),
+                palette.surface2,
+                palette.ink,
+                onOpenSettings,
+            )
+            Spacer(Modifier.height(16.dp))
+        }
+        Box(Modifier.width(1.dp).fillMaxHeight().background(palette.hairline))
+        // Pane 2 — chat list.
+        Box(Modifier.width(290.dp).fillMaxHeight().background(palette.bg)) {
+            ChatListScreen(
+                engine = engine,
+                handle = session.handle,
+                revision = revision,
+                onOpenConversation = onSelectConversation,
+                onOpenSettings = onOpenSettings,
+                onFindPeople = onFindPeople,
+            )
+        }
+        Box(Modifier.width(1.dp).fillMaxHeight().background(palette.hairline))
+        // Pane 3 — conversation (fills the rest). Find people opens here rather
+        // than covering the whole window, so the list stays put.
+        Box(Modifier.weight(1f).fillMaxHeight().background(palette.bg)) {
+            when {
+                showFindPeople -> FindPeopleScreen(
+                    client = client,
+                    session = session,
+                    engine = engine,
+                    onBack = onCloseFindPeople,
+                    onContactAdded = onContactAdded,
+                    onSessionExpired = onSessionExpired,
+                )
+                selected != null -> ConversationScreen(
+                    engine = engine,
+                    conversation = selected,
+                    revision = revision,
+                    onBack = onCloseConversation,
+                )
+                else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text(
+                        "Select a conversation",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = palette.muted,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** A 40dp circular rail action — a glyph on a filled circle. */
+@Composable
+private fun RailButton(glyph: String, bg: Color, fg: Color, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier.size(40.dp).clip(CircleShape).background(bg).clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(glyph, style = MaterialTheme.typography.titleMedium, color = fg)
     }
 }
 
