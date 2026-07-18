@@ -30,7 +30,7 @@ async fn correct_fingerprint_connects() {
         .await
         .expect("pinned connect with the right fingerprint succeeds");
     client
-        .create_mailbox()
+        .create_mailbox(None)
         .await
         .expect("authenticated relay session works end to end");
 }

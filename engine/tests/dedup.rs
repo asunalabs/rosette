@@ -43,7 +43,7 @@ async fn duplicate_delivery_is_surfaced_once_and_never_errors() {
     // in a contact link.
     let mut peer_session = ChatSession::new("bob");
     let mut peer_relay = RelayClient::connect(&addr, fp).await.unwrap();
-    let (peer_mailbox, peer_mailbox_key) = peer_relay.create_mailbox().await.unwrap();
+    let (peer_mailbox, peer_mailbox_key) = peer_relay.create_mailbox(None).await.unwrap();
     peer_relay.subscribe(vec![peer_mailbox]).await.unwrap();
     let kp = peer_session.generate_key_package().unwrap();
     let link = chatcore::pairing::build_contact_link(

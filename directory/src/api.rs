@@ -31,6 +31,9 @@ pub struct AppState {
     pub pepper: Vec<u8>,
     pub config: DirectoryConfig,
     pub rate_limiter: RateLimiter,
+    /// T27: the Ed25519 key that signs attestation tokens. `None` = the feature
+    /// is off (no key configured) and `/attestation/tokens` returns 503.
+    pub attestation_key: Option<ed25519_dalek::SigningKey>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -41,6 +44,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/username", post(claim_username))
         .route("/username-lookup", get(username_lookup))
         .route("/searchable", get(get_searchable).post(set_searchable))
+        .route("/attestation/tokens", post(issue_attestation_tokens))
         .route("/account", delete(delete_account))
         .route("/search", get(search))
         .route("/pairing-bootstrap", post(set_pairing_bootstrap))
@@ -458,6 +462,45 @@ fn is_hex(s: &str, len: usize) -> bool {
 #[derive(Serialize)]
 struct SearchableResponse {
     searchable: bool,
+}
+
+/// T27: one attestation token as the client stores/forwards it. `nonce` and
+/// `signature` are base64; the client reassembles a `proto::AttestationToken`
+/// and hands it to the relay per queue-creation.
+#[derive(Serialize)]
+struct AttestationTokenDto {
+    nonce: String,
+    expires_at: i64,
+    signature: String,
+}
+
+#[derive(Serialize)]
+struct AttestationTokensResponse {
+    tokens: Vec<AttestationTokenDto>,
+}
+
+/// T27: hand a just-verified client a batch of single-use attestation tokens.
+/// Authenticated (needs a real session, i.e. a phone-verified account). 503
+/// when the feature is off (no signing key configured) — the relay is then
+/// also un-configured, so nothing requires tokens.
+async fn issue_attestation_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<AttestationTokensResponse>, ApiError> {
+    let _user_id = authenticate(&headers, &state.store).await?;
+    let key = state
+        .attestation_key
+        .as_ref()
+        .ok_or(ApiError::FeatureDisabled)?;
+    let tokens = crate::attestation::mint_batch(key)
+        .into_iter()
+        .map(|t| AttestationTokenDto {
+            nonce: base64::engine::general_purpose::STANDARD.encode(t.nonce),
+            expires_at: t.expires_at,
+            signature: base64::engine::general_purpose::STANDARD.encode(&t.signature),
+        })
+        .collect();
+    Ok(Json(AttestationTokensResponse { tokens }))
 }
 
 /// DT5: read the caller's own phone-search opt-in so the UI renders the true
@@ -1028,6 +1071,24 @@ mod tests {
                 search_enabled: true,
             },
             rate_limiter: RateLimiter::new(),
+            attestation_key: None,
+        })
+    }
+
+    /// Like `state_for` but with a fixed attestation signing key, for the T27
+    /// issuance test. The verifying key is
+    /// `signing_key_from_seed(&[5; 32]).verifying_key()`.
+    fn state_with_attestation(pool: PgPool) -> Arc<AppState> {
+        Arc::new(AppState {
+            store: Arc::new(DirectoryStore::from_pool(pool)),
+            vendor: Arc::new(DevOtpVendor),
+            pepper: b"test-pepper".to_vec(),
+            config: DirectoryConfig {
+                accounts_enabled: true,
+                search_enabled: true,
+            },
+            rate_limiter: RateLimiter::new(),
+            attestation_key: Some(proto::attestation::signing_key_from_seed(&[5u8; 32])),
         })
     }
 
@@ -1765,5 +1826,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(anon.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test]
+    async fn attestation_tokens_are_issued_and_verify_against_the_public_key(pool: PgPool) {
+        // T27: a verified client gets a batch of tokens that the RELAY's public
+        // key will later accept. Drive the real endpoint, then verify offline
+        // exactly as the relay would.
+        use base64::Engine as _;
+        use proto::attestation::AttestationToken;
+
+        let vk = proto::attestation::signing_key_from_seed(&[5u8; 32]).verifying_key();
+        let state = state_with_attestation(pool);
+        let user_id = state.store.find_or_create_pending_user("h").await.unwrap();
+        let token = state.store.create_session(user_id).await.unwrap();
+        let addr = spawn_for_tests(state).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("http://{addr}/attestation/tokens"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let tokens = body["tokens"].as_array().unwrap();
+        assert_eq!(tokens.len(), crate::attestation::BATCH_SIZE);
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        for t in tokens {
+            let nonce: [u8; 16] = b64
+                .decode(t["nonce"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let signature = b64.decode(t["signature"].as_str().unwrap()).unwrap();
+            let reassembled = AttestationToken {
+                nonce,
+                expires_at: t["expires_at"].as_i64().unwrap(),
+                signature,
+            };
+            assert!(
+                reassembled.signature_valid(&vk),
+                "the relay's public key accepts every issued token"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn attestation_tokens_401_unauthenticated_and_503_when_disabled(pool: PgPool) {
+        // No signing key (state_for) => feature off => 503, even authenticated.
+        let state = state_for(pool);
+        let user_id = state.store.find_or_create_pending_user("h").await.unwrap();
+        let token = state.store.create_session(user_id).await.unwrap();
+        let addr = spawn_for_tests(state).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let anon = client
+            .post(format!("http://{addr}/attestation/tokens"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anon.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let disabled = client
+            .post(format!("http://{addr}/attestation/tokens"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     }
 }

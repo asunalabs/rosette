@@ -734,6 +734,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "ed25519-dalek",
  "engine",
  "proto",
  "rand 0.8.7",
@@ -2467,6 +2468,7 @@ name = "proto"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "ed25519-dalek",
  "hmac",
  "proptest",
  "rand 0.8.7",
@@ -2659,7 +2661,9 @@ name = "relay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bincode",
+ "ed25519-dalek",
  "proto",
  "rand 0.8.7",
  "rcgen",

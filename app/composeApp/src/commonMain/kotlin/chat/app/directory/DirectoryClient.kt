@@ -5,6 +5,7 @@ import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.ResponseException
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import chat.engine.AttestationToken
 import chat.engine.BackupBundle
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
@@ -146,6 +147,12 @@ private data class BackupPutRequest(
     val auth_phrase: String,
     val salt_pa: String,
 )
+
+@Serializable
+private data class AttestationTokenDto(val nonce: String, val expires_at: Long, val signature: String)
+
+@Serializable
+private data class AttestationTokensResponse(val tokens: List<AttestationTokenDto>)
 
 @Serializable
 private data class PairingBootstrapRequest(val contact_link_b64: String)
@@ -324,6 +331,23 @@ class DirectoryClient(baseUrl: String = defaultDirectoryBaseUrl()) {
             authPhrase = b64.decode(res.auth_phrase),
             saltPa = b64.decode(res.salt_pa),
         )
+    }
+
+    /**
+     * POST /attestation/tokens — a batch of single-use queue-creation tokens
+     * (T27) for the just-verified account. Hand the result to
+     * `ChatEngine.stockAttestationTokens`. Throws [DirectoryException] with
+     * status 503 when the directory has attestation disabled (the default) —
+     * the relay is then also un-configured, so queues need no token and the
+     * caller can safely ignore that case.
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    suspend fun fetchAttestationTokens(sessionToken: String): List<AttestationToken> {
+        val res: AttestationTokensResponse = call { http.post("$baseUrl/attestation/tokens") {
+            bearerAuth(sessionToken)
+        } }.body()
+        val b64 = kotlin.io.encoding.Base64.Default
+        return res.tokens.map { AttestationToken(b64.decode(it.nonce), it.expires_at, b64.decode(it.signature)) }
     }
 
     /** POST /pairing-bootstrap — publish (or replenish) this account's one-time contact link for search-initiated pairing. */

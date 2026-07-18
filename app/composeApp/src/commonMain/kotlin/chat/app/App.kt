@@ -226,6 +226,17 @@ private fun EngineScreen(
     // republish a fresh one so the next searcher isn't stranded.
     val pairCount = remember(revision) { engine.conversations().size }
     LaunchedEffect(session.sessionToken, pairCount) {
+        // T27: stock queue-creation tokens before createContactLink (and any
+        // later pairing) mints a queue. Best-effort: the directory 503s when
+        // attestation is off (the default), in which case the relay isn't
+        // gating queues either — so a failure here just means "no token
+        // needed", and onboarding must not break on it.
+        try {
+            engine.stockAttestationTokens(client.fetchAttestationTokens(session.sessionToken))
+        } catch (e: DirectoryException) {
+            if (e.isSessionExpired()) onSessionExpired()
+            // otherwise: attestation disabled or unreachable — queues are ungated.
+        }
         val link = engine.createContactLink()
         if (link.isNotEmpty()) {
             try {

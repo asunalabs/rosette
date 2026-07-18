@@ -1,6 +1,7 @@
 //! Wire protocol shared by core/, relay/, and cli/. Single source of truth for
 //! every type that crosses the client-relay boundary — see plan amendment A6.
 
+pub mod attestation;
 pub mod auth;
 pub mod envelope;
 pub mod error;

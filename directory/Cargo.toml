@@ -19,6 +19,8 @@ tokio.workspace = true
 anyhow.workspace = true
 argon2 = "0.5"
 rand = "0.8"
+# T27: Ed25519 attestation-token signing (the type/verify live in proto).
+ed25519-dalek = "2"
 # Recovery-bundle upload bodies (issue #2) — same version as engine/ffi.
 base64 = "0.22"
 async-trait = "0.1"

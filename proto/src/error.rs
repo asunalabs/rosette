@@ -15,6 +15,11 @@ pub enum RejectionCode {
     Unauthorized,
     #[error("proof of work is invalid or insufficient")]
     InvalidProofOfWork,
+    /// T27: the attestation token was missing, malformed, expired, or already
+    /// spent — the relay requires one for queue creation when configured with a
+    /// directory public key.
+    #[error("attestation token is invalid, expired, or already spent")]
+    InvalidAttestation,
     #[error("queue does not exist")]
     QueueNotFound,
     #[error("relay storage bound exceeded")]
