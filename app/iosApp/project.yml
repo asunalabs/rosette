@@ -5,7 +5,7 @@
 name: iosApp
 
 options:
-  bundleIdPrefix: chat.app
+  bundleIdPrefix: chat.rosette
   deploymentTarget:
     iOS: "15.0"
 
@@ -26,13 +26,13 @@ targets:
     info:
       path: iosApp/Info.plist
       properties:
-        CFBundleDisplayName: chat
+        CFBundleDisplayName: Rosette
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: chat.app
+        PRODUCT_BUNDLE_IDENTIFIER: chat.rosette
         # embedAndSignAppleFrameworkForXcode drops ComposeApp.framework here,
         # keyed by the active configuration + SDK.
         FRAMEWORK_SEARCH_PATHS:
