@@ -1,3 +1,15 @@
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="Rosette — a private messenger for the Chat Control era" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/asunalabs/rosette/actions/workflows/ci.yml"><img src="https://github.com/asunalabs/rosette/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/asunalabs/rosette" alt="License: AGPL-3.0"></a>
+  <img src="https://img.shields.io/badge/rust-stable-orange?logo=rust" alt="Rust">
+  <img src="https://img.shields.io/badge/kotlin-multiplatform-7F52FF?logo=kotlin&logoColor=white" alt="Kotlin Multiplatform">
+  <img src="https://komarev.com/ghpvc/?username=asunalabs-rosette&color=B08CC9&style=flat&label=views" alt="Views">
+</p>
+
 # Rosette
 
 A private messenger for the Chat Control era. Conversations are end-to-end
