@@ -180,8 +180,8 @@ implementation (JS/SVG v0): `docs/design/design-preview.html`.
 
 ## Layout
 
-> **Read the SPECCED, NOT BUILT markers below before filing a QA bug.** CLAUDE.md
-> makes this file normative and tells QA to flag code that doesn't match it, so a
+> **Read the SPECCED, NOT BUILT markers below before filing a QA bug.** This
+> file is normative for the UI, and QA flags code that doesn't match it, so a
 > spec written in the present tense about something unbuilt manufactures a
 > permanent QA violation — the reviewer can only conclude the code is wrong.
 > Marked entries are the design we intend; the "Today:" line under each is what

@@ -103,8 +103,7 @@ chat/
 ├── .github/workflows/
 │   ├── ci.yml                    # NEW  cargo test + gradle build/test on every push
 │   └── release-*.yml             # NEW  per-artifact release pipelines (see Distribution)
-├── TODOS.md                      # (exists) strategy backlog
-└── CLAUDE.md                     # (exists)
+└── TODOS.md                      # (exists) strategy backlog
 ```
 
 What deliberately does NOT exist: a `common/`/`utils/` crate (nothing shared

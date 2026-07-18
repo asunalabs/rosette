@@ -134,13 +134,8 @@ checklist). It's the checked-in counterpart to the local, per-machine design
 docs and CEO plans under `~/.gstack/projects/chat/` — check both when
 looking for prior decisions or open questions.
 
-## How work happens in this repo (alongside Claude)
+## How work happens in this repo
 
-- **`CLAUDE.md` routes requests to skills.** Product ideas → `/office-hours`,
-  architecture → `/plan-eng-review`, bugs → `/investigate`, code review →
-  `/review`, shipping → `/ship`. When in doubt, a skill gets invoked rather
-  than freehanding the equivalent process — this keeps review/plan output
-  in the same structured, checkable format project-wide.
 - **Plan reviews leave a decision log, not just code.** `architecture.md`'s
   `D3`/`D4`/`D5`/`OV1`–`OV10` numbering and the `T*`/`DT*` task IDs in that
   file and in `tasks-identity-directory-pivot.md` are how a review's
