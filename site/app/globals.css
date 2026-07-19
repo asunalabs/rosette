@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+/* ============ Rosette design tokens — "Quiet Room" (see /DESIGN.md) ============
+   THE ACCENT IS A SWAP-POINT: this is the one definition site for the web
+   surface (DESIGN.md's other definition site is the Compose ChatPalette).
+   Values verified against DESIGN.md's token table directly, not copied from
+   docs/design/design-preview.html — that file's dark `--error` (#E5484D) is
+   the pre-ET12 value DESIGN.md documents as failing contrast (3.91:1); the
+   corrected value (#F16A6F) is used here. */
+:root {
+  --bg: #ffffff;
+  --surface: #f7f6f6;
+  --surface-2: #efedee;
+  --ink: #1a1618;
+  --muted: #625b5e;
+  --hairline: #e5e1e3;
+  --accent: #5b3a6c;
+  --accent-strong: #432852;
+  --accent-soft: #ede4f2;
+  --bubble-mine: #5b3a6c;
+  --on-bubble-mine: #ffffff;
+  --bubble-theirs: #f0eef0;
+  --error: #c62828;
+  --error-soft: #fbe9e7;
+  --warning: #7a5500;
+  --warning-soft: #f5ecd4;
+  --info: #4c5a6b;
+  --on-accent: #ffffff;
+}
+
+[data-theme="dark"] {
+  --bg: #0b090c;
+  --surface: #1c1920;
+  --surface-2: #262229;
+  --ink: #ece9eb;
+  --muted: #948d91;
+  --hairline: #2a252b;
+  --accent: #b08cc9;
+  --accent-strong: #c3a4d8;
+  --accent-soft: #2b2233;
+  --bubble-mine: #6b4183;
+  --on-bubble-mine: #ffffff;
+  --bubble-theirs: #242027;
+  --error: #f16a6f;
+  --error-soft: #35201b;
+  --warning: #d4a945;
+  --warning-soft: #322b18;
+  --info: #94a3b8;
+  --on-accent: #121013;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-hairline: var(--hairline);
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-soft: var(--accent-soft);
+  --color-bubble-mine: var(--bubble-mine);
+  --color-on-bubble-mine: var(--on-bubble-mine);
+  --color-bubble-theirs: var(--bubble-theirs);
+  --color-error: var(--error);
+  --color-error-soft: var(--error-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-info: var(--info);
+  --color-on-accent: var(--on-accent);
+
+  --font-sans: var(--font-plex-sans), sans-serif;
+  --font-mono: var(--font-plex-mono), monospace;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+}
+
+* {
+  transition:
+    background-color 0.25s ease-out,
+    color 0.25s ease-out,
+    border-color 0.25s ease-out;
+}
