@@ -18,25 +18,26 @@ can't read names, content, or membership. Built for mainstream EU users who
 want a familiar messenger that doesn't scan — not a hobbyist threat-model
 exercise.
 
-> If we were ever forced to choose between giving government access to user
-> data or shutting down, we would shut down.
+> We would shut down before giving any government access to your data.
 
 The name is the identicon: every contact renders as a deterministic
 guilloché **rosette** — the anti-forgery engraving on banknotes and
 passports — derived from their key fingerprint. Hard to forge, easy to
 recognize.
 
-Status: working protocol skeleton. Relay, encrypted 1:1 chat over the CLI,
-and the Kotlin Multiplatform app shell all run today, paired by exchanging a
-QR/contact link — no phone, no email, no account required for the core path.
-A Signal-model identity/directory pivot is implemented as a standalone
-service (`directory/`): phone required at signup (Argon2id-hashed,
-verification-only, hidden by default), k-anonymity-bucketed phone/username
-search opt-in (off by default), backed by PostgreSQL. Not yet wired to the
-client or to `core`/`engine`'s pairing flow — see
+Status: working protocol skeleton. Relay and encrypted 1:1 chat over the CLI
+run today with no phone, no email, and no account — pair by exchanging a
+QR/contact link. The Kotlin Multiplatform app shell runs too, but its
+onboarding is a hard, Signal-style gate: phone verification (Argon2id-hashed,
+verification-only, hidden by default) is required before the app unlocks at
+all — no unverified-but-usable state, no pairing, no messaging. That gate,
+plus k-anonymity-bucketed phone/username search (opt-in, off by default), is
+served by a separate identity/directory service (`directory/`), backed by
+PostgreSQL. Search is wired to the client; turning a search hit into an
+actual MLS pairing session is not — see
 [docs/plans/tasks-identity-directory-pivot.md](docs/plans/tasks-identity-directory-pivot.md)
-for what's done versus open (T25 in particular: no bridge exists yet from a
-directory search hit to an actual MLS pairing session).
+for what's done versus open (T25's backend half is built, but nothing in the
+app calls it yet).
 
 **Free forever for individuals. No paid tier, ever.** Billing needs an
 identity link, and this app's whole point is not having one.
